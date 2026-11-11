@@ -12,9 +12,11 @@ use crate::buffer::{Buffer, LineEnding};
 use crate::config::{self, ConfigPaths, Session, Settings, UiTheme};
 use crate::editing::{EditCommand, EditSettings};
 use crate::find_bar::{BarMode, FindBar, MatchDecorator};
+use crate::fonts::{self, FontCatalog, FontLoad};
 use crate::highlight::{self, AssetsHandle, HighlightAssets, HighlightDecorator};
 use crate::keymap::{Action, KeyChord, Keymap};
 use crate::markdown::{self, Preview};
+use crate::settings_ui::{SettingsEvent, SettingsWindow};
 use crate::spell::{SpellDecorator, SpellMode, SpellService, SpellStatus};
 use crate::tab::Tab;
 use crate::view::{self, KeyHandler, ViewOptions};
@@ -300,6 +302,12 @@ pub struct FedApp {
     vim_applied: bool,
     /// Last vim message or error, shown in the command bar.
     vim_message: Option<VimMessage>,
+    /// The settings window.
+    settings_window: SettingsWindow,
+    /// System font families, scanned the first time the settings window opens.
+    font_catalog: Option<FontCatalog>,
+    /// Startup load of the configured editor font, until it finishes.
+    font_load: Option<FontLoad>,
 }
 
 impl FedApp {
@@ -334,8 +342,15 @@ impl FedApp {
             allow_close: false,
             vim_applied: false,
             vim_message: None,
+            settings_window: SettingsWindow::new(),
+            font_catalog: None,
+            font_load: None,
         };
         app.vim_applied = app.settings.vim_mode;
+        fonts::apply_editor_font(&cc.egui_ctx, None, None);
+        if let Some(family) = &app.settings.font_family {
+            app.font_load = Some(FontLoad::spawn(cc.egui_ctx.clone(), family.clone()));
+        }
         egui_extras::install_image_loaders(&cc.egui_ctx);
         app.apply_theme(&cc.egui_ctx);
         app.ensure_spell(&cc.egui_ctx);
@@ -404,12 +419,7 @@ impl FedApp {
             Action::Replace => self.open_bar(BarMode::Replace),
             Action::GoToLine => self.open_bar(BarMode::GoToLine),
             Action::TogglePreview => self.toggle_preview(),
-            Action::OpenSettings => {
-                self.set_status(
-                    format!("{}: not available yet", action.label()),
-                    Severity::Info,
-                );
-            }
+            Action::OpenSettings => self.toggle_settings(ctx),
         }
     }
 
@@ -516,7 +526,7 @@ impl FedApp {
     /// Builds the editor widget options from the current settings.
     fn view_options(&self) -> ViewOptions {
         ViewOptions {
-            font: egui::FontId::monospace(self.settings.font_size),
+            font: fonts::editor_font_id(self.settings.font_size),
             line_numbers: self.settings.line_numbers,
             word_wrap: self.settings.word_wrap,
             edit: self.edit_settings(),
@@ -633,12 +643,14 @@ impl FedApp {
     }
 
     /// Consumes this frame's shortcut key presses (each event is matched against the exact
-    /// chord) and dispatches their actions.
+    /// chord) and dispatches their actions. While a settings window text field has focus
+    /// only OpenSettings fires.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if self.pending.is_some() {
             return;
         }
         let editor_focused = self.editor_has_focus(ctx);
+        let settings_typing = self.settings_window.has_focus(ctx) && ctx.text_edit_focused();
         let vim = self.settings.vim_mode;
         let mut fired = Vec::new();
         ctx.input_mut(|i| {
@@ -659,6 +671,9 @@ impl FedApp {
                     return true;
                 }
                 if needs_editor_focus(action) && !editor_focused {
+                    return true;
+                }
+                if settings_typing && action != Action::OpenSettings {
                     return true;
                 }
                 fired.push(action);
@@ -822,6 +837,9 @@ impl FedApp {
 
     /// Opens the suggestions popup for the misspelled word under a right click, if any.
     fn open_spell_menu(&mut self, pos: egui::Pos2, clicked: std::ops::Range<usize>) {
+        if !self.settings.spell_check {
+            return;
+        }
         let Some(checker) = self.spell.as_ref().and_then(SpellService::checker) else {
             return;
         };
@@ -934,6 +952,116 @@ impl FedApp {
         self.tabs.iter_mut().for_each(Tab::reset_vim);
     }
 
+    /// Opens or closes the settings window. Opening takes the keyboard focus away from the
+    /// editor (so Escape closes the window), closing gives it back.
+    fn toggle_settings(&mut self, ctx: &egui::Context) {
+        self.settings_window.toggle();
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        match self.settings_window.open {
+            true => ctx.memory_mut(|m| m.surrender_focus(view::editor_id(tab.id))),
+            false => tab.focus_editor(),
+        }
+    }
+
+    /// Draws the settings window (scanning the system fonts the first time it opens) and
+    /// applies what the user changed.
+    fn show_settings(&mut self, ctx: &egui::Context) {
+        if !self.settings_window.open {
+            return;
+        }
+        let spell = self.spell_status();
+        let theme_names = self
+            .loaded_assets
+            .as_ref()
+            .map(|a| a.theme_names())
+            .unwrap_or_default();
+        let catalog = self
+            .font_catalog
+            .get_or_insert_with(|| FontCatalog::spawn(ctx.clone()));
+        let events = self.settings_window.show(
+            ctx,
+            &mut self.settings,
+            &mut self.keymap,
+            catalog,
+            &theme_names,
+            &spell,
+        );
+        self.apply_settings_events(ctx, events);
+        if !self.settings_window.open {
+            self.tabs[self.active].focus_editor();
+        }
+    }
+
+    /// Carries out the settings window events: loads the font, retries the dictionaries and
+    /// saves the settings once when anything changed. Theme, vim and spell check changes are
+    /// picked up from `settings` by the per-frame sync functions.
+    fn apply_settings_events(&mut self, ctx: &egui::Context, events: Vec<SettingsEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let mut save = false;
+        for event in events {
+            match event {
+                SettingsEvent::Changed | SettingsEvent::KeymapChanged => save = true,
+                SettingsEvent::FontChanged => self.load_editor_font(ctx),
+                SettingsEvent::RetryDictionaries => {
+                    if let Some(service) = &mut self.spell {
+                        service.retry();
+                    }
+                }
+            }
+        }
+        if save {
+            self.save_settings();
+        }
+        self.sync_vim_mode();
+        ctx.request_repaint();
+    }
+
+    /// Applies `settings.font_family` from the font catalog; an unknown family falls back to
+    /// the default font with a status bar warning. Cancels a pending startup load.
+    fn load_editor_font(&mut self, ctx: &egui::Context) {
+        self.font_load = None;
+        let Some(family) = self.settings.font_family.clone() else {
+            fonts::apply_editor_font(ctx, None, None);
+            return;
+        };
+        let font = self
+            .font_catalog
+            .as_ref()
+            .and_then(|c| c.load_family_font(&family));
+        self.apply_loaded_font(ctx, &family, font);
+    }
+
+    /// Applies the result of the startup font load once it is ready.
+    fn poll_font_load(&mut self, ctx: &egui::Context) {
+        let Some(load) = &self.font_load else { return };
+        let Some(font) = load.take() else { return };
+        let family = load.family().to_string();
+        self.font_load = None;
+        self.apply_loaded_font(ctx, &family, font);
+    }
+
+    /// Installs `font` as the editor font, or the default font plus a warning when the
+    /// family `family` was not found.
+    fn apply_loaded_font(
+        &mut self,
+        ctx: &egui::Context,
+        family: &str,
+        font: Option<egui::FontData>,
+    ) {
+        if font.is_none() {
+            self.set_status(
+                format!("font '{family}' not found, using the default font"),
+                Severity::Warning,
+            );
+        }
+        let name = font.as_ref().map(|_| family);
+        fonts::apply_editor_font(ctx, name, font);
+    }
+
     /// Shows `text` in the vim command bar, in the error color when `error`.
     fn set_vim_message(&mut self, text: String, error: bool) {
         self.vim_message = Some(VimMessage { text, error });
@@ -1039,7 +1167,7 @@ impl FedApp {
         let strong = ui.visuals().strong_text_color();
         let error = ui.visuals().error_fg_color;
         let format = |color: egui::Color32| egui::TextFormat {
-            font_id: egui::FontId::monospace(self.settings.font_size + VIM_BAR_FONT_EXTRA),
+            font_id: fonts::editor_font_id(self.settings.font_size + VIM_BAR_FONT_EXTRA),
             color,
             ..Default::default()
         };
@@ -1078,7 +1206,11 @@ impl eframe::App for FedApp {
         self.handle_close_request(&ctx);
         self.ensure_spell(&ctx);
         self.sync_vim_mode();
-        self.handle_shortcuts(&ctx);
+        self.poll_font_load(&ctx);
+        match self.settings_window.capture_keys(&ctx, &mut self.keymap) {
+            Some(events) => self.apply_settings_events(&ctx, events),
+            None => self.handle_shortcuts(&ctx),
+        }
         match self.tab_bar(ui) {
             Some(TabBarAction::Activate(i)) => self.activate(i),
             Some(TabBarAction::Close(i)) => self.request_close_tab(&ctx, i),
@@ -1156,6 +1288,7 @@ impl eframe::App for FedApp {
             let mut highlighted =
                 HighlightDecorator::new(&mut cache, assets, &syntax, theme, !large);
             let spell_checker = checker.filter(|_| !large);
+            let spell_active = spell_checker.is_some();
             let out = match spell_checker {
                 Some(c) => {
                     let mode = SpellMode::for_syntax(&syntax);
@@ -1171,6 +1304,10 @@ impl eframe::App for FedApp {
             };
             tab.highlight = cache;
             tab.spell_md = markdown;
+            if !spell_active {
+                // Nothing was checked: drop the marks so no stale suggestion popup opens.
+                marks.clear();
+            }
             tab.spell_marks = marks;
             if vim_mode && out.mouse_selected {
                 tab.vim.mouse_selection(&mut tab.buffer, &mut tab.editor);
@@ -1190,6 +1327,7 @@ impl eframe::App for FedApp {
             self.open_spell_menu(pos, range);
         }
         self.show_spell_menu(&ctx);
+        self.show_settings(&ctx);
         self.show_dialogs(&ctx);
     }
 
