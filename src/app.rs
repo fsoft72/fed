@@ -762,25 +762,35 @@ impl FedApp {
             .map(|t| t.preview_open);
         let mut action = None;
         egui::Panel::top("fed_tabs").show(ui, |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.horizontal(|ui| {
+                // Reserve room for the Preview button on the right; tabs scroll in the rest.
+                let reserved = if preview_state.is_some() {
+                    PREVIEW_BUTTON_WIDTH + ui.spacing().item_spacing.x
+                } else {
+                    0.0
+                };
+                let tabs_width = (ui.available_width() - reserved).max(0.0);
+                egui::ScrollArea::horizontal()
+                    .max_width(tabs_width)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for (i, tab) in self.tabs.iter().enumerate() {
+                                if let Some(tab_action) = draw_tab(ui, tab, i == self.active) {
+                                    action = Some(match tab_action {
+                                        TabClick::Activate => TabBarAction::Activate(i),
+                                        TabClick::Close => TabBarAction::Close(i),
+                                    });
+                                }
+                            }
+                        });
+                    });
                 if let Some(open) = preview_state
                     && draw_preview_button(ui, open)
                 {
                     action = Some(TabBarAction::TogglePreview);
                 }
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        for (i, tab) in self.tabs.iter().enumerate() {
-                            if let Some(tab_action) = draw_tab(ui, tab, i == self.active) {
-                                action = Some(match tab_action {
-                                    TabClick::Activate => TabBarAction::Activate(i),
-                                    TabClick::Close => TabBarAction::Close(i),
-                                });
-                            }
-                        }
-                    });
-                });
             });
         });
         action
