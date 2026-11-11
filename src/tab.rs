@@ -54,6 +54,12 @@ impl Tab {
         editing::apply_command(&mut self.editor, &mut self.buffer, cmd, settings)
     }
 
+    /// Gives the editor widget keyboard focus the next time this tab is shown
+    /// (after switching tabs or closing a dialog).
+    pub fn focus_editor(&mut self) {
+        self.view.request_focus();
+    }
+
     /// Closes the open typing undo group, if any. Call before editing `buffer` directly,
     /// saving it, or running undo/redo outside of `apply`.
     pub fn end_typing(&mut self) {

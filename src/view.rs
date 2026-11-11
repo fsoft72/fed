@@ -106,13 +106,20 @@ pub struct ViewOutput {
 /// Per-tab state kept by the widget between frames.
 #[derive(Default)]
 pub struct ViewState {
-    /// Focus was requested once when the widget was first shown.
-    focus_requested: bool,
+    /// The widget held keyboard focus since the last `request_focus` (or since creation).
+    focus_acquired: bool,
     /// Longest line display width in columns, with the revision and tab width it was
     /// computed for.
     max_line_cols: Option<(u64, usize, usize)>,
     /// Wrapped line heights (word wrap only).
     wrap: WrapCache,
+}
+
+impl ViewState {
+    /// Makes the widget take keyboard focus the next time it is shown.
+    pub(crate) fn request_focus(&mut self) {
+        self.focus_acquired = false;
+    }
 }
 
 /// Cached line geometry for word wrap mode.
@@ -227,9 +234,15 @@ pub fn show_editor(
     let revision_before = tab.buffer.revision();
     let id = egui::Id::unique(("fed_editor", tab.id));
     let metrics = Metrics::new(ui, opts, tab.buffer.rope().len_lines());
-    if !tab.view.focus_requested {
-        ui.memory_mut(|m| m.request_focus(id));
-        tab.view.focus_requested = true;
+    if !tab.view.focus_acquired {
+        // A click elsewhere in the same frame (a tab bar or dialog button) makes egui
+        // surrender a fresh focus request, so keep asking until the focus has stuck.
+        if ui.memory(|m| m.has_focus(id)) {
+            tab.view.focus_acquired = true;
+        } else {
+            ui.memory_mut(|m| m.request_focus(id));
+            ui.ctx().request_repaint();
+        }
     }
     let focused = ui.memory(|m| m.has_focus(id));
     if focused {

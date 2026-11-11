@@ -1,47 +1,353 @@
-//! Application shell: the `eframe::App` implementation.
+//! Application shell: tabs, file dialogs, shortcuts, status bar and session handling.
 
-use std::path::PathBuf;
+mod dialogs;
+
+use std::cmp::Reverse;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::buffer::Buffer;
-use crate::config::Settings;
-use crate::editing::EditSettings;
+use crate::buffer::{Buffer, LineEnding};
+use crate::config::{self, ConfigPaths, Session, Settings, UiTheme};
+use crate::editing::{EditCommand, EditSettings};
+use crate::keymap::{Action, KeyChord, Keymap};
 use crate::tab::Tab;
 use crate::view::{self, PlainDecorator, ViewOptions};
+use dialogs::Pending;
+
+/// True when running on macOS, where `Cmd` and `Ctrl` are different keys.
+const IS_MAC: bool = cfg!(target_os = "macos");
+/// How long a status bar message stays visible.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Status bar notice for tabs with highlighting disabled.
+const LARGE_FILE_NOTICE: &str = "large file: highlighting off";
+/// Name shown for a tab without a file path.
+const UNTITLED: &str = "untitled";
+/// Suffix of a tab label when the buffer has unsaved changes. Drawn with the monospace
+/// font because the default proportional fonts have no glyph for it.
+const MODIFIED_LABEL_SUFFIX: &str = " ●";
+/// Suffix of the status text when the buffer has unsaved changes.
+const MODIFIED_STATUS_SUFFIX: &str = "  [+]";
+/// Fixed, non-configurable alias for Redo.
+const REDO_ALIAS: &str = "Cmd+Shift+Z";
+
+/// Returns true when closing `tab` would lose unsaved changes.
+pub fn close_requires_confirmation(tab: &Tab) -> bool {
+    tab.buffer.is_modified()
+}
+
+/// Returns the indices of the tabs that would lose unsaved changes when closed.
+pub fn tabs_needing_confirmation(tabs: &[Tab]) -> Vec<usize> {
+    tabs.iter()
+        .enumerate()
+        .filter(|(_, tab)| close_requires_confirmation(tab))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Returns the status bar text for `tab`: path (as opened, or "untitled"), 1-based
+/// `line:col` of the caret, line ending, and `"  [+]"` when modified.
+pub fn status_text(tab: &Tab) -> String {
+    let rope = tab.buffer.rope();
+    let head = tab.editor.selection.head.min(rope.len_chars());
+    let line = rope.char_to_line(head);
+    let col = head - rope.line_to_char(line);
+    let ending = match tab.buffer.line_ending() {
+        LineEnding::Lf => "LF",
+        LineEnding::Crlf => "CRLF",
+    };
+    let mut text = format!("{}  {}:{}  {ending}", tab_path(tab), line + 1, col + 1);
+    if tab.buffer.is_modified() {
+        text.push_str(MODIFIED_STATUS_SUFFIX);
+    }
+    text
+}
+
+/// Path of `tab` as opened, or "untitled".
+fn tab_path(tab: &Tab) -> String {
+    tab.buffer
+        .path()
+        .map_or_else(|| UNTITLED.to_string(), |p| p.display().to_string())
+}
+
+/// True for an untitled tab that is empty and unmodified (replaced when opening a file).
+fn is_blank(tab: &Tab) -> bool {
+    tab.buffer.path().is_none() && !tab.buffer.is_modified() && tab.buffer.rope().len_chars() == 0
+}
+
+/// True when `a` and `b` name the same file (same text, or same canonical path).
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// egui modifiers matching `chord` with `consume_key`.
+fn chord_modifiers(chord: &KeyChord) -> egui::Modifiers {
+    egui::Modifiers {
+        alt: chord.alt,
+        ctrl: chord.ctrl,
+        shift: chord.shift,
+        mac_cmd: chord.command && IS_MAC,
+        command: chord.command,
+    }
+}
+
+/// Shows the native save dialog, starting from the buffer's current location.
+fn save_dialog(buffer: &Buffer) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_file_name(buffer.display_name());
+    if let Some(dir) = buffer.path().and_then(Path::parent)
+        && !dir.as_os_str().is_empty()
+    {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.save_file()
+}
+
+/// How a status bar message is colored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Severity {
+    /// Normal text color.
+    Info,
+    /// Warning color (settings problems).
+    Warning,
+    /// Error color (failed file operations).
+    Error,
+}
+
+/// A transient message on the right side of the status bar.
+struct StatusMessage {
+    /// Message text.
+    text: String,
+    /// Color class.
+    severity: Severity,
+    /// When the message appeared (it disappears after `STATUS_TIMEOUT`).
+    shown_at: Instant,
+}
+
+/// Something the user did in the tab bar.
+enum TabBarAction {
+    /// Switch to the tab at this index.
+    Activate(usize),
+    /// Close the tab at this index.
+    Close(usize),
+}
 
 /// Top-level editor application state.
 pub struct FedApp {
-    /// Open documents, one per tab.
+    /// Open documents, one per tab; never empty.
     tabs: Vec<Tab>,
     /// Index of the tab shown in the editor area.
     active: usize,
-    /// Errors from opening files, shown at the bottom of the window.
-    errors: Vec<String>,
     /// Editor settings.
     settings: Settings,
+    /// Keyboard shortcuts.
+    keymap: Keymap,
+    /// Config file locations; `None` runs without persistence.
+    paths: Option<ConfigPaths>,
+    /// Transient status bar message.
+    status: Option<StatusMessage>,
+    /// Confirmation dialog currently shown.
+    pending: Option<Pending>,
+    /// UI theme last applied to the context.
+    applied_theme: Option<UiTheme>,
+    /// Set once the user agreed to close the window, so the close is not intercepted again.
+    allow_close: bool,
 }
 
 impl FedApp {
-    /// Creates the application; `files` are the paths passed on the command line.
-    /// Opens one tab per readable file, or one empty tab.
-    pub fn new(_cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> FedApp {
-        let mut tabs = Vec::new();
-        let mut errors = Vec::new();
-        for path in &files {
-            match Buffer::load(path) {
-                Ok(buffer) => tabs.push(Tab::new(buffer)),
-                Err(e) => errors.push(e.to_string()),
+    /// Creates the application; `files` are the paths passed on the command line. Loads the
+    /// settings, then opens one tab per file (or the previous session's files when `files` is
+    /// empty and session restore is on), falling back to one empty tab.
+    pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> FedApp {
+        let paths = ConfigPaths::detect();
+        let (settings, mut problems) = match &paths {
+            Some(p) => config::load_settings(p),
+            None => (
+                Settings::default(),
+                vec!["no config directory: settings and session are not saved".to_string()],
+            ),
+        };
+        let (keymap, key_warnings) = Keymap::from_overrides(&settings.keybindings);
+        problems.extend(key_warnings);
+        let mut app = FedApp {
+            tabs: Vec::new(),
+            active: 0,
+            settings,
+            keymap,
+            paths,
+            status: None,
+            pending: None,
+            applied_theme: None,
+            allow_close: false,
+        };
+        app.apply_theme(&cc.egui_ctx);
+        if !problems.is_empty() {
+            app.set_status(problems.join("; "), Severity::Warning);
+        }
+        let files = if files.is_empty() && app.settings.restore_session {
+            app.session_files()
+        } else {
+            files
+        };
+        let errors: Vec<String> = files
+            .into_iter()
+            .filter_map(|path| app.try_open(path).err())
+            .collect();
+        if app.tabs.is_empty() {
+            app.tabs.push(Tab::new(Buffer::new()));
+        }
+        app.active = 0;
+        if !errors.is_empty() {
+            app.set_status(errors.join("; "), Severity::Error);
+        }
+        app
+    }
+
+    /// Opens `path` in a tab. If it is already open that tab is activated; if the active tab
+    /// is an empty unmodified untitled tab it is replaced. Errors go to the status bar.
+    pub fn open_path(&mut self, path: PathBuf) {
+        if let Err(e) = self.try_open(path) {
+            self.set_status(e, Severity::Error);
+        }
+    }
+
+    /// Writes the current settings (including the keymap) to the config directory.
+    pub fn save_settings(&mut self) {
+        self.settings.keybindings = self.keymap.to_overrides();
+        let Some(paths) = &self.paths else { return };
+        if let Err(e) = config::save_settings(paths, &self.settings) {
+            self.set_status(format!("cannot save settings: {e}"), Severity::Error);
+        }
+    }
+
+    /// Executes `action` on the application or the active tab.
+    pub fn dispatch(&mut self, ctx: &egui::Context, action: Action) {
+        let count = self.tabs.len();
+        match action {
+            Action::NewTab => {
+                self.tabs.push(Tab::new(Buffer::new()));
+                self.active = self.tabs.len() - 1;
+            }
+            Action::OpenFile => self.open_dialog(),
+            Action::Save => {
+                self.save_tab(self.active);
+            }
+            Action::SaveAs => {
+                self.save_tab_as(self.active);
+            }
+            Action::CloseTab => self.request_close_tab(ctx, self.active),
+            Action::NextTab => self.activate((self.active + 1) % count),
+            Action::PrevTab => self.activate((self.active + count - 1) % count),
+            Action::Undo => self.apply_to_active(EditCommand::Undo),
+            Action::Redo => self.apply_to_active(EditCommand::Redo),
+            Action::SelectAll => self.apply_to_active(EditCommand::SelectAll),
+            Action::OpenSettings
+            | Action::Find
+            | Action::Replace
+            | Action::GoToLine
+            | Action::TogglePreview => {
+                self.set_status(
+                    format!("{}: not available yet", action.label()),
+                    Severity::Info,
+                );
             }
         }
-        if tabs.is_empty() {
-            tabs.push(Tab::new(Buffer::new()));
+    }
+
+    /// Opens `path` in a tab (see `open_path`), returning a readable error.
+    fn try_open(&mut self, path: PathBuf) -> Result<(), String> {
+        let open = self
+            .tabs
+            .iter()
+            .position(|t| t.buffer.path().is_some_and(|p| same_file(p, &path)));
+        if let Some(idx) = open {
+            self.activate(idx);
+            return Ok(());
         }
-        FedApp {
-            tabs,
-            active: 0,
-            errors,
-            settings: Settings::default(),
+        let tab = Tab::new(Buffer::load(&path).map_err(|e| e.to_string())?);
+        match self.tabs.get(self.active) {
+            Some(current) if is_blank(current) => self.tabs[self.active] = tab,
+            _ => {
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Files of the previous session that still exist.
+    fn session_files(&self) -> Vec<PathBuf> {
+        let Some(paths) = &self.paths else {
+            return Vec::new();
+        };
+        config::load_session(paths)
+            .files
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect()
+    }
+
+    /// Writes the open file paths as the session, when session restore is on.
+    fn save_session(&self) {
+        if !self.settings.restore_session {
+            return;
+        }
+        let Some(paths) = &self.paths else { return };
+        let files = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.buffer.path())
+            .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()))
+            .collect();
+        if let Err(e) = config::save_session(paths, &Session { files }) {
+            eprintln!("fed: cannot save session to {}: {e}", paths.dir.display());
+        }
+    }
+
+    /// Shows a message in the status bar for `STATUS_TIMEOUT`.
+    fn set_status(&mut self, text: String, severity: Severity) {
+        self.status = Some(StatusMessage {
+            text,
+            severity,
+            shown_at: Instant::now(),
+        });
+    }
+
+    /// Drops the status message once it timed out, or schedules a repaint for that moment.
+    fn expire_status(&mut self, ctx: &egui::Context) {
+        let Some(msg) = &self.status else { return };
+        let elapsed = msg.shown_at.elapsed();
+        if elapsed >= STATUS_TIMEOUT {
+            self.status = None;
+            return;
+        }
+        ctx.request_repaint_after(STATUS_TIMEOUT - elapsed);
+    }
+
+    /// Applies the configured UI theme when it changed since the last frame.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        if self.applied_theme == Some(self.settings.ui_theme) {
+            return;
+        }
+        ctx.set_theme(match self.settings.ui_theme {
+            UiTheme::System => egui::ThemePreference::System,
+            UiTheme::Light => egui::ThemePreference::Light,
+            UiTheme::Dark => egui::ThemePreference::Dark,
+        });
+        self.applied_theme = Some(self.settings.ui_theme);
+    }
+
+    /// Indentation settings from the current settings.
+    fn edit_settings(&self) -> EditSettings {
+        EditSettings {
+            tab_width: self.settings.tab_width,
+            insert_spaces: self.settings.insert_spaces,
         }
     }
 
@@ -51,26 +357,193 @@ impl FedApp {
             font: egui::FontId::monospace(self.settings.font_size),
             line_numbers: self.settings.line_numbers,
             word_wrap: self.settings.word_wrap,
-            edit: EditSettings {
-                tab_width: self.settings.tab_width,
-                insert_spaces: self.settings.insert_spaces,
-            },
-            keys_enabled: true,
+            edit: self.edit_settings(),
+            keys_enabled: self.pending.is_none(),
         }
+    }
+
+    /// Applies an editing command to the active tab.
+    fn apply_to_active(&mut self, cmd: EditCommand) {
+        let edit = self.edit_settings();
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        tab.apply(cmd, &edit);
+    }
+
+    /// Makes the tab at `idx` active and gives it keyboard focus.
+    fn activate(&mut self, idx: usize) {
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        tab.focus_editor();
+        self.active = idx;
+    }
+
+    /// Shows the native open dialog and opens every picked file.
+    fn open_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = self.tabs[self.active].buffer.path().and_then(Path::parent)
+            && !dir.as_os_str().is_empty()
+        {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(files) = dialog.pick_files() else {
+            return;
+        };
+        for path in files {
+            self.open_path(path);
+        }
+    }
+
+    /// Saves the tab at `idx`, asking for a path when it is untitled. Returns true on success.
+    fn save_tab(&mut self, idx: usize) -> bool {
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return false;
+        };
+        tab.end_typing();
+        if tab.buffer.path().is_none() {
+            return self.save_tab_as(idx);
+        }
+        let result = tab.buffer.save();
+        self.report_save(idx, result)
+    }
+
+    /// Asks for a path and saves the tab at `idx` there. Returns true on success.
+    fn save_tab_as(&mut self, idx: usize) -> bool {
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return false;
+        };
+        tab.end_typing();
+        let Some(path) = save_dialog(&tab.buffer) else {
+            return false;
+        };
+        let result = tab.buffer.save_as(path);
+        self.report_save(idx, result)
+    }
+
+    /// Shows the outcome of saving the tab at `idx`; returns true when it succeeded.
+    fn report_save(&mut self, idx: usize, result: Result<(), crate::buffer::BufferError>) -> bool {
+        match result {
+            Ok(()) => {
+                let path = tab_path(&self.tabs[idx]);
+                self.set_status(format!("saved {path}"), Severity::Info);
+                true
+            }
+            Err(e) => {
+                self.set_status(e.to_string(), Severity::Error);
+                false
+            }
+        }
+    }
+
+    /// Consumes this frame's shortcut key presses and dispatches their actions.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.pending.is_some() {
+            return;
+        }
+        let table = self.shortcut_table();
+        let mut fired = Vec::new();
+        ctx.input_mut(|i| {
+            for (mods, key, action) in &table {
+                if i.consume_key(*mods, *key) {
+                    fired.push(*action);
+                }
+            }
+        });
+        for action in fired {
+            self.dispatch(ctx, action);
+        }
+    }
+
+    /// Bound shortcuts plus the Redo alias, ordered so chords with more Shift/Alt come first
+    /// (`consume_key` ignores extra Shift/Alt, so `Ctrl+S` would also eat `Ctrl+Shift+S`).
+    fn shortcut_table(&self) -> Vec<(egui::Modifiers, egui::Key, Action)> {
+        let mut table: Vec<_> = Action::ALL
+            .iter()
+            .filter_map(|a| self.keymap.chord(*a).map(|c| (c, *a)))
+            .collect();
+        let alias = KeyChord::parse(REDO_ALIAS).expect("the redo alias is a valid chord");
+        if self.keymap.lookup(&alias).is_none() {
+            table.push((alias, Action::Redo));
+        }
+        table.sort_by_key(|(c, _)| Reverse(u8::from(c.shift) + u8::from(c.alt)));
+        table
+            .into_iter()
+            .map(|(c, a)| (chord_modifiers(&c), c.key, a))
+            .collect()
+    }
+
+    /// Draws the tab bar and returns what the user clicked.
+    fn tab_bar(&self, ui: &mut egui::Ui) -> Option<TabBarAction> {
+        let mut action = None;
+        egui::Panel::top("fed_tabs").show(ui, |ui| {
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, tab) in self.tabs.iter().enumerate() {
+                        let mut label = egui::Atoms::new(tab.buffer.display_name());
+                        if tab.buffer.is_modified() {
+                            label
+                                .push_right(egui::RichText::new(MODIFIED_LABEL_SUFFIX).monospace());
+                        }
+                        let resp = ui
+                            .selectable_label(i == self.active, label)
+                            .on_hover_text(tab_path(tab));
+                        if resp.clicked() {
+                            action = Some(TabBarAction::Activate(i));
+                        }
+                        if resp.middle_clicked() {
+                            action = Some(TabBarAction::Close(i));
+                        }
+                        if ui.small_button("x").on_hover_text("Close tab").clicked() {
+                            action = Some(TabBarAction::Close(i));
+                        }
+                        ui.separator();
+                    }
+                });
+            });
+        });
+        action
+    }
+
+    /// Draws the status bar: tab status on the left, notices and messages on the right.
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        let tab = &self.tabs[self.active];
+        egui::Panel::bottom("fed_status").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(status_text(tab));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(msg) = &self.status {
+                        let color = match msg.severity {
+                            Severity::Info => ui.visuals().text_color(),
+                            Severity::Warning => ui.visuals().warn_fg_color,
+                            Severity::Error => ui.visuals().error_fg_color,
+                        };
+                        ui.colored_label(color, &msg.text);
+                    }
+                    if tab.buffer.is_large() {
+                        ui.label(LARGE_FILE_NOTICE);
+                    }
+                });
+            });
+        });
     }
 }
 
 impl eframe::App for FedApp {
-    /// Draws one frame.
+    /// Draws one frame: shortcuts first, then tab bar, status bar, editor and dialogs.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if !self.errors.is_empty() {
-            egui::Panel::bottom("errors").show(ui, |ui| {
-                let color = ui.visuals().error_fg_color;
-                for err in &self.errors {
-                    ui.colored_label(color, err);
-                }
-            });
+        let ctx = ui.ctx().clone();
+        self.apply_theme(&ctx);
+        self.expire_status(&ctx);
+        self.handle_close_request(&ctx);
+        self.handle_shortcuts(&ctx);
+        match self.tab_bar(ui) {
+            Some(TabBarAction::Activate(i)) => self.activate(i),
+            Some(TabBarAction::Close(i)) => self.request_close_tab(&ctx, i),
+            None => {}
         }
+        self.status_bar(ui);
         let opts = self.view_options();
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(tab) = self.tabs.get_mut(self.active) else {
@@ -81,5 +554,60 @@ impl eframe::App for FedApp {
                 ui.ctx().copy_text(text);
             }
         });
+        self.show_dialogs(&ctx);
+    }
+
+    /// Saves the session when the application exits.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_session();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editing::{EditCommand, Selection};
+
+    const SET: EditSettings = EditSettings {
+        tab_width: 4,
+        insert_spaces: true,
+    };
+
+    #[test]
+    fn close_requires_confirmation_when_modified() {
+        let mut tab = Tab::new(Buffer::from_text("hello"));
+        assert!(!close_requires_confirmation(&tab));
+        tab.apply(EditCommand::InsertText("x".into()), &SET);
+        assert!(close_requires_confirmation(&tab));
+        tab.end_typing();
+        tab.apply(EditCommand::Undo, &SET);
+        assert!(!close_requires_confirmation(&tab));
+    }
+
+    #[test]
+    fn tabs_needing_confirmation_lists_modified_only() {
+        let mut tabs = vec![
+            Tab::new(Buffer::from_text("a")),
+            Tab::new(Buffer::from_text("b")),
+            Tab::new(Buffer::from_text("c")),
+        ];
+        assert!(tabs_needing_confirmation(&tabs).is_empty());
+        tabs[0].apply(EditCommand::InsertText("x".into()), &SET);
+        tabs[2].apply(EditCommand::InsertText("y".into()), &SET);
+        assert_eq!(tabs_needing_confirmation(&tabs), vec![0, 2]);
+    }
+
+    #[test]
+    fn status_text_format() {
+        let tab = Tab::new(Buffer::new());
+        assert_eq!(status_text(&tab), "untitled  1:1  LF");
+
+        let mut tab = Tab::new(Buffer::from_text("a\r\nbc"));
+        tab.buffer.set_path(PathBuf::from("src/lib.rs"));
+        tab.editor.selection = Selection::caret(3);
+        assert_eq!(status_text(&tab), "src/lib.rs  2:2  CRLF");
+
+        tab.apply(EditCommand::InsertText("x".into()), &SET);
+        assert_eq!(status_text(&tab), "src/lib.rs  2:3  CRLF  [+]");
     }
 }
