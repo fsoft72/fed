@@ -38,6 +38,8 @@ const MODIFIED_LABEL_SUFFIX: &str = " ●";
 const MODIFIED_STATUS_SUFFIX: &str = "  [+]";
 /// Fixed, non-configurable alias for Redo.
 const REDO_ALIAS: &str = "Cmd+Shift+Z";
+/// Vim error for `:w {file}` on an existing file.
+const VIM_FILE_EXISTS: &str = "E13: File exists (add ! to override)";
 /// Vim error for `:q` on a buffer with unsaved changes.
 const VIM_NO_WRITE: &str = "No write since last change (add ! to override)";
 /// The vim command bar font is this much larger than the editor font.
@@ -177,7 +179,60 @@ struct StatusMessage {
     shown_at: Instant,
 }
 
+/// Result of a save attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SaveOutcome {
+    /// The file was written.
+    Saved,
+    /// The user cancelled the Save As dialog.
+    Cancelled,
+    /// Writing failed with this message.
+    Failed(String),
+}
+
+impl SaveOutcome {
+    /// Converts a buffer save result.
+    fn from_result(result: Result<(), crate::buffer::BufferError>) -> SaveOutcome {
+        match result {
+            Ok(()) => SaveOutcome::Saved,
+            Err(e) => SaveOutcome::Failed(e.to_string()),
+        }
+    }
+}
+
+/// Command bar text for a vim write of `path`: `"path" written`, the error, or nothing when
+/// the Save As dialog was cancelled.
+fn vim_save_message(outcome: &SaveOutcome, path: &str) -> Option<VimMessage> {
+    match outcome {
+        SaveOutcome::Saved => Some(VimMessage {
+            text: format!("\"{path}\" written"),
+            error: false,
+        }),
+        SaveOutcome::Failed(e) => Some(VimMessage {
+            text: e.clone(),
+            error: true,
+        }),
+        SaveOutcome::Cancelled => None,
+    }
+}
+
+/// True when `:w {target}` must refuse without `!`: the file exists and is not the tab's own
+/// file (`own`).
+fn write_copy_refused(target: &Path, own: Option<&Path>) -> bool {
+    target.exists() && !own.is_some_and(|own| same_file(own, target))
+}
+
+/// True for effects after which the rest of the frame's vim keys and effects are dropped,
+/// because they may close or switch the active tab.
+fn ends_vim_frame(effect: &VimEffect) -> bool {
+    matches!(
+        effect,
+        VimEffect::Quit { .. } | VimEffect::WriteQuit | VimEffect::Edit(_)
+    )
+}
+
 /// Text shown in the vim command bar until the next key.
+#[derive(Debug, PartialEq, Eq)]
 struct VimMessage {
     /// Message text.
     text: String,
@@ -516,42 +571,54 @@ impl FedApp {
 
     /// Saves the tab at `idx`, asking for a path when it is untitled. Returns true on success.
     fn save_tab(&mut self, idx: usize) -> bool {
-        let Some(tab) = self.tabs.get_mut(idx) else {
-            return false;
-        };
-        tab.end_typing();
-        if tab.buffer.path().is_none() {
-            return self.save_tab_as(idx);
-        }
-        let result = tab.buffer.save();
-        self.report_save(idx, result)
+        let outcome = self.save_tab_outcome(idx);
+        self.report_save(idx, &outcome)
     }
 
     /// Asks for a path and saves the tab at `idx` there. Returns true on success.
     fn save_tab_as(&mut self, idx: usize) -> bool {
+        let outcome = self.save_tab_as_outcome(idx);
+        self.report_save(idx, &outcome)
+    }
+
+    /// Saves the tab at `idx` (Save As dialog when untitled) without reporting.
+    fn save_tab_outcome(&mut self, idx: usize) -> SaveOutcome {
         let Some(tab) = self.tabs.get_mut(idx) else {
-            return false;
+            return SaveOutcome::Cancelled;
+        };
+        tab.end_typing();
+        if tab.buffer.path().is_none() {
+            return self.save_tab_as_outcome(idx);
+        }
+        SaveOutcome::from_result(tab.buffer.save())
+    }
+
+    /// Asks for a path and saves the tab at `idx` there, without reporting.
+    fn save_tab_as_outcome(&mut self, idx: usize) -> SaveOutcome {
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return SaveOutcome::Cancelled;
         };
         tab.end_typing();
         let Some(path) = save_dialog(&tab.buffer) else {
-            return false;
+            return SaveOutcome::Cancelled;
         };
-        let result = tab.buffer.save_as(path);
-        self.report_save(idx, result)
+        SaveOutcome::from_result(tab.buffer.save_as(path))
     }
 
-    /// Shows the outcome of saving the tab at `idx`; returns true when it succeeded.
-    fn report_save(&mut self, idx: usize, result: Result<(), crate::buffer::BufferError>) -> bool {
-        match result {
-            Ok(()) => {
+    /// Shows the outcome of saving the tab at `idx` in the status bar; returns true when the
+    /// file was written.
+    fn report_save(&mut self, idx: usize, outcome: &SaveOutcome) -> bool {
+        match outcome {
+            SaveOutcome::Saved => {
                 let path = tab_path(&self.tabs[idx]);
                 self.set_status(format!("saved {path}"), Severity::Info);
                 true
             }
-            Err(e) => {
-                self.set_status(e.to_string(), Severity::Error);
+            SaveOutcome::Failed(e) => {
+                self.set_status(e.clone(), Severity::Error);
                 false
             }
+            SaveOutcome::Cancelled => false,
         }
     }
 
@@ -875,6 +942,7 @@ impl FedApp {
     /// Carries out the effects of the vim keys handled this frame on the active tab.
     fn apply_vim_effects(&mut self, ctx: &egui::Context, effects: Vec<VimEffect>) {
         for effect in effects {
+            let last = ends_vim_frame(&effect);
             match effect {
                 VimEffect::SetClipboard(text) => ctx.copy_text(text),
                 VimEffect::Message(text) => self.set_vim_message(text, false),
@@ -882,7 +950,8 @@ impl FedApp {
                 VimEffect::Write(None) => {
                     self.vim_write();
                 }
-                VimEffect::Write(Some(path)) => self.vim_write_copy(path),
+                VimEffect::Write(Some(path)) => self.vim_write_copy(path, false),
+                VimEffect::ForceWrite(path) => self.vim_write_copy(path, true),
                 VimEffect::Quit { force } => self.vim_quit(ctx, force),
                 VimEffect::WriteQuit => {
                     if self.vim_write() {
@@ -892,33 +961,36 @@ impl FedApp {
                 VimEffect::Edit(path) => self.vim_edit(path),
                 VimEffect::GotoLine(line) => self.vim_goto_line(line),
             }
+            if last {
+                break;
+            }
         }
     }
 
     /// `:w`: saves the active tab (Save As dialog when untitled) and reports the outcome in
     /// the command bar. Returns true when the file was written.
     fn vim_write(&mut self) -> bool {
-        let saved = self.save_tab(self.active);
-        if saved {
-            let path = tab_path(&self.tabs[self.active]);
-            self.set_vim_message(format!("\"{path}\" written"), false);
-            return true;
-        }
-        let error = self
-            .status
-            .as_ref()
-            .filter(|s| s.severity == Severity::Error)
-            .map(|s| s.text.clone());
-        if let Some(text) = error {
-            self.set_vim_message(text, true);
-        }
-        false
+        let outcome = self.save_tab_outcome(self.active);
+        let saved = self.report_save(self.active, &outcome);
+        let path = tab_path(&self.tabs[self.active]);
+        self.vim_message = vim_save_message(&outcome, &path);
+        saved
     }
 
-    /// `:w {file}`: writes a copy of the active tab, which stays bound to its own path.
-    fn vim_write_copy(&mut self, path: PathBuf) {
+    /// `:w {file}`: writes a copy of the active tab, which stays bound to its own path. An
+    /// existing other file is only overwritten with `force` (`:w!`); the tab's own file is a
+    /// plain `:w`.
+    fn vim_write_copy(&mut self, path: PathBuf, force: bool) {
         let tab = &mut self.tabs[self.active];
         let path = resolve_vim_path(path, tab.buffer.path());
+        if tab.buffer.path().is_some_and(|own| same_file(own, &path)) {
+            self.vim_write();
+            return;
+        }
+        if !force && write_copy_refused(&path, tab.buffer.path()) {
+            self.set_vim_message(VIM_FILE_EXISTS.to_string(), true);
+            return;
+        }
         tab.end_typing();
         match tab.buffer.write_copy(&path) {
             Ok(()) => self.set_vim_message(format!("\"{}\" written", path.display()), false),
@@ -1050,8 +1122,12 @@ impl eframe::App for FedApp {
             let mut marks = std::mem::take(&mut tab.spell_marks);
             let large = tab.buffer.is_large();
             let edit = opts.edit;
+            let mut frame_ended = false;
             let mut route_to_vim = |ev: &egui::Event, tab: &mut Tab| {
                 vim_key_seen = true;
+                if frame_ended {
+                    return true;
+                }
                 let keys: Vec<VimKey> = match ev {
                     // Pasting types the text in Insert mode only (p/P use the register).
                     egui::Event::Paste(text) if tab.vim.mode() == Mode::Insert => text
@@ -1065,7 +1141,11 @@ impl eframe::App for FedApp {
                     let fx = tab
                         .vim
                         .handle_key(key, &mut tab.buffer, &mut tab.editor, &edit);
+                    frame_ended = fx.iter().any(ends_vim_frame);
                     vim_effects.extend(fx);
+                    if frame_ended {
+                        break;
+                    }
                 }
                 true
             };
@@ -1253,6 +1333,52 @@ mod tests {
             resolve_vim_path(PathBuf::from("a.txt"), Some(Path::new("b.txt"))),
             PathBuf::from("a.txt")
         );
+    }
+
+    #[test]
+    fn write_copy_refuses_existing_other_files() {
+        let dir = std::env::temp_dir().join(format!("fed-app-{}-wcopy", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let own = dir.join("own.txt");
+        let other = dir.join("other.txt");
+        std::fs::write(&own, "a").unwrap();
+        std::fs::write(&other, "b").unwrap();
+        assert!(write_copy_refused(&other, Some(&own)));
+        assert!(write_copy_refused(&other, None));
+        assert!(
+            !write_copy_refused(&own, Some(&own)),
+            "own file is a plain write"
+        );
+        assert!(!write_copy_refused(&dir.join("new.txt"), Some(&own)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn vim_save_message_reflects_the_outcome() {
+        assert_eq!(
+            vim_save_message(&SaveOutcome::Saved, "a.txt"),
+            Some(VimMessage {
+                text: "\"a.txt\" written".into(),
+                error: false
+            })
+        );
+        assert_eq!(
+            vim_save_message(&SaveOutcome::Failed("denied".into()), "a.txt"),
+            Some(VimMessage {
+                text: "denied".into(),
+                error: true
+            })
+        );
+        assert_eq!(vim_save_message(&SaveOutcome::Cancelled, "a.txt"), None);
+    }
+
+    #[test]
+    fn tab_changing_effects_end_the_vim_frame() {
+        assert!(ends_vim_frame(&VimEffect::Quit { force: false }));
+        assert!(ends_vim_frame(&VimEffect::WriteQuit));
+        assert!(ends_vim_frame(&VimEffect::Edit(PathBuf::from("x"))));
+        assert!(!ends_vim_frame(&VimEffect::Write(None)));
+        assert!(!ends_vim_frame(&VimEffect::Message("m".into())));
     }
 
     #[test]

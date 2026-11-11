@@ -149,6 +149,10 @@ pub struct ViewOutput {
 pub struct ViewState {
     /// The widget held keyboard focus since the last `request_focus` (or since creation).
     focus_acquired: bool,
+    /// Char index hit by the last primary press (before any vim clamping of the caret).
+    press_pos: Option<usize>,
+    /// The pointer left the press position since the last press.
+    dragged: bool,
     /// Longest line display width in columns, with the revision and tab width it was
     /// computed for.
     max_line_cols: Option<(u64, usize, usize)>,
@@ -860,12 +864,17 @@ impl Frame<'_> {
             response.request_focus();
             // The pointer may already have moved within this frame: anchor at the press.
             let pos = self.hit_test(ui, press_origin.unwrap_or(pointer), pl);
+            self.tab.view.press_pos = Some(pos);
+            self.tab.view.dragged = false;
             self.tab
                 .apply(EditCommand::SetCaret { pos, select: shift }, &edit);
         }
         if down && response.is_pointer_button_down_on() {
             let pos = self.hit_test(ui, pointer, pl);
-            if pos != self.tab.editor.selection.head {
+            let view = &mut self.tab.view;
+            view.dragged |= view.press_pos != Some(pos);
+            let head = self.tab.editor.selection.head;
+            if drag_moves_head(pos, head, self.tab.view.dragged) {
                 self.tab
                     .apply(EditCommand::SetCaret { pos, select: true }, &edit);
             }
@@ -1012,6 +1021,13 @@ impl Frame<'_> {
     }
 }
 
+/// True when a held primary button at char `pos` must move the selection head. Nothing moves
+/// until the pointer has left the press position (`dragged`), so a caret that vim clamped
+/// after the press (a click past the line end) does not turn the click into a selection.
+fn drag_moves_head(pos: usize, head: usize, dragged: bool) -> bool {
+    dragged && pos != head
+}
+
 /// Selection rectangles (galley coordinates) for display columns `a..b`, with `extra`
 /// width appended after the last row when the selection includes the newline.
 fn selection_rects(galley: &Galley, a: usize, b: usize, extra: f32) -> Vec<Rect> {
@@ -1148,6 +1164,17 @@ mod tests {
             event_to_command(&egui::Event::Paste("x".into()), 1),
             Some(EditCommand::Paste("x".into()))
         );
+    }
+
+    #[test]
+    fn held_click_past_clamped_caret_does_not_drag() {
+        // Press at 3 (past the line end), vim clamped the caret to 2: no selection.
+        assert!(!drag_moves_head(3, 2, false));
+        // The pointer moved away from the press position: the drag extends the selection.
+        assert!(drag_moves_head(5, 2, true));
+        // Back on the press position after a real drag: the head follows.
+        assert!(drag_moves_head(3, 5, true));
+        assert!(!drag_moves_head(5, 5, true));
     }
 
     #[test]

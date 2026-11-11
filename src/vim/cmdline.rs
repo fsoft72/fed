@@ -51,13 +51,17 @@ pub struct LineRange {
 pub enum ExCommand {
     /// `:w`, `:w {file}`.
     Write(Option<PathBuf>),
+    /// `:w! {file}`: write a copy even when the file exists.
+    ForceWrite(PathBuf),
     /// `:q`, `:q!`.
     Quit {
         /// Discard unsaved changes (`!`).
         force: bool,
     },
-    /// `:wq`, `:x`.
+    /// `:wq`.
     WriteQuit,
+    /// `:x`: write only when modified, then close.
+    Exit,
     /// `:e {file}`.
     Edit(PathBuf),
     /// `:{n}`, `:$`, `:'a`: jump to a line.
@@ -107,9 +111,11 @@ pub fn parse(input: &str) -> Result<ExCommand, String> {
     let arg = tail.trim();
     let cmd = match name {
         "w" | "write" if arg.is_empty() => ExCommand::Write(None),
+        "w" | "write" if bang => ExCommand::ForceWrite(PathBuf::from(arg)),
         "w" | "write" => ExCommand::Write(Some(PathBuf::from(arg))),
         "q" | "quit" if arg.is_empty() => ExCommand::Quit { force: bang },
-        "wq" | "x" | "xit" if arg.is_empty() => ExCommand::WriteQuit,
+        "wq" if arg.is_empty() => ExCommand::WriteQuit,
+        "x" | "xit" if arg.is_empty() => ExCommand::Exit,
         "e" | "edit" if arg.is_empty() => return Err(NO_FILE_NAME.to_string()),
         "e" | "edit" => ExCommand::Edit(PathBuf::from(arg)),
         "q" | "quit" | "wq" | "x" | "xit" => return Err("E488: Trailing characters".into()),
@@ -118,7 +124,12 @@ pub fn parse(input: &str) -> Result<ExCommand, String> {
     if range.is_some() {
         return Err(NO_RANGE_ALLOWED.to_string());
     }
-    if bang && !matches!(cmd, ExCommand::Quit { .. }) {
+    // `:w!` without a file is a plain write.
+    let bang_allowed = matches!(
+        cmd,
+        ExCommand::Quit { .. } | ExCommand::Write(None) | ExCommand::ForceWrite(_)
+    );
+    if bang && !bang_allowed {
         return Err(NO_BANG_ALLOWED.to_string());
     }
     Ok(cmd)
@@ -294,7 +305,10 @@ pub fn execute(
     match cmd {
         ExCommand::Write(path) => vec![VimEffect::Write(path)],
         ExCommand::Quit { force } => vec![VimEffect::Quit { force }],
+        ExCommand::ForceWrite(path) => vec![VimEffect::ForceWrite(path)],
         ExCommand::WriteQuit => vec![VimEffect::WriteQuit],
+        ExCommand::Exit if buf.is_modified() => vec![VimEffect::WriteQuit],
+        ExCommand::Exit => vec![VimEffect::Quit { force: false }],
         ExCommand::Edit(path) => vec![VimEffect::Edit(path)],
         ExCommand::Goto(addr) => {
             // A line past the end jumps to the last line, like vim.
@@ -409,13 +423,18 @@ mod tests {
         assert_eq!(parse("q"), Ok(ExCommand::Quit { force: false }));
         assert_eq!(parse("q!"), Ok(ExCommand::Quit { force: true }));
         assert_eq!(parse("wq"), Ok(ExCommand::WriteQuit));
-        assert_eq!(parse("x"), Ok(ExCommand::WriteQuit));
+        assert_eq!(parse("x"), Ok(ExCommand::Exit));
+        assert_eq!(parse("w!"), Ok(ExCommand::Write(None)));
+        assert_eq!(
+            parse("w! out.txt"),
+            Ok(ExCommand::ForceWrite(PathBuf::from("out.txt")))
+        );
+        assert!(parse("wq!").is_err());
         assert_eq!(
             parse("e other.txt"),
             Ok(ExCommand::Edit(PathBuf::from("other.txt")))
         );
         assert_eq!(parse("e"), Err(NO_FILE_NAME.to_string()));
-        assert!(parse("w!").is_err());
         assert!(parse("1,2w").is_err());
     }
 
@@ -586,6 +605,17 @@ mod tests {
         assert_eq!(ed.selection, Selection::caret(6));
         execute(parse("0").unwrap(), &mut buf, &mut ed, None);
         assert_eq!(ed.selection, Selection::caret(0));
+    }
+
+    #[test]
+    fn exit_writes_only_when_modified() {
+        let mut buf = Buffer::from_text("a\n");
+        let mut ed = EditorState::default();
+        let fx = execute(ExCommand::Exit, &mut buf, &mut ed, None);
+        assert_eq!(fx, vec![VimEffect::Quit { force: false }]);
+        buf.replace(0..0, "x");
+        let fx = execute(ExCommand::Exit, &mut buf, &mut ed, None);
+        assert_eq!(fx, vec![VimEffect::WriteQuit]);
     }
 
     #[test]

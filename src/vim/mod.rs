@@ -75,6 +75,8 @@ pub enum VimEffect {
     Error(String),
     /// Write the buffer, to the given path when present.
     Write(Option<PathBuf>),
+    /// Write a copy to the path even when that file exists (`:w! {file}`).
+    ForceWrite(PathBuf),
     /// Close the tab, discarding changes when `force`.
     Quit {
         /// Discard unsaved changes.
