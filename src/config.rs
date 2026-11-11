@@ -269,10 +269,23 @@ pub fn save_session(paths: &ConfigPaths, session: &Session) -> io::Result<()> {
     write_in_config_dir(paths, &paths.session_file(), &text)
 }
 
-/// Creates the config directory and writes `text` to `file`.
+/// Suffix of the temporary file written next to a config file before it is renamed.
+const TMP_SUFFIX: &str = ".fed-tmp";
+
+/// Creates the config directory and writes `text` to `file` atomically: the content goes to
+/// a temporary file in the same directory which is then renamed over `file`, so a crash or
+/// a full disk never leaves a truncated config behind.
 fn write_in_config_dir(paths: &ConfigPaths, file: &Path, text: &str) -> io::Result<()> {
     std::fs::create_dir_all(&paths.dir)?;
-    std::fs::write(file, text)
+    let mut tmp_name = file.as_os_str().to_os_string();
+    tmp_name.push(TMP_SUFFIX);
+    let tmp = PathBuf::from(tmp_name);
+    let result = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, file));
+    if result.is_err() {
+        // Best effort cleanup; the write or rename error is the one worth reporting.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -352,6 +365,29 @@ mod tests {
         };
         save_settings(&paths, &custom).unwrap();
         assert_eq!(load_settings(&paths).0, custom);
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[test]
+    fn settings_save_is_atomic_and_leaves_no_temp_file() {
+        let paths = ConfigPaths::new(temp_dir("atomic"));
+        save_settings(&paths, &Settings::default()).unwrap();
+        let custom = Settings {
+            tab_width: 8,
+            ..Settings::default()
+        };
+        save_settings(&paths, &custom).unwrap();
+        assert_eq!(load_settings(&paths).0, custom);
+        let names: Vec<_> = std::fs::read_dir(&paths.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![paths.settings_file().file_name().unwrap()]);
+        // A failing rename (target is a directory) reports the error and cleans up.
+        std::fs::remove_file(paths.settings_file()).unwrap();
+        std::fs::create_dir(paths.settings_file()).unwrap();
+        assert!(save_settings(&paths, &custom).is_err());
+        assert_eq!(std::fs::read_dir(&paths.dir).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 }

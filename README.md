@@ -33,7 +33,11 @@ fed [files...]
   session" is on, the files that were open when the last `fed` window closed.
 - Every launch is an independent process with its own window.
 - Files are read and written as UTF-8 only: a file that is not valid UTF-8 shows an error instead
-  of being opened. Line endings (LF or CRLF) are kept as found.
+  of being opened.
+- Line endings: the file is saved with its majority line ending, CRLF when CRLF lines outnumber
+  bare LF lines and LF otherwise (a tie or a new file is LF), so a mostly-LF file with one stray
+  CRLF is saved as all LF. A lone CR (old Mac ending) is read as LF. Only LF breaks lines: form
+  feed, vertical tab, NEL and the Unicode line/paragraph separators are ordinary characters.
 - The status bar shows the file path, `line:column`, the line ending, the vim mode (when on) and
   `[+]` for unsaved changes. Closing a tab or the window with unsaved changes asks first.
 
@@ -187,8 +191,9 @@ For `.md`, `.markdown` and `.mdown` tabs, `Ctrl+Shift+V` or the "Preview" button
 opens a live preview panel on the right. It renders CommonMark plus tables, task lists, footnotes
 and strikethrough, and local images relative to the file. Remote images are not fetched (their
 alt text is shown) and raw HTML is not rendered. Code blocks are shown in monospace without
-colors. Clicking an `http`, `https`, `mailto` or `file` link opens it with the system handler
-(the default browser for web links); other links, such as relative ones, are ignored. If the
+colors. Clicking an `http`, `https` or `mailto` link opens it with the system handler
+(the default browser for web links); other links, such as relative ones and `file:` links
+(which could launch programs), are ignored. If the
 system cannot open it, the error shows in the status bar.
 
 ## Large files

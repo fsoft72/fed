@@ -1,7 +1,7 @@
 //! Live Markdown preview: path detection, image URL rewriting and the preview panel state.
 
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -21,12 +21,15 @@ pub fn is_markdown_path(path: Option<&Path>) -> bool {
 }
 
 /// URL scheme prefixes (lowercase) that a clicked link may open in the system.
-const OPENABLE_URL_PREFIXES: [&str; 4] = ["http://", "https://", "mailto:", "file:"];
+/// `file:` is deliberately absent: opening local files could launch programs
+/// (executables, `.desktop` entries) or leak credentials through `file://host/share`.
+const OPENABLE_URL_PREFIXES: [&str; 3] = ["http://", "https://", "mailto:"];
 
 /// Returns true when a clicked link may be handed to the system opener: only `http`,
-/// `https`, `mailto` and `file` URLs (scheme case-insensitive). Anything else is ignored.
+/// `https` and `mailto` URLs (scheme case-insensitive, surrounding whitespace ignored).
+/// Anything else is ignored.
 pub fn is_openable_url(url: &str) -> bool {
-    let url = url.trim_start();
+    let url = url.trim();
     OPENABLE_URL_PREFIXES.iter().any(|prefix| {
         url.get(..prefix.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
@@ -106,13 +109,23 @@ pub fn rewrite_image_paths(text: &str, base_dir: &Path) -> String {
         if has_scheme(&dest_url) || dest_url.starts_with('/') || dest_url.is_empty() {
             continue;
         }
-        let Some(offset) = text[range.clone()].rfind(dest_url.as_ref()) else {
+        let Some(start) = destination_start(text, range.clone(), &dest_url) else {
             continue;
         };
-        let start = range.start + offset;
         edits.push((start..start + dest_url.len(), file_url(base_dir, &dest_url)));
     }
     apply_edits(text, edits)
+}
+
+/// Returns the byte offset in `text` where the destination `dest` of the image spanning
+/// `range` starts: the first occurrence after the `](` that ends the alt text, optionally
+/// wrapped in `<...>`. Searching from the `](` keeps an identical title or alt text from
+/// being mistaken for the destination.
+fn destination_start(text: &str, range: Range<usize>, dest: &str) -> Option<usize> {
+    let image = &text[range.clone()];
+    let open = image.find("](")? + 2;
+    let offset = image[open..].find(dest)?;
+    Some(range.start + open + offset)
 }
 
 /// Consumes events up to the end of the current image and returns its plain alt text.
@@ -152,6 +165,24 @@ fn apply_edits(text: &str, edits: Vec<(Range<usize>, String)>) -> String {
     out
 }
 
+/// Returns the absolute directory that relative image paths of the file at `path` resolve
+/// against. A relative path (`fed README.md`) is made absolute against the current
+/// directory, so the rewritten `file://` URLs never become `file:///img.png`.
+fn absolute_base_dir(path: Option<&Path>) -> PathBuf {
+    let dir = path
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    if dir.is_absolute() {
+        return dir;
+    }
+    std::path::absolute(&dir).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&dir))
+            .unwrap_or(dir)
+    })
+}
+
 /// Rendered-preview state of one tab: the Markdown render cache and the last prepared source.
 pub struct Preview {
     /// Render cache of egui_commonmark (images, layout).
@@ -180,11 +211,7 @@ impl Preview {
     /// image paths are rewritten only when the buffer revision changed.
     pub fn show(&mut self, ui: &mut egui::Ui, buf: &Buffer) {
         if self.source.0 != buf.revision() {
-            let base = buf
-                .path()
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
+            let base = absolute_base_dir(buf.path());
             self.source = (
                 buf.revision(),
                 rewrite_image_paths(&buf.rope().to_string(), &base),
@@ -201,15 +228,14 @@ impl Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
-    fn openable_urls_are_web_mail_and_file_only() {
+    fn openable_urls_are_web_and_mail_only() {
         for url in [
             "http://example.com",
             "HTTPS://example.com/a?b",
             "mailto:me@example.com",
-            "file:///tmp/notes.md",
+            "  https://example.com  ",
         ] {
             assert!(is_openable_url(url), "{url}");
         }
@@ -222,6 +248,10 @@ mod tests {
             "ftp://example.com",
             "C:\\file.txt",
             "smb://server/share",
+            "file:///tmp/notes.md",
+            "FILE:///usr/bin/xterm",
+            "file://host/share/x.exe",
+            " file:///etc/passwd",
             "httpx://example.com",
             "é",
         ] {
@@ -244,6 +274,28 @@ mod tests {
         let base = PathBuf::from("/abs/path");
         let out = rewrite_image_paths("see ![a](img/x.png) ok", &base);
         assert_eq!(out, "see ![a](file:///abs/path/img/x.png) ok");
+    }
+
+    #[test]
+    fn destination_found_after_bracket_not_in_title() {
+        let out = rewrite_image_paths("![x.png](x.png \"x.png\")", Path::new("/d"));
+        assert_eq!(out, "![x.png](file:///d/x.png \"x.png\")");
+    }
+
+    #[test]
+    fn relative_base_dir_becomes_absolute() {
+        let base = absolute_base_dir(Some(Path::new("README.md")));
+        assert!(base.is_absolute(), "{base:?}");
+        assert_eq!(base, std::env::current_dir().unwrap());
+        let base = absolute_base_dir(Some(Path::new("docs/a.md")));
+        assert_eq!(base, std::env::current_dir().unwrap().join("docs"));
+        let out = rewrite_image_paths("![a](img/x.png)", &base);
+        assert!(!out.contains("file:///img"), "{out}");
+        assert!(out.contains("/docs/img/x.png"), "{out}");
+        assert_eq!(
+            absolute_base_dir(Some(Path::new("/abs/a.md"))),
+            PathBuf::from("/abs")
+        );
     }
 
     #[test]

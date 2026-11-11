@@ -18,7 +18,7 @@ egui_extras = { version = "0.37", features = ["file", "image"] }
 egui_commonmark = { version = "0.26", features = ["load-images"] }
 pulldown-cmark = "0.13"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
-ropey = "1.6"
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 regex = "1.13"
 spellbook = "0.4"

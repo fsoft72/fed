@@ -95,10 +95,12 @@ impl Buffer {
         Self::from_text("")
     }
 
-    /// Creates a buffer from `text`; CRLF is detected and normalized to LF.
+    /// Creates a buffer from `text`. The line ending used on save is the majority one
+    /// (CRLF when CRLF lines outnumber bare LF lines, LF otherwise, ties go to LF); the
+    /// rope always holds LF only (CRLF and lone CR become LF).
     pub fn from_text(text: &str) -> Buffer {
-        let crlf = text.contains("\r\n");
-        let rope = Rope::from_str(&_normalize_newlines(text));
+        let crlf = detect_line_ending(text) == LineEnding::Crlf;
+        let rope = Rope::from_str(&normalize_newlines(text));
         let large =
             text.len() >= LARGE_FILE_BYTES || rope.lines().any(|l| l.len_chars() > LONG_LINE_CHARS);
         Buffer {
@@ -158,10 +160,13 @@ impl Buffer {
         Ok(())
     }
 
-    /// Binds the buffer to `path` and saves there.
+    /// Saves to `path` and binds the buffer to it. On failure the buffer keeps its previous
+    /// path, so a failed "Save As" does not silently retarget later saves.
     pub fn save_as(&mut self, path: PathBuf) -> Result<(), BufferError> {
+        self.write_copy(&path)?;
         self.path = Some(path);
-        self.save()
+        self.saved_position = Some(self.position);
+        Ok(())
     }
 
     /// Writes the content to `path` atomically without changing the buffer state.
@@ -240,7 +245,7 @@ impl Buffer {
         if range.is_empty() && text.is_empty() {
             return;
         }
-        let text = _normalize_newlines(text);
+        let text = normalize_newlines(text);
         let edit = self.apply(range, &text);
         if self.group_depth > 0 {
             self.group_edits.push(edit);
@@ -365,8 +370,19 @@ impl Buffer {
     }
 }
 
+/// Returns the majority line ending of `text`: CRLF only when CRLF line breaks outnumber
+/// bare LF ones. Lone CR is not counted (it is normalized to LF).
+fn detect_line_ending(text: &str) -> LineEnding {
+    let crlf = text.matches("\r\n").count();
+    let lf = text.matches('\n').count() - crlf;
+    match crlf > lf {
+        true => LineEnding::Crlf,
+        false => LineEnding::Lf,
+    }
+}
+
 /// Maps `\r\n` and lone `\r` to `\n` so the rope never contains `\r`.
-fn _normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains('\r') {
         return text.into();
     }
@@ -395,6 +411,57 @@ mod tests {
         buf.replace(0..1, "x");
         buf.save().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"x\r\nb\r\n");
+    }
+
+    #[test]
+    fn mostly_lf_file_with_one_crlf_saves_as_lf() {
+        let path = temp_dir("mixed-lf").join("a.txt");
+        fs::write(&path, "a\nb\r\nc\nd\n").unwrap();
+        let mut buf = Buffer::load(&path).unwrap();
+        assert_eq!(buf.line_ending(), LineEnding::Lf);
+        buf.save().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"a\nb\nc\nd\n");
+    }
+
+    #[test]
+    fn mostly_crlf_file_saves_as_crlf() {
+        let path = temp_dir("mixed-crlf").join("a.txt");
+        fs::write(&path, "a\r\nb\nc\r\nd\r\n").unwrap();
+        let mut buf = Buffer::load(&path).unwrap();
+        assert_eq!(buf.line_ending(), LineEnding::Crlf);
+        buf.save().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"a\r\nb\r\nc\r\nd\r\n");
+    }
+
+    #[test]
+    fn line_ending_tie_and_lone_cr_go_to_lf() {
+        assert_eq!(detect_line_ending("a\r\nb\n"), LineEnding::Lf);
+        assert_eq!(detect_line_ending("a\rb\rc\r\n"), LineEnding::Crlf);
+        assert_eq!(detect_line_ending(""), LineEnding::Lf);
+        let buf = Buffer::from_text("a\rb");
+        assert_eq!(buf.text(), "a\nb");
+    }
+
+    #[test]
+    fn failed_save_as_keeps_previous_path() {
+        let dir = temp_dir("saveas-fail");
+        let old = dir.join("old.txt");
+        let mut buf = Buffer::load(&old).unwrap();
+        buf.replace(0..0, "x");
+        let bad = dir.join("missing-dir").join("new.txt");
+        assert!(buf.save_as(bad).is_err());
+        assert_eq!(buf.path(), Some(old.as_path()));
+        assert!(buf.is_modified());
+    }
+
+    #[test]
+    fn form_feed_and_unicode_separators_are_not_line_breaks() {
+        let buf = Buffer::from_text("a\x0cb\nc");
+        assert_eq!(buf.rope().len_lines(), 2);
+        for sep in ['\u{0b}', '\u{85}', '\u{2028}', '\u{2029}'] {
+            let buf = Buffer::from_text(&format!("a{sep}b"));
+            assert_eq!(buf.rope().len_lines(), 1, "{sep:?}");
+        }
     }
 
     #[test]

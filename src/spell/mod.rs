@@ -8,7 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use eframe::egui::{self, Color32, Stroke, TextFormat};
 use ropey::Rope;
@@ -168,7 +168,8 @@ fn parse_dictionary(aff: &Path, dic: &Path) -> Result<spellbook::Dictionary, Str
 
 /// Updates the shared status and wakes the UI.
 fn set_status(shared: &Shared, ctx: &egui::Context, status: SpellStatus) {
-    *shared.status.lock().expect("spell status poisoned") = status;
+    // Tolerate poisoning: a crashed loader must still be able to report its failure.
+    *shared.status.lock().unwrap_or_else(PoisonError::into_inner) = status;
     ctx.request_repaint();
 }
 
@@ -225,6 +226,18 @@ fn load_all(shared: &Shared, ctx: &egui::Context, paths: &ConfigPaths, allow_dow
     set_status(shared, ctx, status);
 }
 
+/// Status message set when the loader thread panics.
+const LOADER_CRASHED: &str = "dictionary loader crashed";
+
+/// Runs the loader body `load` and turns a panic into `SpellStatus::Failed`, so the status
+/// never stays `Loading` forever and a retry is offered.
+fn run_guarded(shared: &Shared, ctx: &egui::Context, load: impl FnOnce()) {
+    let Err(_) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(load)) else {
+        return;
+    };
+    set_status(shared, ctx, SpellStatus::Failed(LOADER_CRASHED.to_string()));
+}
+
 impl SpellService {
     /// Starts loading the dictionaries in a thread and requests a repaint as it progresses.
     pub fn spawn(ctx: egui::Context, paths: ConfigPaths, allow_download: bool) -> SpellService {
@@ -248,7 +261,11 @@ impl SpellService {
         let ctx = self.ctx.clone();
         let paths = self.paths.clone();
         let allow_download = self.allow_download;
-        std::thread::spawn(move || load_all(&shared, &ctx, &paths, allow_download));
+        std::thread::spawn(move || {
+            run_guarded(&shared, &ctx, || {
+                load_all(&shared, &ctx, &paths, allow_download)
+            })
+        });
     }
 
     /// Returns the current loading status.
@@ -256,7 +273,7 @@ impl SpellService {
         self.shared
             .status
             .lock()
-            .expect("spell status poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -547,6 +564,27 @@ mod tests {
         assert!(!c.check("albero"));
         c.add_dictionary(spellbook::Dictionary::new("SET UTF-8\n", "1\nalbero\n").unwrap());
         assert!(c.check("albero"));
+    }
+
+    #[test]
+    fn loader_panic_sets_failed_status() {
+        let shared = Shared {
+            status: Mutex::new(SpellStatus::Loading),
+            checker: Mutex::new(None),
+        };
+        let ctx = egui::Context::default();
+        run_guarded(&shared, &ctx, || panic!("simulated loader crash"));
+        assert_eq!(
+            *shared.status.lock().unwrap(),
+            SpellStatus::Failed(LOADER_CRASHED.to_string())
+        );
+        // A normal run leaves the status alone.
+        let shared = Shared {
+            status: Mutex::new(SpellStatus::Ready),
+            checker: Mutex::new(None),
+        };
+        run_guarded(&shared, &ctx, || {});
+        assert_eq!(*shared.status.lock().unwrap(), SpellStatus::Ready);
     }
 
     #[test]

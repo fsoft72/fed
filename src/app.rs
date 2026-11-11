@@ -1077,7 +1077,11 @@ impl FedApp {
             });
             urls
         });
-        for url in urls.into_iter().filter(|u| markdown::is_openable_url(u)) {
+        let urls = urls
+            .iter()
+            .map(|u| u.trim().to_string())
+            .filter(|u| markdown::is_openable_url(u));
+        for url in urls {
             let tx = self.link_error_tx.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {

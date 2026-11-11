@@ -565,3 +565,10 @@ fn insert_group_can_be_closed_and_reopened() {
     h.feed("u");
     assert_eq!(h.buf.text(), "");
 }
+
+#[test]
+fn dd_treats_form_feed_as_text_not_line_break() {
+    assert_eq!(run("a\x0cb\nc", 0, "dd").0, "c");
+    let h = Harness::new("a\x0cb\nc", 0);
+    assert_eq!(h.buf.rope().len_lines(), 2);
+}
