@@ -11,6 +11,7 @@ use eframe::egui::{
 };
 use ropey::Rope;
 
+use crate::buffer::Buffer;
 use crate::editing::{EditCommand, EditSettings};
 use crate::tab::Tab;
 use crate::text_nav::{self, CharClass};
@@ -51,7 +52,16 @@ pub struct LineDecor {
 }
 
 /// Supplies per-line formatting (syntax highlighting, spell underlines, find matches).
+///
+/// Timing: `show_editor` applies this frame's keyboard edits first, then calls `prepare` with
+/// the updated buffer, then calls `decorate` for each line it lays out. Decorators that cache
+/// per-buffer state should refresh it in `prepare` so no stale spans are painted in the frame
+/// of an edit. When the buffer changed, `show_editor` also requests a repaint so state
+/// refreshed asynchronously is shown promptly.
 pub trait Decorator {
+    /// Called once per frame after input handling and before any `decorate` call.
+    fn prepare(&mut self, _buffer: &Buffer) {}
+
     /// Returns formatted char ranges for `line` (without its newline). Ranges are char
     /// indices within the line; gaps are drawn with `base`.
     fn decorate(
@@ -98,8 +108,9 @@ pub struct ViewOutput {
 pub struct ViewState {
     /// Focus was requested once when the widget was first shown.
     focus_requested: bool,
-    /// Longest line length in chars, for the buffer revision it was computed at.
-    max_line_chars: Option<(u64, usize)>,
+    /// Longest line display width in columns, with the revision and tab width it was
+    /// computed for.
+    max_line_cols: Option<(u64, usize, usize)>,
     /// Wrapped line heights (word wrap only).
     wrap: WrapCache,
 }
@@ -234,6 +245,7 @@ pub fn show_editor(
             handle_keyboard(ui, tab, opts, page, &mut key_handler, &mut out);
         }
     }
+    deco.prepare(&tab.buffer);
     let scroll = if opts.word_wrap {
         egui::ScrollArea::vertical()
     } else {
@@ -254,6 +266,9 @@ pub fn show_editor(
             frame.run(ui, viewport, &mut out);
         });
     out.changed = tab.buffer.revision() != revision_before;
+    if out.changed {
+        ui.ctx().request_repaint();
+    }
     out
 }
 
@@ -386,6 +401,15 @@ fn line_at_y(tops: &[f32], y: f32) -> usize {
         .partition_point(|&top| top <= y)
         .saturating_sub(1)
         .min(lines - 1)
+}
+
+/// Display width in columns of `chars` (a line, newline excluded from the count); tabs take
+/// `tab_width` columns.
+fn display_width(chars: impl Iterator<Item = char>, tab_width: usize) -> usize {
+    chars
+        .filter(|&c| c != '\n')
+        .map(|c| if c == '\t' { tab_width } else { 1 })
+        .sum()
 }
 
 /// Converts a char column of `line` to a display column (tabs take `tab_width` columns).
@@ -574,8 +598,8 @@ impl Frame<'_> {
         let width = match wrap_width {
             Some(_) => viewport.width(),
             None => {
-                let chars = self.max_line_chars() as f32 * self.m.char_width;
-                (text_x + chars + SCROLL_MARGIN_CHARS * self.m.char_width).max(viewport.width())
+                let cols = self.max_line_cols() as f32 * self.m.char_width;
+                (text_x + cols + SCROLL_MARGIN_CHARS * self.m.char_width).max(viewport.width())
             }
         };
         let height = rows.total().max(viewport.height());
@@ -595,6 +619,11 @@ impl Frame<'_> {
         let galleys: Vec<(usize, Arc<Galley>)> = (first..=last)
             .map(|i| (i, self.layout_line(ui, i, wrap_width)))
             .collect();
+        if wrap_width.is_none() {
+            // Wide glyphs can make a visible line wider than its column estimate.
+            let widest = galleys.iter().map(|(_, g)| g.size().x).fold(0.0, f32::max);
+            ui.set_min_width(text_x + widest + SCROLL_MARGIN_CHARS * self.m.char_width);
+        }
         self.paint(ui, &galleys, &pl);
 
         let caret = self.caret_rect(ui, &galleys, &pl);
@@ -625,24 +654,26 @@ impl Frame<'_> {
         }
     }
 
-    /// Length in chars of the longest line, cached per buffer revision.
-    fn max_line_chars(&mut self) -> usize {
+    /// Display width in columns (tabs expanded) of the longest line, cached per revision.
+    fn max_line_cols(&mut self) -> usize {
         let revision = self.tab.buffer.revision();
-        if let Some((rev, chars)) = self.tab.view.max_line_chars
+        let tab_width = self.m.tab_width;
+        if let Some((rev, tw, cols)) = self.tab.view.max_line_cols
             && rev == revision
+            && tw == tab_width
         {
-            return chars;
+            return cols;
         }
-        let chars = self
+        let cols = self
             .tab
             .buffer
             .rope()
             .lines()
-            .map(|l| l.len_chars())
+            .map(|l| display_width(l.chars(), tab_width))
             .max()
             .unwrap_or(0);
-        self.tab.view.max_line_chars = Some((revision, chars));
-        chars
+        self.tab.view.max_line_cols = Some((revision, tab_width, cols));
+        cols
     }
 
     /// Lays out `line` with the decorator formats.
@@ -975,6 +1006,22 @@ mod tests {
         assert_eq!(line_at_y(&tops, 10.0), 1);
         assert_eq!(line_at_y(&tops, 35.0), 2);
         assert_eq!(line_at_y(&tops, 100.0), 2);
+    }
+
+    #[test]
+    fn display_width_expands_tabs() {
+        assert_eq!(display_width("\t\tab\n".chars(), 4), 10);
+        assert_eq!(display_width("abc".chars(), 4), 3);
+        assert_eq!(display_width("".chars(), 4), 0);
+    }
+
+    #[test]
+    fn decorator_prepare_defaults_to_noop() {
+        let mut deco = PlainDecorator;
+        deco.prepare(&Buffer::from_text("x"));
+        let spans = deco.decorate(0, "abc", &TextFormat::default());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0, 0..3);
     }
 
     #[test]
