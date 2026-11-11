@@ -1439,8 +1439,13 @@ impl eframe::App for FedApp {
                 true => Some(&mut route_to_vim),
                 false => None,
             };
+            // Plain text until the syntax regexes are compiled off the UI thread.
+            let warm = self
+                .loaded_assets
+                .as_ref()
+                .is_some_and(|a| a.ensure_warm(&syntax, tab.buffer.rope(), ui.ctx()));
             let mut highlighted =
-                HighlightDecorator::new(&mut cache, assets, &syntax, theme, !large);
+                HighlightDecorator::new(&mut cache, assets, &syntax, theme, !large && warm);
             let spell_checker = checker.filter(|_| !large);
             let spell_active = spell_checker.is_some();
             let out = match spell_checker {

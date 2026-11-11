@@ -1,5 +1,6 @@
 //! Incremental syntax highlighting with syntect: asset loading, per-line cache and decorator.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -29,6 +30,17 @@ static STRING_PREFIX: LazyLock<Scope> =
     LazyLock::new(|| Scope::new(STRING_SCOPE).expect("valid scope"));
 /// Width of the underline stroke for underlined tokens.
 const UNDERLINE_WIDTH: f32 = 1.0;
+/// Maximum number of lines a background warm-up parses.
+const WARM_UP_LINES: usize = 2000;
+
+/// Warm-up progress of one syntax.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Warmth {
+    /// A background thread is compiling the syntax regexes.
+    Pending,
+    /// The syntax regexes are compiled: parsing on the UI thread is cheap.
+    Ready,
+}
 
 /// Syntax definitions and themes, loaded once off the UI thread.
 pub struct HighlightAssets {
@@ -36,6 +48,8 @@ pub struct HighlightAssets {
     pub syntaxes: SyntaxSet,
     /// Color themes.
     pub themes: ThemeSet,
+    /// Warm-up progress by syntax name (see `ensure_warm`).
+    warm: Mutex<HashMap<String, Warmth>>,
 }
 
 impl HighlightAssets {
@@ -44,6 +58,48 @@ impl HighlightAssets {
         HighlightAssets {
             syntaxes: two_face::syntax::extra_newlines(),
             themes: ThemeSet::load_defaults(),
+            warm: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns true when `syntax` is ready to be highlighted on the UI thread.
+    ///
+    /// syntect compiles a syntax's regexes lazily, the first time the parser meets them, and
+    /// big grammars (TypeScript) take hundreds of milliseconds to compile. The first call for
+    /// a syntax returns false and parses `sample` on a background thread instead: the compiled
+    /// regexes are cached in the shared `SyntaxSet`, and `ctx` is repainted when done.
+    pub fn ensure_warm(self: &Arc<Self>, syntax: &str, sample: &Rope, ctx: &egui::Context) -> bool {
+        let mut warm = self.warm.lock().expect("warm-up map poisoned");
+        match warm.get(syntax) {
+            Some(Warmth::Ready) => return true,
+            Some(Warmth::Pending) => return false,
+            None => {}
+        }
+        warm.insert(syntax.to_string(), Warmth::Pending);
+        drop(warm);
+        let assets = Arc::clone(self);
+        let syntax = syntax.to_string();
+        let sample = sample.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            assets.warm_up(&syntax, &sample);
+            let mut warm = assets.warm.lock().expect("warm-up map poisoned");
+            warm.insert(syntax, Warmth::Ready);
+            drop(warm);
+            ctx.request_repaint();
+        });
+        false
+    }
+
+    /// Parses the first `WARM_UP_LINES` lines of `sample` with `syntax`, so the regexes the
+    /// text needs get compiled. The parse result is thrown away.
+    fn warm_up(&self, syntax: &str, sample: &Rope) {
+        let mut state = ParseState::new(find_syntax(self, syntax));
+        for line in sample.lines().take(WARM_UP_LINES) {
+            // A parse error only means fewer regexes are warmed: the UI parse reports it.
+            if state.parse_line(&line.to_string(), &self.syntaxes).is_err() {
+                return;
+            }
         }
     }
 
@@ -490,6 +546,23 @@ mod tests {
         assert_eq!(spans.first().map(|s| s.range.start), Some(0));
         assert_eq!(spans.last().map(|s| s.range.end), Some(len));
         assert!(spans.windows(2).all(|w| w[0].range.end == w[1].range.start));
+    }
+
+    #[test]
+    fn ensure_warm_turns_ready_after_background_parse() {
+        let a = Arc::new(assets());
+        let ctx = egui::Context::default();
+        let rope = Rope::from_str("const x: number = 1; // note\n");
+        assert!(!a.ensure_warm("TypeScript", &rope, &ctx));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !a.ensure_warm("TypeScript", &rope, &ctx) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "warm-up never finished"
+            );
+            std::thread::yield_now();
+        }
+        assert!(a.ensure_warm("TypeScript", &rope, &ctx));
     }
 
     #[test]
