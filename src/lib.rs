@@ -5,6 +5,7 @@ pub mod buffer;
 pub mod config;
 pub mod editing;
 pub mod find_bar;
+pub mod highlight;
 pub mod keymap;
 pub mod search;
 pub mod tab;

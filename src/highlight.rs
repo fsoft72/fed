@@ -1,0 +1,447 @@
+//! Incremental syntax highlighting with syntect: asset loading, per-line cache and decorator.
+
+use std::ops::Range;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use eframe::egui::{self, Color32, Stroke, TextFormat};
+use ropey::Rope;
+use syntect::highlighting::ThemeSet;
+use syntect::highlighting::{
+    FontStyle, HighlightState, Highlighter, RangedHighlightIterator, Style,
+};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
+
+use crate::buffer::Buffer;
+use crate::view::Decorator;
+
+/// Name of the fallback syntax.
+const PLAIN_TEXT: &str = "Plain Text";
+/// Scope prefix of comments.
+const COMMENT_SCOPE: &str = "comment";
+/// Scope prefix of string literals.
+const STRING_SCOPE: &str = "string";
+/// Width of the underline stroke for underlined tokens.
+const UNDERLINE_WIDTH: f32 = 1.0;
+
+/// Syntax definitions and themes, loaded once off the UI thread.
+pub struct HighlightAssets {
+    /// Syntax definitions (newline-aware).
+    pub syntaxes: SyntaxSet,
+    /// Color themes.
+    pub themes: ThemeSet,
+}
+
+impl HighlightAssets {
+    /// Loads the bundled syntaxes and themes (slow: call off the UI thread).
+    pub fn load() -> HighlightAssets {
+        HighlightAssets {
+            syntaxes: SyntaxSet::load_defaults_newlines(),
+            themes: ThemeSet::load_defaults(),
+        }
+    }
+
+    /// Returns the names of the available themes, sorted.
+    pub fn theme_names(&self) -> Vec<String> {
+        self.themes.themes.keys().cloned().collect()
+    }
+}
+
+/// Handle to assets that load on a background thread.
+pub struct AssetsHandle {
+    /// Filled by the loader thread when loading is done.
+    slot: Arc<Mutex<Option<Arc<HighlightAssets>>>>,
+}
+
+impl AssetsHandle {
+    /// Starts loading the assets in a thread and requests a repaint when they are ready.
+    pub fn spawn(ctx: egui::Context) -> AssetsHandle {
+        let slot = Arc::new(Mutex::new(None));
+        let thread_slot = Arc::clone(&slot);
+        std::thread::spawn(move || {
+            let assets = Arc::new(HighlightAssets::load());
+            *thread_slot.lock().expect("assets slot poisoned") = Some(assets);
+            ctx.request_repaint();
+        });
+        AssetsHandle { slot }
+    }
+
+    /// Returns the assets once loaded, without blocking on the loader.
+    pub fn get(&self) -> Option<Arc<HighlightAssets>> {
+        self.slot.lock().expect("assets slot poisoned").clone()
+    }
+}
+
+/// Coarse token class, used by the spell checker to pick checkable text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpanKind {
+    /// Inside a comment.
+    Comment,
+    /// Inside a string literal.
+    String,
+    /// Anything else.
+    Other,
+}
+
+/// Classifies a scope stack: comment wins over string, anything else is `Other`.
+pub fn span_kind(stack: &ScopeStack) -> SpanKind {
+    let mut kind = SpanKind::Other;
+    for scope in stack.as_slice() {
+        let name = scope.to_string();
+        if name.starts_with(COMMENT_SCOPE) {
+            return SpanKind::Comment;
+        }
+        if name.starts_with(STRING_SCOPE) {
+            kind = SpanKind::String;
+        }
+    }
+    kind
+}
+
+/// A styled run of text within one line.
+#[derive(Clone, Debug)]
+pub struct StyledSpan {
+    /// Char range within the line (newline excluded).
+    pub range: Range<usize>,
+    /// Foreground color.
+    pub color: Color32,
+    /// Italic font style.
+    pub italic: bool,
+    /// Bold font style.
+    pub bold: bool,
+    /// Underlined font style.
+    pub underline: bool,
+    /// Token class.
+    pub kind: SpanKind,
+}
+
+/// Returns the name of the syntax for `path` by extension, or `"Plain Text"`.
+pub fn syntax_for_path(assets: &HighlightAssets, path: Option<&Path>) -> String {
+    let ext = path.and_then(|p| p.extension()).and_then(|e| e.to_str());
+    ext.and_then(|e| assets.syntaxes.find_syntax_by_extension(e))
+        .map_or_else(|| PLAIN_TEXT.to_string(), |s| s.name.clone())
+}
+
+/// Finds a syntax by name, then by extension, falling back to plain text.
+fn find_syntax<'a>(assets: &'a HighlightAssets, name_or_ext: &str) -> &'a SyntaxReference {
+    let syntaxes = &assets.syntaxes;
+    syntaxes
+        .find_syntax_by_name(name_or_ext)
+        .or_else(|| syntaxes.find_syntax_by_extension(name_or_ext))
+        .unwrap_or_else(|| syntaxes.find_syntax_plain_text())
+}
+
+/// Parser and highlighter state at the start of a line.
+#[derive(Clone)]
+struct LineState {
+    /// Syntax parser state.
+    parse: ParseState,
+    /// Theme highlighter state.
+    highlight: HighlightState,
+}
+
+/// Per-line highlight cache: spans plus the parser state needed to resume after any line.
+#[derive(Default)]
+pub struct HighlightCache {
+    /// `(syntax, theme)` the cache was built for.
+    key: Option<(String, String)>,
+    /// State at the start of each line; one longer than `spans` when initialised.
+    states: Vec<LineState>,
+    /// Spans of every line parsed so far.
+    spans: Vec<Vec<StyledSpan>>,
+}
+
+impl HighlightCache {
+    /// Creates an empty cache.
+    pub fn new() -> HighlightCache {
+        HighlightCache::default()
+    }
+
+    /// Forgets everything computed for `line` and the lines after it.
+    pub fn invalidate_from(&mut self, line: usize) {
+        self.spans.truncate(line);
+        self.states.truncate(line + 1);
+    }
+
+    /// Drops the whole cache (theme or syntax change).
+    pub fn reset(&mut self) {
+        self.key = None;
+        self.states.clear();
+        self.spans.clear();
+    }
+
+    /// Returns the styled spans of `line`, parsing forward from the last valid line state.
+    /// Spans cover the line text without its newline.
+    pub fn line_spans(
+        &mut self,
+        assets: &HighlightAssets,
+        syntax_name_or_ext: &str,
+        theme: &str,
+        rope: &Rope,
+        line: usize,
+    ) -> &[StyledSpan] {
+        let key = (syntax_name_or_ext.to_string(), theme.to_string());
+        if self.key.as_ref() != Some(&key) {
+            self.reset();
+            self.key = Some(key);
+        }
+        let Some(theme) = assets
+            .themes
+            .themes
+            .get(theme)
+            .or_else(|| assets.themes.themes.values().next())
+        else {
+            return &[];
+        };
+        if line >= rope.len_lines() {
+            return &[];
+        }
+        let highlighter = Highlighter::new(theme);
+        if self.states.is_empty() {
+            let syntax = find_syntax(assets, syntax_name_or_ext);
+            self.states.push(LineState {
+                parse: ParseState::new(syntax),
+                highlight: HighlightState::new(&highlighter, ScopeStack::new()),
+            });
+        }
+        while self.spans.len() <= line {
+            let idx = self.spans.len();
+            let mut state = self.states[idx].clone();
+            let text = rope.line(idx).to_string();
+            let spans = parse_line(assets, &highlighter, &mut state, &text);
+            self.spans.push(spans);
+            self.states.push(state);
+        }
+        &self.spans[line]
+    }
+}
+
+/// Parses and highlights one line (with its newline), advancing `state`.
+fn parse_line(
+    assets: &HighlightAssets,
+    highlighter: &Highlighter<'_>,
+    state: &mut LineState,
+    text: &str,
+) -> Vec<StyledSpan> {
+    let Ok(ops) = state.parse.parse_line(text, &assets.syntaxes) else {
+        return Vec::new();
+    };
+    let content_len = text.trim_end_matches(['\n', '\r']).len();
+    let mut stack = state.highlight.path.clone();
+    let mut out = Vec::new();
+    let iter = RangedHighlightIterator::new(&mut state.highlight, &ops, text, highlighter);
+    let mut next_op = 0;
+    for (style, _, range) in iter {
+        // The iterator skips empty segments, so sync the stack by position, not by index.
+        while next_op < ops.len() && ops[next_op].0 <= range.start {
+            // A scope stack error cannot be recovered here; keep the stack as is.
+            let _ = stack.apply(&ops[next_op].1);
+            next_op += 1;
+        }
+        let end = range.end.min(content_len);
+        if range.start < end {
+            let start_char = text[..range.start].chars().count();
+            let end_char = start_char + text[range.start..end].chars().count();
+            out.push(styled_span(start_char..end_char, style, span_kind(&stack)));
+        }
+    }
+    out
+}
+
+/// Builds a `StyledSpan` from a syntect style.
+fn styled_span(range: Range<usize>, style: Style, kind: SpanKind) -> StyledSpan {
+    let fg = style.foreground;
+    StyledSpan {
+        range,
+        color: Color32::from_rgb(fg.r, fg.g, fg.b),
+        italic: style.font_style.contains(FontStyle::ITALIC),
+        bold: style.font_style.contains(FontStyle::BOLD),
+        underline: style.font_style.contains(FontStyle::UNDERLINE),
+        kind,
+    }
+}
+
+/// Decorator that colors lines with the highlight cache of the active tab.
+pub struct HighlightDecorator<'a> {
+    /// Cache of the tab being drawn.
+    cache: &'a mut HighlightCache,
+    /// Loaded assets; `None` (or `enabled == false`) draws plain text.
+    assets: Option<&'a HighlightAssets>,
+    /// Syntax name of the tab.
+    syntax: &'a str,
+    /// Theme name to use.
+    theme: &'a str,
+    /// False for large files.
+    enabled: bool,
+    /// Snapshot of the buffer text taken in `prepare`.
+    rope: Option<Rope>,
+    /// Lowest line touched by edits since the previous frame, taken in `prepare`.
+    last_dirty: Option<usize>,
+}
+
+impl<'a> HighlightDecorator<'a> {
+    /// Creates a decorator; with `assets == None` or `enabled == false` lines stay plain.
+    pub fn new(
+        cache: &'a mut HighlightCache,
+        assets: Option<&'a HighlightAssets>,
+        syntax: &'a str,
+        theme: &'a str,
+        enabled: bool,
+    ) -> HighlightDecorator<'a> {
+        HighlightDecorator {
+            cache,
+            assets,
+            syntax,
+            theme,
+            enabled,
+            rope: None,
+            last_dirty: None,
+        }
+    }
+
+    /// Returns the lowest line edited since the previous frame (set by `prepare`), for
+    /// decorators that also need to invalidate per-line caches.
+    pub fn last_dirty(&self) -> Option<usize> {
+        self.last_dirty
+    }
+
+    /// Returns the spans of `line_idx`, or `None` when highlighting is off.
+    pub fn spans(&mut self, line_idx: usize) -> Option<&[StyledSpan]> {
+        if !self.enabled {
+            return None;
+        }
+        let assets = self.assets?;
+        let rope = self.rope.as_ref()?;
+        Some(
+            self.cache
+                .line_spans(assets, self.syntax, self.theme, rope, line_idx),
+        )
+    }
+}
+
+impl Decorator for HighlightDecorator<'_> {
+    /// Takes the buffer's dirty line, invalidates the cache from it and snapshots the text.
+    fn prepare(&mut self, buffer: &Buffer) {
+        self.last_dirty = buffer.take_dirty_line();
+        if let Some(line) = self.last_dirty {
+            self.cache.invalidate_from(line);
+        }
+        self.rope = Some(buffer.rope().clone());
+    }
+
+    /// Returns the colored runs of the line, with unstyled gaps left to `base`.
+    fn decorate(
+        &mut self,
+        line_idx: usize,
+        line: &str,
+        base: &TextFormat,
+    ) -> Vec<(Range<usize>, TextFormat)> {
+        let len = line.chars().count();
+        let plain = || vec![(0..len, base.clone())];
+        let Some(spans) = self.spans(line_idx) else {
+            return plain();
+        };
+        let mut out = Vec::with_capacity(spans.len());
+        for span in spans {
+            let range = span.range.start.min(len)..span.range.end.min(len);
+            if range.start >= range.end {
+                continue;
+            }
+            let mut format = base.clone();
+            format.color = span.color;
+            format.italics = span.italic;
+            if span.underline {
+                format.underline = Stroke::new(UNDERLINE_WIDTH, span.color);
+            }
+            out.push((range, format));
+        }
+        if out.is_empty() { plain() } else { out }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Loads the assets synchronously for tests.
+    fn assets() -> HighlightAssets {
+        HighlightAssets::load()
+    }
+
+    /// Returns the char ranges of spans of `kind`, merged when adjacent.
+    fn ranges_of(spans: &[StyledSpan], kind: SpanKind) -> Vec<Range<usize>> {
+        let mut out: Vec<Range<usize>> = Vec::new();
+        for s in spans.iter().filter(|s| s.kind == kind) {
+            match out.last_mut() {
+                Some(last) if last.end == s.range.start => last.end = s.range.end,
+                _ => out.push(s.range.clone()),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn span_kind_detects_comment_and_string() {
+        let a = assets();
+        let rope = Rope::from_str("let s = \"hi\"; // note\n");
+        let mut cache = HighlightCache::new();
+        let spans = cache.line_spans(&a, "Rust", "base16-ocean.dark", &rope, 0);
+        let strings = ranges_of(spans, SpanKind::String);
+        let comments = ranges_of(spans, SpanKind::Comment);
+        assert!(
+            strings.iter().any(|r| r.start <= 8 && r.end >= 12),
+            "{strings:?}"
+        );
+        assert!(
+            comments.iter().any(|r| r.start <= 14 && r.end == 21),
+            "{comments:?}"
+        );
+    }
+
+    #[test]
+    fn cache_invalidation_reparses_from_edited_line() {
+        let a = assets();
+        let mut cache = HighlightCache::new();
+        let theme = "base16-ocean.dark";
+        let rope = Rope::from_str("/* open\nstill comment\n");
+        let spans = cache.line_spans(&a, "Rust", theme, &rope, 1);
+        assert_eq!(ranges_of(spans, SpanKind::Comment), vec![0..13]);
+
+        let edited = Rope::from_str("// open\nstill comment\n");
+        cache.invalidate_from(0);
+        let spans = cache.line_spans(&a, "Rust", theme, &edited, 1);
+        assert!(ranges_of(spans, SpanKind::Comment).is_empty());
+    }
+
+    #[test]
+    fn syntax_for_path_extension() {
+        let a = assets();
+        assert_eq!(syntax_for_path(&a, Some(Path::new("x.rs"))), "Rust");
+        assert_eq!(syntax_for_path(&a, Some(Path::new("x.md"))), "Markdown");
+        assert_eq!(syntax_for_path(&a, Some(Path::new("x.zzzz"))), "Plain Text");
+        assert_eq!(syntax_for_path(&a, None), "Plain Text");
+    }
+
+    #[test]
+    fn spans_cover_multibyte_line() {
+        let a = assets();
+        let rope = Rope::from_str("let s = \"città è\"; // né\n");
+        let mut cache = HighlightCache::new();
+        let spans = cache.line_spans(&a, "Rust", "base16-ocean.dark", &rope, 0);
+        let len = rope.line(0).to_string().trim_end().chars().count();
+        assert_eq!(spans.first().map(|s| s.range.start), Some(0));
+        assert_eq!(spans.last().map(|s| s.range.end), Some(len));
+        assert!(spans.windows(2).all(|w| w[0].range.end == w[1].range.start));
+    }
+
+    #[test]
+    fn decorator_is_plain_when_disabled() {
+        let mut cache = HighlightCache::new();
+        let mut deco = HighlightDecorator::new(&mut cache, None, "Rust", "x", true);
+        deco.prepare(&Buffer::from_text("let x = 1;"));
+        let base = TextFormat::default();
+        let out = deco.decorate(0, "let x = 1;", &base);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 0..10);
+    }
+}

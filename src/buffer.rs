@@ -1,5 +1,6 @@
 //! Rope-backed text buffer with undo/redo, marks, line endings and atomic saving.
 
+use std::cell::Cell;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -78,7 +79,8 @@ pub struct Buffer {
     group_depth: usize,
     group_edits: Vec<Edit>,
     marks: Vec<(char, usize)>,
-    dirty_line: Option<usize>,
+    /// Lowest edited line since the last take (a `Cell` so decorators can take it from `&Buffer`).
+    dirty_line: Cell<Option<usize>>,
 }
 
 impl Default for Buffer {
@@ -115,7 +117,7 @@ impl Buffer {
             group_depth: 0,
             group_edits: Vec::new(),
             marks: Vec::new(),
-            dirty_line: None,
+            dirty_line: Cell::new(None),
         }
     }
 
@@ -311,7 +313,7 @@ impl Buffer {
     }
 
     /// Returns and clears the lowest line index touched since the last call.
-    pub fn take_dirty_line(&mut self) -> Option<usize> {
+    pub fn take_dirty_line(&self) -> Option<usize> {
         self.dirty_line.take()
     }
 
@@ -342,7 +344,9 @@ impl Buffer {
         let new_len = text.chars().count();
         let old_len = range.len();
         let line = self.rope.char_to_line(range.start);
-        self.dirty_line = Some(self.dirty_line.map_or(line, |d| d.min(line)));
+        let dirty = self.dirty_line.get();
+        self.dirty_line
+            .set(Some(dirty.map_or(line, |d| d.min(line))));
         self.rope.remove(range.clone());
         self.rope.insert(range.start, text);
         self.revision += 1;

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::buffer::Buffer;
 use crate::editing::{self, EditCommand, EditSettings, EditorState};
+use crate::highlight::HighlightCache;
 use crate::view::ViewState;
 
 /// Source of unique tab ids.
@@ -21,6 +22,10 @@ pub struct Tab {
     pub scroll_to_cursor: bool,
     /// True while consecutive typed text is collected into one open undo group.
     typing: bool,
+    /// Syntax highlighting cache.
+    pub highlight: HighlightCache,
+    /// Name of the syntax used for highlighting (`None` until assets are loaded).
+    pub syntax: Option<String>,
     /// Rendering caches owned by the editor widget.
     pub(crate) view: ViewState,
 }
@@ -34,6 +39,8 @@ impl Tab {
             editor: EditorState::default(),
             scroll_to_cursor: true,
             typing: false,
+            highlight: HighlightCache::new(),
+            syntax: None,
             view: ViewState::default(),
         }
     }

@@ -3,6 +3,7 @@
 mod dialogs;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -11,9 +12,10 @@ use crate::buffer::{Buffer, LineEnding};
 use crate::config::{self, ConfigPaths, Session, Settings, UiTheme};
 use crate::editing::{EditCommand, EditSettings};
 use crate::find_bar::{BarMode, FindBar, MatchDecorator};
+use crate::highlight::{self, AssetsHandle, HighlightAssets, HighlightDecorator};
 use crate::keymap::{Action, KeyChord, Keymap};
 use crate::tab::Tab;
-use crate::view::{self, PlainDecorator, ViewOptions};
+use crate::view::{self, ViewOptions};
 use dialogs::Pending;
 
 /// How long a status bar message stays visible.
@@ -161,6 +163,10 @@ pub struct FedApp {
     applied_theme: Option<UiTheme>,
     /// Find/replace and go-to-line bars.
     find_bar: FindBar,
+    /// Syntax and theme assets loading in the background.
+    assets: AssetsHandle,
+    /// The loaded assets, once available.
+    loaded_assets: Option<Arc<HighlightAssets>>,
     /// Set once the user agreed to close the window, so the close is not intercepted again.
     allow_close: bool,
 }
@@ -190,6 +196,8 @@ impl FedApp {
             pending: None,
             applied_theme: None,
             find_bar: FindBar::new(),
+            assets: AssetsHandle::spawn(cc.egui_ctx.clone()),
+            loaded_assets: None,
             allow_close: false,
         };
         app.apply_theme(&cc.egui_ctx);
@@ -588,9 +596,27 @@ impl eframe::App for FedApp {
                 return;
             };
             let matches = self.find_bar.matches(tab);
-            let mut plain = PlainDecorator;
-            let mut deco = MatchDecorator::new(&mut plain, &matches);
+            if self.loaded_assets.is_none() {
+                self.loaded_assets = self.assets.get();
+            }
+            let assets = self.loaded_assets.as_deref();
+            if let Some(a) = assets {
+                tab.syntax = Some(highlight::syntax_for_path(a, tab.buffer.path()));
+            }
+            let theme = if ui.visuals().dark_mode {
+                &self.settings.code_theme_dark
+            } else {
+                &self.settings.code_theme_light
+            };
+            let syntax = tab.syntax.clone().unwrap_or_default();
+            // The cache is moved out of the tab so the decorator does not borrow the tab.
+            let mut cache = std::mem::take(&mut tab.highlight);
+            let enabled = !tab.buffer.is_large();
+            let mut highlighted =
+                HighlightDecorator::new(&mut cache, assets, &syntax, theme, enabled);
+            let mut deco = MatchDecorator::new(&mut highlighted, &matches);
             let out = view::show_editor(ui, tab, &opts, &mut deco, None);
+            tab.highlight = cache;
             if let Some(text) = out.clipboard {
                 ui.ctx().copy_text(text);
             }
