@@ -2,7 +2,6 @@
 
 mod dialogs;
 
-use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,13 +10,12 @@ use eframe::egui;
 use crate::buffer::{Buffer, LineEnding};
 use crate::config::{self, ConfigPaths, Session, Settings, UiTheme};
 use crate::editing::{EditCommand, EditSettings};
+use crate::find_bar::{BarMode, FindBar, MatchDecorator};
 use crate::keymap::{Action, KeyChord, Keymap};
 use crate::tab::Tab;
 use crate::view::{self, PlainDecorator, ViewOptions};
 use dialogs::Pending;
 
-/// True when running on macOS, where `Cmd` and `Ctrl` are different keys.
-const IS_MAC: bool = cfg!(target_os = "macos");
 /// How long a status bar message stays visible.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Status bar notice for tabs with highlighting disabled.
@@ -87,15 +85,20 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// egui modifiers matching `chord` with `consume_key`.
-fn chord_modifiers(chord: &KeyChord) -> egui::Modifiers {
-    egui::Modifiers {
-        alt: chord.alt,
-        ctrl: chord.ctrl,
-        shift: chord.shift,
-        mac_cmd: chord.command && IS_MAC,
-        command: chord.command,
+/// Returns the action fired by pressing `key` with `mods`: the keymap binding of that exact
+/// chord, or Redo for the fixed `REDO_ALIAS`.
+fn shortcut_action(keymap: &Keymap, key: egui::Key, mods: egui::Modifiers) -> Option<Action> {
+    let chord = KeyChord::from_egui(key, mods);
+    if let Some(action) = keymap.lookup(&chord) {
+        return Some(action);
     }
+    let alias = KeyChord::parse(REDO_ALIAS).expect("the redo alias is a valid chord");
+    (chord == alias).then_some(Action::Redo)
+}
+
+/// True for actions that edit the text and must leave text fields (find bar) alone.
+fn needs_editor_focus(action: Action) -> bool {
+    matches!(action, Action::Undo | Action::Redo | Action::SelectAll)
 }
 
 /// Shows the native save dialog, starting from the buffer's current location.
@@ -156,6 +159,8 @@ pub struct FedApp {
     pending: Option<Pending>,
     /// UI theme last applied to the context.
     applied_theme: Option<UiTheme>,
+    /// Find/replace and go-to-line bars.
+    find_bar: FindBar,
     /// Set once the user agreed to close the window, so the close is not intercepted again.
     allow_close: bool,
 }
@@ -184,6 +189,7 @@ impl FedApp {
             status: None,
             pending: None,
             applied_theme: None,
+            find_bar: FindBar::new(),
             allow_close: false,
         };
         app.apply_theme(&cc.egui_ctx);
@@ -247,17 +253,24 @@ impl FedApp {
             Action::Undo => self.apply_to_active(EditCommand::Undo),
             Action::Redo => self.apply_to_active(EditCommand::Redo),
             Action::SelectAll => self.apply_to_active(EditCommand::SelectAll),
-            Action::OpenSettings
-            | Action::Find
-            | Action::Replace
-            | Action::GoToLine
-            | Action::TogglePreview => {
+            Action::Find => self.open_bar(BarMode::Find),
+            Action::Replace => self.open_bar(BarMode::Replace),
+            Action::GoToLine => self.open_bar(BarMode::GoToLine),
+            Action::OpenSettings | Action::TogglePreview => {
                 self.set_status(
                     format!("{}: not available yet", action.label()),
                     Severity::Info,
                 );
             }
         }
+    }
+
+    /// Shows the find, replace or go-to-line bar for the active tab.
+    fn open_bar(&mut self, mode: BarMode) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        self.find_bar.open(mode, tab);
     }
 
     /// Opens `path` in a tab (see `open_path`), returning a readable error.
@@ -437,41 +450,48 @@ impl FedApp {
         }
     }
 
-    /// Consumes this frame's shortcut key presses and dispatches their actions.
+    /// True when the active editor (or nothing) has keyboard focus, so editing shortcuts
+    /// must not be stolen from a focused text field.
+    fn editor_has_focus(&self, ctx: &egui::Context) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        ctx.memory(|m| m.focused())
+            .is_none_or(|id| id == view::editor_id(tab.id))
+    }
+
+    /// Consumes this frame's shortcut key presses (each event is matched against the exact
+    /// chord) and dispatches their actions.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if self.pending.is_some() {
             return;
         }
-        let table = self.shortcut_table();
+        let editor_focused = self.editor_has_focus(ctx);
         let mut fired = Vec::new();
         ctx.input_mut(|i| {
-            for (mods, key, action) in &table {
-                if i.consume_key(*mods, *key) {
-                    fired.push(*action);
+            i.events.retain(|event| {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    return true;
+                };
+                let Some(action) = shortcut_action(&self.keymap, *key, *modifiers) else {
+                    return true;
+                };
+                if needs_editor_focus(action) && !editor_focused {
+                    return true;
                 }
-            }
+                fired.push(action);
+                false
+            });
         });
         for action in fired {
             self.dispatch(ctx, action);
         }
-    }
-
-    /// Bound shortcuts plus the Redo alias, ordered so chords with more Shift/Alt come first
-    /// (`consume_key` ignores extra Shift/Alt, so `Ctrl+S` would also eat `Ctrl+Shift+S`).
-    fn shortcut_table(&self) -> Vec<(egui::Modifiers, egui::Key, Action)> {
-        let mut table: Vec<_> = Action::ALL
-            .iter()
-            .filter_map(|a| self.keymap.chord(*a).map(|c| (c, *a)))
-            .collect();
-        let alias = KeyChord::parse(REDO_ALIAS).expect("the redo alias is a valid chord");
-        if self.keymap.lookup(&alias).is_none() {
-            table.push((alias, Action::Redo));
-        }
-        table.sort_by_key(|(c, _)| Reverse(u8::from(c.shift) + u8::from(c.alt)));
-        table
-            .into_iter()
-            .map(|(c, a)| (chord_modifiers(&c), c.key, a))
-            .collect()
     }
 
     /// Draws the tab bar and returns what the user clicked.
@@ -504,6 +524,23 @@ impl FedApp {
             });
         });
         action
+    }
+
+    /// Draws the find or go-to-line bar above the status bar and shows its message.
+    fn find_bar_panel(&mut self, ui: &mut egui::Ui) {
+        if self.find_bar.mode == BarMode::Hidden {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let bar = &mut self.find_bar;
+        let message = egui::Panel::bottom("fed_find_bar")
+            .show(ui, |ui| bar.show(ui, tab))
+            .inner;
+        if let Some(text) = message {
+            self.set_status(text, Severity::Info);
+        }
     }
 
     /// Draws the status bar: tab status on the left, notices and messages on the right.
@@ -544,12 +581,16 @@ impl eframe::App for FedApp {
             None => {}
         }
         self.status_bar(ui);
+        self.find_bar_panel(ui);
         let opts = self.view_options();
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(tab) = self.tabs.get_mut(self.active) else {
                 return;
             };
-            let out = view::show_editor(ui, tab, &opts, &mut PlainDecorator, None);
+            let matches = self.find_bar.matches(tab);
+            let mut plain = PlainDecorator;
+            let mut deco = MatchDecorator::new(&mut plain, &matches);
+            let out = view::show_editor(ui, tab, &opts, &mut deco, None);
             if let Some(text) = out.clipboard {
                 ui.ctx().copy_text(text);
             }
@@ -572,6 +613,35 @@ mod tests {
         tab_width: 4,
         insert_spaces: true,
     };
+
+    #[test]
+    fn shortcut_lookup_is_exact() {
+        let km = Keymap::defaults();
+        let ctrl = egui::Modifiers::COMMAND;
+        let ctrl_shift = egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::COMMAND
+        };
+        assert_eq!(
+            shortcut_action(&km, egui::Key::N, ctrl),
+            Some(Action::NewTab)
+        );
+        assert_eq!(shortcut_action(&km, egui::Key::N, ctrl_shift), None);
+        assert_eq!(shortcut_action(&km, egui::Key::S, ctrl), Some(Action::Save));
+        assert_eq!(
+            shortcut_action(&km, egui::Key::S, ctrl_shift),
+            Some(Action::SaveAs)
+        );
+        assert_eq!(shortcut_action(&km, egui::Key::Z, ctrl), Some(Action::Undo));
+        assert_eq!(
+            shortcut_action(&km, egui::Key::Z, ctrl_shift),
+            Some(Action::Redo)
+        );
+        assert_eq!(
+            shortcut_action(&km, egui::Key::N, egui::Modifiers::NONE),
+            None
+        );
+    }
 
     #[test]
     fn close_requires_confirmation_when_modified() {

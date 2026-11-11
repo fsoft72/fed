@@ -1,0 +1,835 @@
+//! Find/replace and go-to-line bars, plus the decorator that highlights search matches.
+
+use std::cell::RefCell;
+use std::ops::Range;
+use std::rc::Rc;
+
+use eframe::egui::{self, Color32, Key, Modifiers, TextFormat};
+use regex::Regex;
+use ropey::Rope;
+
+use crate::buffer::Buffer;
+use crate::editing::Selection;
+use crate::search::{self, SearchQuery};
+use crate::tab::Tab;
+use crate::text_nav;
+use crate::view::Decorator;
+
+/// Width of the search and replacement text fields in points.
+const FIELD_WIDTH: f32 = 220.0;
+/// Width of the go-to-line text field in points.
+const GOTO_FIELD_WIDTH: f32 = 100.0;
+/// Id source of the search field (also used to focus it).
+const FIND_FIELD_ID: &str = "fed_find_field";
+/// Id source of the replacement field.
+const REPLACE_FIELD_ID: &str = "fed_replace_field";
+/// Id source of the go-to-line field.
+const GOTO_FIELD_ID: &str = "fed_goto_field";
+/// Background drawn behind search matches (translucent, readable on light and dark themes).
+const MATCH_BACKGROUND: Color32 = Color32::from_rgba_premultiplied(110, 80, 0, 110);
+
+/// Which bar is shown above the status bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BarMode {
+    /// No bar.
+    #[default]
+    Hidden,
+    /// Search only.
+    Find,
+    /// Search and replace.
+    Replace,
+    /// Go to line.
+    GoToLine,
+}
+
+/// Cached match list for one (tab, buffer revision, query) combination.
+struct MatchCache {
+    /// Tab the matches belong to.
+    tab_id: u64,
+    /// Buffer revision the matches were computed for.
+    revision: u64,
+    /// Query the matches were computed for.
+    query: SearchQuery,
+    /// Matches in document order.
+    matches: Rc<Vec<Range<usize>>>,
+}
+
+/// What the user did in the bar during one frame.
+#[derive(Default)]
+struct BarInput {
+    /// The query text or an option changed.
+    changed: bool,
+    /// Go to the next (`true`) or previous (`false`) match.
+    step: Option<bool>,
+    /// Replace the current match.
+    replace: bool,
+    /// Replace every match.
+    replace_all: bool,
+    /// Close the bar.
+    close: bool,
+}
+
+/// State of the find/replace and go-to-line bars (shared by all tabs).
+pub struct FindBar {
+    /// Bar currently shown.
+    pub mode: BarMode,
+    /// Current search query.
+    pub query: SearchQuery,
+    /// Replacement text.
+    pub replacement: String,
+    /// Go-to-line input text.
+    pub goto: String,
+    /// Error to show in the bar (invalid regex or go-to-line input).
+    pub error: Option<String>,
+    /// Give keyboard focus to the main field on the next frame.
+    focus_field: bool,
+    /// Match list cache.
+    cache: RefCell<Option<MatchCache>>,
+}
+
+impl Default for FindBar {
+    /// Creates a hidden bar with an empty case-insensitive literal query.
+    fn default() -> FindBar {
+        FindBar::new()
+    }
+}
+
+impl FindBar {
+    /// Creates a hidden bar with an empty case-insensitive literal query.
+    pub fn new() -> FindBar {
+        FindBar {
+            mode: BarMode::Hidden,
+            query: SearchQuery {
+                pattern: String::new(),
+                regex: false,
+                case_sensitive: false,
+            },
+            replacement: String::new(),
+            goto: String::new(),
+            error: None,
+            focus_field: false,
+            cache: RefCell::new(None),
+        }
+    }
+
+    /// Shows the bar in `mode` and focuses its field. Find and Replace pre-fill the query
+    /// with the selection of `tab` when it is a single line.
+    pub fn open(&mut self, mode: BarMode, tab: &Tab) {
+        self.mode = mode;
+        self.focus_field = true;
+        self.error = None;
+        if matches!(mode, BarMode::Find | BarMode::Replace)
+            && let Some(text) = single_line_selection(tab)
+        {
+            self.query.pattern = if self.query.regex {
+                regex::escape(&text)
+            } else {
+                text
+            };
+        }
+    }
+
+    /// Hides the bar and gives the editor of `tab` keyboard focus.
+    pub fn close(&mut self, tab: &mut Tab) {
+        self.mode = BarMode::Hidden;
+        self.error = None;
+        tab.focus_editor();
+    }
+
+    /// Returns the matches of the current query in `tab` (empty while no search bar is
+    /// shown, the pattern is empty or invalid). Cached by tab, buffer revision and query.
+    pub fn matches(&self, tab: &Tab) -> Rc<Vec<Range<usize>>> {
+        let empty = || Rc::new(Vec::new());
+        if !matches!(self.mode, BarMode::Find | BarMode::Replace) || self.query.pattern.is_empty() {
+            return empty();
+        }
+        let revision = tab.buffer.revision();
+        if let Some(c) = &*self.cache.borrow()
+            && c.tab_id == tab.id
+            && c.revision == revision
+            && c.query == self.query
+        {
+            return c.matches.clone();
+        }
+        let Ok(re) = self.query.compile() else {
+            return empty();
+        };
+        let matches = Rc::new(search::find_all(tab.buffer.rope(), &re));
+        *self.cache.borrow_mut() = Some(MatchCache {
+            tab_id: tab.id,
+            revision,
+            query: self.query.clone(),
+            matches: matches.clone(),
+        });
+        matches
+    }
+
+    /// Draws the active bar and applies the user's actions to `tab`. Returns a status bar
+    /// message when there is one (for example the replace-all count).
+    pub fn show(&mut self, ui: &mut egui::Ui, tab: &mut Tab) -> Option<String> {
+        match self.mode {
+            BarMode::Hidden => None,
+            BarMode::GoToLine => {
+                self.show_goto(ui, tab);
+                None
+            }
+            BarMode::Find | BarMode::Replace => self.show_search(ui, tab),
+        }
+    }
+
+    /// Draws the find (and replace) rows and applies what the user did.
+    fn show_search(&mut self, ui: &mut egui::Ui, tab: &mut Tab) -> Option<String> {
+        let mut input = BarInput::default();
+        let count = self.count_label(tab);
+        let replace_mode = self.mode == BarMode::Replace;
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.query.pattern)
+                    .id(egui::Id::unique(FIND_FIELD_ID))
+                    .hint_text("Find")
+                    .desired_width(FIELD_WIDTH),
+            );
+            if std::mem::take(&mut self.focus_field) {
+                field.request_focus();
+            }
+            input.changed |= field.changed();
+            if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                input.step = Some(!ui.input(|i| i.modifiers.shift));
+                field.request_focus();
+            }
+            input.changed |= ui
+                .toggle_value(&mut self.query.case_sensitive, "Aa")
+                .on_hover_text("Match case")
+                .changed();
+            input.changed |= ui
+                .toggle_value(&mut self.query.regex, ".*")
+                .on_hover_text("Regular expression")
+                .changed();
+            if ui.button("Prev").clicked() {
+                input.step = Some(false);
+            }
+            if ui.button("Next").clicked() {
+                input.step = Some(true);
+            }
+            if let Some(err) = &self.error {
+                ui.colored_label(ui.visuals().error_fg_color, err);
+            } else {
+                ui.label(count);
+            }
+            if ui.small_button("x").on_hover_text("Close").clicked() {
+                input.close = true;
+            }
+            let escape = ui.input(|i| i.key_pressed(Key::Escape));
+            input.close |= escape && (field.has_focus() || field.lost_focus());
+        });
+        if replace_mode {
+            ui.horizontal(|ui| {
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.replacement)
+                        .id(egui::Id::unique(REPLACE_FIELD_ID))
+                        .hint_text("Replace with")
+                        .desired_width(FIELD_WIDTH),
+                );
+                if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    input.replace = true;
+                    field.request_focus();
+                }
+                input.replace |= ui.button("Replace").clicked();
+                input.replace_all |= ui.button("Replace all").clicked();
+                let escape = ui.input(|i| i.key_pressed(Key::Escape));
+                input.close |= escape && (field.has_focus() || field.lost_focus());
+            });
+        }
+        if ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F3)) {
+            input.step = Some(false);
+        } else if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F3)) {
+            input.step = Some(true);
+        }
+        if input.close {
+            // The editor takes focus in this same frame: hide the key from it.
+            ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        }
+        self.apply(tab, input)
+    }
+
+    /// Applies the user's actions from one frame of the search bar.
+    fn apply(&mut self, tab: &mut Tab, input: BarInput) -> Option<String> {
+        if input.close {
+            self.close(tab);
+            return None;
+        }
+        if input.changed {
+            self.select_from_caret(tab);
+        }
+        if let Some(forward) = input.step {
+            self.step(tab, forward);
+        }
+        if input.replace {
+            self.replace_current(tab);
+        }
+        if input.replace_all {
+            return self.replace_all(tab);
+        }
+        None
+    }
+
+    /// Compiles the query, updating `error`. Returns `None` for an empty or invalid pattern.
+    fn compiled(&mut self) -> Option<Regex> {
+        self.error = None;
+        if self.query.pattern.is_empty() {
+            return None;
+        }
+        match self.query.compile() {
+            Ok(re) => Some(re),
+            Err(e) => {
+                self.error = Some(short_error(&e.to_string()));
+                None
+            }
+        }
+    }
+
+    /// Selects the first match at or after the caret (incremental search).
+    fn select_from_caret(&mut self, tab: &mut Tab) {
+        if self.compiled().is_none() {
+            return;
+        }
+        let from = tab.editor.selection.range().start;
+        if let Some(m) = next_match(&self.matches(tab), from, true) {
+            select(tab, m);
+        }
+    }
+
+    /// Selects the next or previous match relative to the selection.
+    fn step(&mut self, tab: &mut Tab, forward: bool) {
+        if self.compiled().is_none() {
+            return;
+        }
+        let matches = self.matches(tab);
+        let sel = tab.editor.selection.range();
+        let found = if forward {
+            next_match(&matches, sel.start, sel.is_empty())
+        } else {
+            prev_match(&matches, sel.start)
+        };
+        if let Some(m) = found {
+            select(tab, m);
+        }
+    }
+
+    /// Replaces the selected match (when the selection is one), then selects the next match.
+    fn replace_current(&mut self, tab: &mut Tab) {
+        let Some(re) = self.compiled() else { return };
+        let sel = tab.editor.selection.range();
+        let rep = effective_replacement(&self.query, &self.replacement);
+        if self.matches(tab).contains(&sel)
+            && let Some(new_text) = expand_match(tab.buffer.rope(), &re, &sel, &rep)
+        {
+            tab.end_typing();
+            tab.buffer.replace(sel.clone(), &new_text);
+            tab.editor.selection = Selection::caret(sel.start + new_text.chars().count());
+            tab.editor.preferred_col = None;
+        }
+        let from = tab.editor.selection.range().end;
+        if let Some(m) = next_match(&self.matches(tab), from, true) {
+            select(tab, m);
+        }
+    }
+
+    /// Replaces every match as one undo step and reports the count.
+    fn replace_all(&mut self, tab: &mut Tab) -> Option<String> {
+        let re = self.compiled()?;
+        let rep = effective_replacement(&self.query, &self.replacement);
+        tab.end_typing();
+        let count = search::replace_all(&mut tab.buffer, &re, &rep);
+        let len = tab.buffer.rope().len_chars();
+        let sel = tab.editor.selection;
+        tab.editor.selection = Selection {
+            anchor: sel.anchor.min(len),
+            head: sel.head.min(len),
+        };
+        tab.scroll_to_cursor = true;
+        Some(match count {
+            0 => "no matches".to_string(),
+            1 => "replaced 1 occurrence".to_string(),
+            n => format!("replaced {n} occurrences"),
+        })
+    }
+
+    /// The `"3 of 12"` / `"no matches"` text (empty while there is no pattern).
+    fn count_label(&self, tab: &Tab) -> String {
+        if self.query.pattern.is_empty() || self.error.is_some() {
+            return String::new();
+        }
+        let matches = self.matches(tab);
+        if matches.is_empty() {
+            return "no matches".to_string();
+        }
+        let sel = tab.editor.selection.range();
+        match matches.iter().position(|m| *m == sel) {
+            Some(i) => format!("{} of {}", i + 1, matches.len()),
+            None => format!("{} matches", matches.len()),
+        }
+    }
+
+    /// Draws the go-to-line bar.
+    fn show_goto(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
+        let mut submit = false;
+        let mut close = false;
+        let line_count = tab.buffer.rope().len_lines();
+        ui.horizontal(|ui| {
+            ui.label("Go to line");
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.goto)
+                    .id(egui::Id::unique(GOTO_FIELD_ID))
+                    .hint_text(format!("1-{line_count}"))
+                    .desired_width(GOTO_FIELD_WIDTH),
+            );
+            if std::mem::take(&mut self.focus_field) {
+                field.request_focus();
+            }
+            if field.changed() {
+                self.error = None;
+            }
+            if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                submit = true;
+                field.request_focus();
+            }
+            if let Some(err) = &self.error {
+                ui.colored_label(ui.visuals().error_fg_color, err);
+            }
+            if ui.small_button("x").on_hover_text("Close").clicked() {
+                close = true;
+            }
+            let escape = ui.input(|i| i.key_pressed(Key::Escape));
+            close |= escape && (field.has_focus() || field.lost_focus());
+        });
+        if close || submit {
+            // The editor takes focus in this same frame: hide the key from it.
+            ui.input_mut(|i| {
+                i.consume_key(Modifiers::NONE, Key::Enter);
+                i.consume_key(Modifiers::NONE, Key::Escape);
+            });
+        }
+        if close {
+            self.close(tab);
+        } else if submit {
+            self.go_to_line(tab, line_count);
+        }
+    }
+
+    /// Moves the caret of `tab` to the first non-blank of the typed line and closes the bar.
+    fn go_to_line(&mut self, tab: &mut Tab, line_count: usize) {
+        let line = match parse_goto(&self.goto, line_count) {
+            Ok(line) => line,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        let rope = tab.buffer.rope();
+        let pos = text_nav::first_non_blank(rope, rope.line_to_char(line));
+        tab.end_typing();
+        tab.editor.selection = Selection::caret(pos);
+        tab.editor.preferred_col = None;
+        tab.scroll_to_cursor = true;
+        self.close(tab);
+    }
+}
+
+/// Parses go-to-line input: a 1-based line number. Returns the 0-based line clamped to the
+/// document (`line_count` lines), or an error message for anything that is not a number.
+pub fn parse_goto(input: &str, line_count: usize) -> Result<usize, String> {
+    let text = input.trim();
+    let number: usize = text
+        .parse()
+        .map_err(|_| format!("'{text}' is not a line number"))?;
+    Ok(number.saturating_sub(1).min(line_count.saturating_sub(1)))
+}
+
+/// Reduces a multi-line regex error to its last line (the reason) so it fits in the bar.
+fn short_error(message: &str) -> String {
+    let reason = message.lines().last().unwrap_or(message).trim();
+    format!("invalid regex: {}", reason.trim_start_matches("error: "))
+}
+
+/// The selected text of `tab` when it is non-empty and on a single line.
+fn single_line_selection(tab: &Tab) -> Option<String> {
+    let sel = tab.editor.selection;
+    if sel.is_empty() {
+        return None;
+    }
+    let range = sel.range();
+    let len = tab.buffer.rope().len_chars();
+    let text = tab
+        .buffer
+        .rope()
+        .slice(range.start.min(len)..range.end.min(len))
+        .to_string();
+    (!text.contains('\n')).then_some(text)
+}
+
+/// Selects `range` in `tab` and scrolls it into view.
+fn select(tab: &mut Tab, range: Range<usize>) {
+    tab.end_typing();
+    tab.editor.selection = Selection {
+        anchor: range.start,
+        head: range.end,
+    };
+    tab.editor.preferred_col = None;
+    tab.scroll_to_cursor = true;
+}
+
+/// First match starting after `from` (or at `from` when `inclusive`), wrapping to the first.
+/// `matches` must be sorted by start.
+fn next_match(matches: &[Range<usize>], from: usize, inclusive: bool) -> Option<Range<usize>> {
+    let idx = if inclusive {
+        matches.partition_point(|m| m.start < from)
+    } else {
+        matches.partition_point(|m| m.start <= from)
+    };
+    matches.get(idx).or(matches.first()).cloned()
+}
+
+/// Last match starting before `from`, wrapping to the last. `matches` must be sorted by start.
+fn prev_match(matches: &[Range<usize>], from: usize) -> Option<Range<usize>> {
+    let idx = matches.partition_point(|m| m.start < from);
+    let prev = if idx == 0 { None } else { matches.get(idx - 1) };
+    prev.or(matches.last()).cloned()
+}
+
+/// The replacement string to pass to the regex engine: literal queries must not expand `$`.
+fn effective_replacement(query: &SearchQuery, replacement: &str) -> String {
+    if query.regex {
+        replacement.to_string()
+    } else {
+        replacement.replace('$', "$$")
+    }
+}
+
+/// Expands `replacement` for the match at char `range` (which must lie on one line),
+/// resolving capture groups. Returns `None` when no match of `re` has exactly that range.
+fn expand_match(
+    rope: &Rope,
+    re: &Regex,
+    range: &Range<usize>,
+    replacement: &str,
+) -> Option<String> {
+    if range.start >= rope.len_chars() {
+        return None;
+    }
+    let line = rope.char_to_line(range.start);
+    let line_start = rope.line_to_char(line);
+    let mut text = rope.line(line).to_string();
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    for caps in re.captures_iter(&text) {
+        let m = caps.get(0)?;
+        let start = line_start + text[..m.start()].chars().count();
+        let end = start + text[m.start()..m.end()].chars().count();
+        if start == range.start && end == range.end {
+            let mut out = String::new();
+            caps.expand(replacement, &mut out);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Overlays `background` on the parts of `spans` covered by `ranges`, splitting spans at the
+/// range borders. `ranges` are sorted, non-overlapping char ranges in the same coordinates
+/// as the spans. Order and non-overlap of the spans are preserved.
+pub fn overlay_background(
+    spans: Vec<(Range<usize>, TextFormat)>,
+    ranges: &[Range<usize>],
+    background: Color32,
+) -> Vec<(Range<usize>, TextFormat)> {
+    if ranges.is_empty() {
+        return spans;
+    }
+    let mut out = Vec::with_capacity(spans.len() + ranges.len() * 2);
+    for (span, format) in spans {
+        let mut pos = span.start;
+        for r in ranges
+            .iter()
+            .filter(|r| r.end > span.start && r.start < span.end)
+        {
+            let (a, b) = (r.start.max(span.start), r.end.min(span.end));
+            if a > pos {
+                out.push((pos..a, format.clone()));
+            }
+            let mut highlighted = format.clone();
+            highlighted.background = background;
+            out.push((a..b, highlighted));
+            pos = b;
+        }
+        if pos < span.end || span.is_empty() {
+            out.push((pos..span.end, format));
+        }
+    }
+    out
+}
+
+/// Decorator that paints a translucent background behind search matches on top of the
+/// spans produced by a wrapped decorator.
+pub struct MatchDecorator<'a> {
+    /// Decorator providing the base spans (syntax highlighting, plain text, ...).
+    inner: &'a mut dyn Decorator,
+    /// Matches as char ranges in the buffer, sorted by start.
+    matches: &'a [Range<usize>],
+    /// Snapshot of the buffer text taken in `prepare`, used to map lines to char offsets.
+    rope: Option<Rope>,
+}
+
+impl<'a> MatchDecorator<'a> {
+    /// Wraps `inner`, highlighting `matches` (sorted char ranges in the buffer).
+    pub fn new(inner: &'a mut dyn Decorator, matches: &'a [Range<usize>]) -> MatchDecorator<'a> {
+        MatchDecorator {
+            inner,
+            matches,
+            rope: None,
+        }
+    }
+}
+
+impl Decorator for MatchDecorator<'_> {
+    /// Prepares the inner decorator and snapshots the buffer text.
+    fn prepare(&mut self, buffer: &Buffer) {
+        self.inner.prepare(buffer);
+        self.rope = Some(buffer.rope().clone());
+    }
+
+    /// Returns the inner spans with match backgrounds overlaid.
+    fn decorate(
+        &mut self,
+        line_idx: usize,
+        line: &str,
+        base: &TextFormat,
+    ) -> Vec<(Range<usize>, TextFormat)> {
+        let spans = self.inner.decorate(line_idx, line, base);
+        let Some(rope) = &self.rope else { return spans };
+        if line_idx >= rope.len_lines() {
+            return spans;
+        }
+        let start = rope.line_to_char(line_idx);
+        let end = start + line.chars().count();
+        let first = self.matches.partition_point(|m| m.end <= start);
+        let local: Vec<Range<usize>> = self.matches[first..]
+            .iter()
+            .take_while(|m| m.start < end)
+            .map(|m| m.start.max(start) - start..m.end.min(end) - start)
+            .collect();
+        overlay_background(spans, &local, MATCH_BACKGROUND)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view::PlainDecorator;
+
+    /// Builds a query with the given options.
+    fn query(pattern: &str, regex: bool, case_sensitive: bool) -> SearchQuery {
+        SearchQuery {
+            pattern: pattern.to_string(),
+            regex,
+            case_sensitive,
+        }
+    }
+
+    /// A format with a distinct text color to tell spans apart.
+    fn colored(color: Color32) -> TextFormat {
+        TextFormat {
+            color,
+            ..TextFormat::default()
+        }
+    }
+
+    #[test]
+    fn parse_goto_valid() {
+        assert_eq!(parse_goto("1", 10), Ok(0));
+        assert_eq!(parse_goto(" 5 ", 10), Ok(4));
+        assert_eq!(parse_goto("10", 10), Ok(9));
+    }
+
+    #[test]
+    fn parse_goto_clamps() {
+        assert_eq!(parse_goto("0", 10), Ok(0));
+        assert_eq!(parse_goto("999", 10), Ok(9));
+        assert_eq!(parse_goto("5", 0), Ok(0));
+    }
+
+    #[test]
+    fn parse_goto_rejects_text() {
+        assert!(parse_goto("abc", 10).is_err());
+        assert!(parse_goto("", 10).is_err());
+        assert!(parse_goto("-3", 10).is_err());
+        assert!(parse_goto("1.5", 10).is_err());
+    }
+
+    #[test]
+    fn short_error_keeps_only_the_reason() {
+        let long = "invalid pattern: regex parse error:\n    (fo+\n    ^\nerror: unclosed group";
+        assert_eq!(short_error(long), "invalid regex: unclosed group");
+    }
+
+    #[test]
+    fn next_and_prev_wrap() {
+        let m = vec![2..4, 10..12, 20..22];
+        assert_eq!(next_match(&m, 0, true), Some(2..4));
+        assert_eq!(next_match(&m, 2, true), Some(2..4));
+        assert_eq!(next_match(&m, 2, false), Some(10..12));
+        assert_eq!(next_match(&m, 21, false), Some(2..4));
+        assert_eq!(prev_match(&m, 10), Some(2..4));
+        assert_eq!(prev_match(&m, 2), Some(20..22));
+        assert_eq!(next_match(&[], 0, true), None);
+        assert_eq!(prev_match(&[], 0), None);
+    }
+
+    #[test]
+    fn literal_replacement_does_not_expand_dollar() {
+        let rope = Rope::from_str("a.b and a.b");
+        let q = query("a.b", false, true);
+        let re = q.compile().unwrap();
+        let rep = effective_replacement(&q, "$1x");
+        assert_eq!(expand_match(&rope, &re, &(0..3), &rep), Some("$1x".into()));
+    }
+
+    #[test]
+    fn regex_replacement_expands_groups_on_the_right_match() {
+        let rope = Rope::from_str("x\nfoo=1 foo=2\n");
+        let q = query(r"(\w+)=(\d)", true, true);
+        let re = q.compile().unwrap();
+        let rep = effective_replacement(&q, "$2:$1");
+        assert_eq!(
+            expand_match(&rope, &re, &(8..13), &rep),
+            Some("2:foo".into())
+        );
+        assert_eq!(expand_match(&rope, &re, &(3..5), &rep), None);
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn overlay_splits_spans_at_range_borders() {
+        let red = colored(Color32::RED);
+        let blue = colored(Color32::BLUE);
+        let spans = vec![(0..5, red.clone()), (5..10, blue.clone())];
+        let bg = Color32::YELLOW;
+        let out = overlay_background(spans, &[3..7], bg);
+        let ranges: Vec<_> = out.iter().map(|(r, _)| r.clone()).collect();
+        assert_eq!(ranges, vec![0..3, 3..5, 5..7, 7..10]);
+        assert_eq!(out[0].1, red);
+        assert_eq!(out[1].1.background, bg);
+        assert_eq!(out[1].1.color, Color32::RED);
+        assert_eq!(out[2].1.background, bg);
+        assert_eq!(out[2].1.color, Color32::BLUE);
+        assert_eq!(out[3].1, blue);
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn overlay_without_overlap_keeps_spans() {
+        let base = TextFormat::default();
+        let spans = vec![(0..4, base.clone())];
+        assert_eq!(
+            overlay_background(spans.clone(), &[], Color32::RED).len(),
+            1
+        );
+        let out = overlay_background(spans, &[4..6], Color32::RED);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, base);
+    }
+
+    #[test]
+    fn overlay_handles_range_covering_whole_span_and_multiple_ranges() {
+        let spans = vec![(0..8, TextFormat::default())];
+        let out = overlay_background(spans, &[0..2, 4..8], Color32::RED);
+        let ranges: Vec<_> = out.iter().map(|(r, _)| r.clone()).collect();
+        assert_eq!(ranges, vec![0..2, 2..4, 4..8]);
+        assert_eq!(out[0].1.background, Color32::RED);
+        assert_ne!(out[1].1.background, Color32::RED);
+        assert_eq!(out[2].1.background, Color32::RED);
+    }
+
+    #[test]
+    fn match_decorator_maps_buffer_matches_to_lines() {
+        let buf = Buffer::from_text("héllo\nfoo bar foo\n");
+        let matches = vec![6..9, 14..17];
+        let mut plain = PlainDecorator;
+        let mut deco = MatchDecorator::new(&mut plain, &matches);
+        deco.prepare(&buf);
+        let base = TextFormat::default();
+        let line0 = deco.decorate(0, "héllo", &base);
+        assert_eq!(line0.len(), 1);
+        let line1 = deco.decorate(1, "foo bar foo", &base);
+        let ranges: Vec<_> = line1.iter().map(|(r, _)| r.clone()).collect();
+        assert_eq!(ranges, vec![0..3, 3..8, 8..11]);
+        assert_eq!(line1[0].1.background, MATCH_BACKGROUND);
+        assert_eq!(line1[2].1.background, MATCH_BACKGROUND);
+    }
+
+    #[test]
+    fn matches_are_cached_and_follow_edits() {
+        let mut tab = Tab::new(Buffer::from_text("ab ab"));
+        let mut bar = FindBar::new();
+        bar.open(BarMode::Find, &tab);
+        bar.query.pattern = "ab".to_string();
+        let first = bar.matches(&tab);
+        assert_eq!(*first, vec![0..2, 3..5]);
+        assert!(Rc::ptr_eq(&first, &bar.matches(&tab)));
+        tab.buffer.replace(0..0, "ab ");
+        assert_eq!(bar.matches(&tab).len(), 3);
+        bar.mode = BarMode::Hidden;
+        assert!(bar.matches(&tab).is_empty());
+    }
+
+    #[test]
+    fn open_prefills_single_line_selection_only() {
+        let mut tab = Tab::new(Buffer::from_text("héllo\nworld"));
+        let mut bar = FindBar::new();
+        tab.editor.selection = Selection { anchor: 0, head: 5 };
+        bar.open(BarMode::Find, &tab);
+        assert_eq!(bar.query.pattern, "héllo");
+        tab.editor.selection = Selection { anchor: 0, head: 8 };
+        bar.query.pattern = "keep".into();
+        bar.open(BarMode::Find, &tab);
+        assert_eq!(bar.query.pattern, "keep");
+    }
+
+    #[test]
+    fn replace_current_then_next_and_replace_all_with_accents() {
+        let mut tab = Tab::new(Buffer::from_text("città città\ncittà"));
+        let mut bar = FindBar::new();
+        bar.open(BarMode::Replace, &tab);
+        bar.query.pattern = "CITTÀ".into();
+        bar.replacement = "x".into();
+        bar.select_from_caret(&mut tab);
+        assert_eq!(tab.editor.selection.range(), 0..5);
+        bar.replace_current(&mut tab);
+        assert_eq!(tab.buffer.text(), "x città\ncittà");
+        assert_eq!(tab.editor.selection.range(), 2..7);
+        assert_eq!(
+            bar.replace_all(&mut tab),
+            Some("replaced 2 occurrences".into())
+        );
+        assert_eq!(tab.buffer.text(), "x x\nx");
+        assert!(tab.buffer.undo().is_some());
+        assert_eq!(tab.buffer.text(), "x città\ncittà");
+    }
+
+    #[test]
+    fn invalid_regex_sets_error_and_go_to_line_moves_caret() {
+        let mut tab = Tab::new(Buffer::from_text("a\n   b\nc"));
+        let mut bar = FindBar::new();
+        bar.open(BarMode::Find, &tab);
+        bar.query.regex = true;
+        bar.query.pattern = "(".into();
+        bar.select_from_caret(&mut tab);
+        assert!(bar.error.is_some());
+        bar.open(BarMode::GoToLine, &tab);
+        bar.goto = "2".into();
+        bar.go_to_line(&mut tab, 3);
+        assert_eq!(tab.editor.selection, Selection::caret(5));
+        assert_eq!(bar.mode, BarMode::Hidden);
+    }
+}

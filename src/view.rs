@@ -221,6 +221,11 @@ impl RowMap {
     }
 }
 
+/// Widget id of the editor of the tab with id `tab_id` (to query keyboard focus).
+pub fn editor_id(tab_id: u64) -> egui::Id {
+    egui::Id::unique(("fed_editor", tab_id))
+}
+
 /// Shows the editor for `tab` filling the available space. `deco` formats visible lines.
 /// When `key_handler` returns true for a keyboard event the widget skips it (vim hook).
 pub fn show_editor(
@@ -232,7 +237,7 @@ pub fn show_editor(
 ) -> ViewOutput {
     let mut out = ViewOutput::default();
     let revision_before = tab.buffer.revision();
-    let id = egui::Id::unique(("fed_editor", tab.id));
+    let id = editor_id(tab.id);
     let metrics = Metrics::new(ui, opts, tab.buffer.rope().len_lines());
     if !tab.view.focus_acquired {
         // A click elsewhere in the same frame (a tab bar or dialog button) makes egui
