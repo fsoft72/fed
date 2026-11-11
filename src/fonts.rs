@@ -92,9 +92,12 @@ fn family_font(db: &fontdb::Database, family: &str) -> Option<FontData> {
 struct Scan {
     /// Every system face.
     db: fontdb::Database,
-    /// Family names with their monospace flag (see `family_list`).
-    families: Vec<(String, bool)>,
+    /// Family names with their monospace flag (see `family_list`), shared with callers.
+    families: FamilyList,
 }
+
+/// Shared, read-only list of font family names with their monospace flag.
+pub type FamilyList = Arc<[(String, bool)]>;
 
 /// The system font families, scanned on a background thread.
 pub struct FontCatalog {
@@ -109,7 +112,7 @@ impl FontCatalog {
         let thread_slot = Arc::clone(&slot);
         std::thread::spawn(move || {
             let db = system_database();
-            let families = family_list(&db);
+            let families = family_list(&db).into();
             let scan = Arc::new(Scan { db, families });
             *thread_slot.lock().expect("font catalog poisoned") = Some(scan);
             ctx.request_repaint();
@@ -122,9 +125,10 @@ impl FontCatalog {
         self.slot.lock().expect("font catalog poisoned").clone()
     }
 
-    /// Returns the family names (sorted, monospace flag), or `None` while scanning.
-    pub fn families(&self) -> Option<Vec<(String, bool)>> {
-        self.scan().map(|scan| scan.families.clone())
+    /// Returns the family names (sorted, monospace flag), or `None` while scanning. The
+    /// list is shared, so calling this every frame does not copy it.
+    pub fn families(&self) -> Option<FamilyList> {
+        self.scan().map(|scan| Arc::clone(&scan.families))
     }
 
     /// Returns the regular face of `family` with its face index, or `None` while scanning or
@@ -215,6 +219,20 @@ mod tests {
         assert!(!font.bytes().is_empty());
         assert_eq!(font.index, 0);
         assert!(family_font(&db, "No Such Family").is_none());
+    }
+
+    #[test]
+    fn catalog_families_are_shared_not_copied() {
+        let db = hack_database();
+        let families: FamilyList = family_list(&db).into();
+        let scan = Arc::new(Scan { db, families });
+        let catalog = FontCatalog {
+            slot: Arc::new(Mutex::new(Some(scan))),
+        };
+        let first = catalog.families().expect("scan finished");
+        let second = catalog.families().expect("scan finished");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(&first[..], &[(HACK.to_string(), true)]);
     }
 
     #[test]

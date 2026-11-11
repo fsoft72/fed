@@ -2,11 +2,12 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::buffer::Buffer;
 use crate::editing::{self, EditCommand, EditSettings, EditorState};
-use crate::highlight::HighlightCache;
+use crate::highlight::{self, HighlightAssets, HighlightCache};
 use crate::markdown::Preview;
 use crate::view::ViewState;
 use crate::vim::VimState;
@@ -30,6 +31,8 @@ pub struct Tab {
     pub highlight: HighlightCache,
     /// Name of the syntax used for highlighting (`None` until assets are loaded).
     pub syntax: Option<String>,
+    /// Buffer path `syntax` was computed for, to recompute it only when the path changes.
+    syntax_path: Option<PathBuf>,
     /// Markdown prose ranges (char ranges of the whole document) for the given buffer revision.
     pub spell_md: Option<(u64, Vec<Range<usize>>)>,
     /// Buffer char ranges of the misspelled words painted in the last frame.
@@ -55,6 +58,7 @@ impl Tab {
             typing: false,
             highlight: HighlightCache::new(),
             syntax: None,
+            syntax_path: None,
             spell_md: None,
             spell_marks: HashSet::new(),
             preview_open: false,
@@ -78,6 +82,17 @@ impl Tab {
         }
         self.scroll_to_cursor = true;
         editing::apply_command(&mut self.editor, &mut self.buffer, cmd, settings)
+    }
+
+    /// Picks the highlighting syntax from the buffer path. Cheap when nothing changed: the
+    /// lookup only runs the first time (assets just loaded) and after the path changed.
+    pub fn refresh_syntax(&mut self, assets: &HighlightAssets) {
+        let path = self.buffer.path();
+        if self.syntax.is_some() && self.syntax_path.as_deref() == path {
+            return;
+        }
+        self.syntax = Some(highlight::syntax_for_path(assets, path));
+        self.syntax_path = path.map(PathBuf::from);
     }
 
     /// Gives the editor widget keyboard focus the next time this tab is shown
@@ -116,6 +131,24 @@ mod tests {
         tab_width: 4,
         insert_spaces: true,
     };
+
+    #[test]
+    fn syntax_is_recomputed_only_when_the_path_changes() {
+        let assets = HighlightAssets::load();
+        let mut tab = Tab::new(Buffer::new());
+        tab.refresh_syntax(&assets);
+        assert_eq!(tab.syntax.as_deref(), Some("Plain Text"));
+        tab.buffer.set_path(PathBuf::from("main.rs"));
+        tab.refresh_syntax(&assets);
+        assert_eq!(tab.syntax.as_deref(), Some("Rust"));
+        // Same path: the cached name is kept (a sentinel proves no lookup ran).
+        tab.syntax = Some("sentinel".to_string());
+        tab.refresh_syntax(&assets);
+        assert_eq!(tab.syntax.as_deref(), Some("sentinel"));
+        tab.buffer.set_path(PathBuf::from("notes.md"));
+        tab.refresh_syntax(&assets);
+        assert_eq!(tab.syntax.as_deref(), Some("Markdown"));
+    }
 
     #[test]
     fn ids_are_unique() {

@@ -13,10 +13,10 @@ use crate::config::{self, ConfigPaths, Session, Settings, UiTheme};
 use crate::editing::{EditCommand, EditSettings};
 use crate::find_bar::{BarMode, FindBar, MatchDecorator};
 use crate::fonts::{self, FontCatalog, FontLoad};
-use crate::highlight::{self, AssetsHandle, HighlightAssets, HighlightDecorator};
+use crate::highlight::{AssetsHandle, HighlightAssets, HighlightDecorator};
 use crate::keymap::{Action, KeyChord, Keymap};
 use crate::markdown::{self, Preview};
-use crate::settings_ui::{SettingsEvent, SettingsWindow};
+use crate::settings_ui::{SaveDebounce, SettingsEvent, SettingsWindow};
 use crate::spell::{SpellDecorator, SpellMode, SpellService, SpellStatus};
 use crate::tab::Tab;
 use crate::view::{self, KeyHandler, ViewOptions};
@@ -25,8 +25,8 @@ use dialogs::Pending;
 
 /// How long a status bar message stays visible.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
-/// Status bar notice for tabs with highlighting disabled.
-const LARGE_FILE_NOTICE: &str = "large file: highlighting off";
+/// Status bar notice for large files (highlighting, spell check and word wrap disabled).
+const LARGE_FILE_NOTICE: &str = "large file: highlighting, spell check and wrap off";
 /// Status bar text while the dictionaries are downloading.
 const SPELL_DOWNLOADING_NOTICE: &str = "downloading dictionaries...";
 /// Name shown for a tab without a file path.
@@ -308,13 +308,22 @@ pub struct FedApp {
     font_catalog: Option<FontCatalog>,
     /// Startup load of the configured editor font, until it finishes.
     font_load: Option<FontLoad>,
+    /// Deferred save of live (dragged) settings changes.
+    settings_save: SaveDebounce,
+    /// Process start time, while the first frame is still to be traced (`FED_TRACE_STARTUP`).
+    startup_trace: Option<Instant>,
 }
 
 impl FedApp {
     /// Creates the application; `files` are the paths passed on the command line. Loads the
     /// settings, then opens one tab per file (or the previous session's files when `files` is
-    /// empty and session restore is on), falling back to one empty tab.
-    pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> FedApp {
+    /// empty and session restore is on), falling back to one empty tab. With `startup_trace`
+    /// the time from that instant to the end of the first frame is printed to stderr.
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        files: Vec<PathBuf>,
+        startup_trace: Option<Instant>,
+    ) -> FedApp {
         let paths = ConfigPaths::detect();
         let (settings, mut problems) = match &paths {
             Some(p) => config::load_settings(p),
@@ -345,6 +354,8 @@ impl FedApp {
             settings_window: SettingsWindow::new(),
             font_catalog: None,
             font_load: None,
+            settings_save: SaveDebounce::default(),
+            startup_trace,
         };
         app.vim_applied = app.settings.vim_mode;
         fonts::apply_editor_font(&cc.egui_ctx, None, None);
@@ -384,8 +395,10 @@ impl FedApp {
         }
     }
 
-    /// Writes the current settings (including the keymap) to the config directory.
+    /// Writes the current settings (including the keymap) to the config directory, dropping
+    /// any deferred save.
     pub fn save_settings(&mut self) {
+        self.settings_save.cancel();
         self.settings.keybindings = self.keymap.to_overrides();
         let Some(paths) = &self.paths else { return };
         if let Err(e) = config::save_settings(paths, &self.settings) {
@@ -523,12 +536,17 @@ impl FedApp {
         }
     }
 
-    /// Builds the editor widget options from the current settings.
+    /// Builds the editor widget options from the current settings. Word wrap is off for a
+    /// large active file.
     fn view_options(&self) -> ViewOptions {
+        let large = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|t| t.buffer.is_large());
         ViewOptions {
             font: fonts::editor_font_id(self.settings.font_size),
             line_numbers: self.settings.line_numbers,
-            word_wrap: self.settings.word_wrap,
+            word_wrap: self.settings.word_wrap && !large,
             edit: self.edit_settings(),
             keys_enabled: self.pending.is_none(),
             vim: self.settings.vim_mode,
@@ -995,8 +1013,9 @@ impl FedApp {
     }
 
     /// Carries out the settings window events: loads the font, retries the dictionaries and
-    /// saves the settings once when anything changed. Theme, vim and spell check changes are
-    /// picked up from `settings` by the per-frame sync functions.
+    /// saves the settings once when anything changed. Live (dragged) changes only schedule a
+    /// deferred save, written when the drag ends or `SAVE_DEBOUNCE` later. Theme, vim and
+    /// spell check changes are picked up from `settings` by the per-frame sync functions.
     fn apply_settings_events(&mut self, ctx: &egui::Context, events: Vec<SettingsEvent>) {
         if events.is_empty() {
             return;
@@ -1005,6 +1024,8 @@ impl FedApp {
         for event in events {
             match event {
                 SettingsEvent::Changed | SettingsEvent::KeymapChanged => save = true,
+                SettingsEvent::ChangedLive => self.settings_save.schedule(Instant::now()),
+                SettingsEvent::CommitLive => save |= self.settings_save.is_pending(),
                 SettingsEvent::FontChanged => self.load_editor_font(ctx),
                 SettingsEvent::RetryDictionaries => {
                     if let Some(service) = &mut self.spell {
@@ -1018,6 +1039,30 @@ impl FedApp {
         }
         self.sync_vim_mode();
         ctx.request_repaint();
+    }
+
+    /// Writes the deferred settings save once it is due, or schedules a repaint for then.
+    fn flush_settings_save(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if self.settings_save.take_due(now) {
+            self.save_settings();
+            return;
+        }
+        if let Some(left) = self.settings_save.remaining(now) {
+            ctx.request_repaint_after(left);
+        }
+    }
+
+    /// Prints the time from process start to the end of the first frame, once, when
+    /// startup tracing is on.
+    fn trace_first_frame(&mut self) {
+        let Some(start) = self.startup_trace.take() else {
+            return;
+        };
+        eprintln!(
+            "fed: first frame after {:.1} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     /// Applies `settings.font_family` from the font catalog; an unknown family falls back to
@@ -1240,14 +1285,14 @@ impl eframe::App for FedApp {
             }
             let assets = self.loaded_assets.as_deref();
             if let Some(a) = assets {
-                tab.syntax = Some(highlight::syntax_for_path(a, tab.buffer.path()));
+                tab.refresh_syntax(a);
             }
             let theme = if ui.visuals().dark_mode {
                 &self.settings.code_theme_dark
             } else {
                 &self.settings.code_theme_light
             };
-            let syntax = tab.syntax.clone().unwrap_or_default();
+            let syntax = tab.syntax.take().unwrap_or_default();
             // Decorator state is moved out of the tab so the decorators do not borrow it.
             let mut cache = std::mem::take(&mut tab.highlight);
             let mut markdown = tab.spell_md.take();
@@ -1303,6 +1348,7 @@ impl eframe::App for FedApp {
                 }
             };
             tab.highlight = cache;
+            tab.syntax = assets.map(|_| syntax);
             tab.spell_md = markdown;
             if !spell_active {
                 // Nothing was checked: drop the marks so no stale suggestion popup opens.
@@ -1329,10 +1375,15 @@ impl eframe::App for FedApp {
         self.show_spell_menu(&ctx);
         self.show_settings(&ctx);
         self.show_dialogs(&ctx);
+        self.flush_settings_save(&ctx);
+        self.trace_first_frame();
     }
 
-    /// Saves the session when the application exits.
+    /// Writes a pending settings save and the session when the application exits.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.settings_save.is_pending() {
+            self.save_settings();
+        }
         self.save_session();
     }
 }

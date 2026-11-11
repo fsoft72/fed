@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use eframe::egui::{self, Color32, Stroke, TextFormat};
 use ropey::Rope;
@@ -10,7 +10,7 @@ use syntect::highlighting::ThemeSet;
 use syntect::highlighting::{
     FontStyle, HighlightState, Highlighter, RangedHighlightIterator, Style,
 };
-use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
+use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
 use crate::buffer::Buffer;
 use crate::view::Decorator;
@@ -21,6 +21,12 @@ const PLAIN_TEXT: &str = "Plain Text";
 const COMMENT_SCOPE: &str = "comment";
 /// Scope prefix of string literals.
 const STRING_SCOPE: &str = "string";
+/// `COMMENT_SCOPE` as a parsed scope, for cheap prefix tests.
+static COMMENT_PREFIX: LazyLock<Scope> =
+    LazyLock::new(|| Scope::new(COMMENT_SCOPE).expect("valid scope"));
+/// `STRING_SCOPE` as a parsed scope, for cheap prefix tests.
+static STRING_PREFIX: LazyLock<Scope> =
+    LazyLock::new(|| Scope::new(STRING_SCOPE).expect("valid scope"));
 /// Width of the underline stroke for underlined tokens.
 const UNDERLINE_WIDTH: f32 = 1.0;
 
@@ -85,13 +91,14 @@ pub enum SpanKind {
 
 /// Classifies a scope stack: comment wins over string, anything else is `Other`.
 pub fn span_kind(stack: &ScopeStack) -> SpanKind {
+    let comment = *COMMENT_PREFIX;
+    let string = *STRING_PREFIX;
     let mut kind = SpanKind::Other;
-    for scope in stack.as_slice() {
-        let name = scope.to_string();
-        if name.starts_with(COMMENT_SCOPE) {
+    for &scope in stack.as_slice() {
+        if comment.is_prefix_of(scope) {
             return SpanKind::Comment;
         }
-        if name.starts_with(STRING_SCOPE) {
+        if string.is_prefix_of(scope) {
             kind = SpanKind::String;
         }
     }
@@ -170,8 +177,16 @@ impl HighlightCache {
         self.spans.clear();
     }
 
+    /// True when the cache was built for `syntax` and `theme`.
+    fn has_key(&self, syntax: &str, theme: &str) -> bool {
+        self.key
+            .as_ref()
+            .is_some_and(|(s, t)| s == syntax && t == theme)
+    }
+
     /// Returns the styled spans of `line`, parsing forward from the last valid line state.
-    /// Spans cover the line text without its newline.
+    /// Spans cover the line text without its newline. A line already in the cache is
+    /// returned as is: callers must `invalidate_from` the first edited line.
     pub fn line_spans(
         &mut self,
         assets: &HighlightAssets,
@@ -180,10 +195,12 @@ impl HighlightCache {
         rope: &Rope,
         line: usize,
     ) -> &[StyledSpan] {
-        let key = (syntax_name_or_ext.to_string(), theme.to_string());
-        if self.key.as_ref() != Some(&key) {
+        if !self.has_key(syntax_name_or_ext, theme) {
             self.reset();
-            self.key = Some(key);
+            self.key = Some((syntax_name_or_ext.to_string(), theme.to_string()));
+        }
+        if line < self.spans.len() {
+            return &self.spans[line];
         }
         let Some(theme) = assets
             .themes
@@ -411,6 +428,40 @@ mod tests {
         cache.invalidate_from(0);
         let spans = cache.line_spans(&a, "Rust", theme, &edited, 1);
         assert!(ranges_of(spans, SpanKind::Comment).is_empty());
+    }
+
+    #[test]
+    fn cache_hit_returns_cached_spans_without_reparsing() {
+        let a = assets();
+        let mut cache = HighlightCache::new();
+        let theme = "base16-ocean.dark";
+        let rope = Rope::from_str("// note\n");
+        let first = cache.line_spans(&a, "Rust", theme, &rope, 0).to_vec();
+        assert_eq!(ranges_of(&first, SpanKind::Comment), vec![0..7]);
+        // Without invalidation a hit must not look at the text again.
+        let other = Rope::from_str("let x = 1;\n");
+        let hit = cache.line_spans(&a, "Rust", theme, &other, 0);
+        assert_eq!(ranges_of(hit, SpanKind::Comment), vec![0..7]);
+        // A different theme is a different key and rebuilds the cache.
+        let rebuilt = cache.line_spans(&a, "Rust", "InspiredGitHub", &other, 0);
+        assert!(ranges_of(rebuilt, SpanKind::Comment).is_empty());
+    }
+
+    #[test]
+    fn span_kind_matches_scope_prefixes() {
+        let stack = |s: &str| s.parse::<ScopeStack>().expect("valid scope stack");
+        let kind = |s: &str| span_kind(&stack(s));
+        assert_eq!(kind("source.rust"), SpanKind::Other);
+        assert_eq!(kind("source.rust string.quoted.double"), SpanKind::String);
+        assert_eq!(
+            kind("source.rust string.quoted comment.line"),
+            SpanKind::Comment
+        );
+        assert_eq!(
+            kind("source.rust comment.block string.quoted"),
+            SpanKind::Comment
+        );
+        assert_eq!(kind("source.rust stringy.other"), SpanKind::Other);
     }
 
     #[test]

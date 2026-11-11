@@ -1,6 +1,8 @@
 //! The settings window: editor, appearance, vim, spell check, session and key bindings,
 //! including live capture of a new key chord.
 
+use std::time::{Duration, Instant};
+
 use eframe::egui::{self, Event, Key};
 
 use crate::config::{Settings, UiTheme};
@@ -26,12 +28,20 @@ const DEFAULT_FONT_LABEL: &str = "Default (Hack)";
 const CAPTURE_PROMPT: &str = "Press keys... (Esc to cancel)";
 /// Chord column text of an action without a binding.
 const UNBOUND_LABEL: &str = "unbound";
+/// Inline message after capturing a chord without Ctrl/Cmd/Alt that is not a function key.
+pub const NEEDS_MODIFIER_MESSAGE: &str = "Shortcut needs a modifier key";
+/// Delay between a live (dragged) setting change and its save to disk.
+pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Something the user changed in the settings window, for the app to apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsEvent {
     /// Some setting changed: save the settings file.
     Changed,
+    /// A dragged value changed: apply it now, save it later (see `SaveDebounce`).
+    ChangedLive,
+    /// The user stopped dragging or left a dragged value: save it now if a save is pending.
+    CommitLive,
     /// The editor font family changed: load and apply it.
     FontChanged,
     /// A key binding changed.
@@ -65,6 +75,95 @@ fn is_bare_modifier(key: Key) -> bool {
             | Key::NumLock
             | Key::ScrollLock
     )
+}
+
+/// True for the function keys F1 to F20, which may be bound without a modifier.
+fn is_function_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::F1
+            | Key::F2
+            | Key::F3
+            | Key::F4
+            | Key::F5
+            | Key::F6
+            | Key::F7
+            | Key::F8
+            | Key::F9
+            | Key::F10
+            | Key::F11
+            | Key::F12
+            | Key::F13
+            | Key::F14
+            | Key::F15
+            | Key::F16
+            | Key::F17
+            | Key::F18
+            | Key::F19
+            | Key::F20
+    )
+}
+
+/// True when `chord` may become a shortcut: it uses Ctrl, Cmd or Alt, or its key is F1-F20.
+/// Shift alone is not enough, since Shift+letter is plain typing.
+pub fn chord_has_modifier(chord: &KeyChord) -> bool {
+    chord.command || chord.ctrl || chord.alt || is_function_key(chord.key)
+}
+
+/// Events for a dragged value widget: `changed` applies the value live, `committed` (drag
+/// stopped or focus lost) saves it.
+fn drag_value_events(changed: bool, committed: bool) -> Vec<SettingsEvent> {
+    let mut events = Vec::new();
+    if changed {
+        events.push(SettingsEvent::ChangedLive);
+    }
+    if committed {
+        events.push(SettingsEvent::CommitLive);
+    }
+    events
+}
+
+/// Deadline of a deferred settings save: live changes save at most once per `SAVE_DEBOUNCE`.
+#[derive(Debug, Default)]
+pub struct SaveDebounce {
+    /// When the pending save is due; `None` when nothing is pending.
+    due: Option<Instant>,
+}
+
+impl SaveDebounce {
+    /// Schedules a save `SAVE_DEBOUNCE` after `now`, unless one is already pending (so a long
+    /// drag still saves every `SAVE_DEBOUNCE`).
+    pub fn schedule(&mut self, now: Instant) {
+        if self.due.is_some() {
+            return;
+        }
+        self.due = Some(now + SAVE_DEBOUNCE);
+    }
+
+    /// True while a save is pending.
+    pub fn is_pending(&self) -> bool {
+        self.due.is_some()
+    }
+
+    /// Drops the pending save (the settings were just saved).
+    pub fn cancel(&mut self) {
+        self.due = None;
+    }
+
+    /// Returns true and clears the deadline when the pending save is due at `now`.
+    pub fn take_due(&mut self, now: Instant) -> bool {
+        let Some(due) = self.due else { return false };
+        if now < due {
+            return false;
+        }
+        self.due = None;
+        true
+    }
+
+    /// Time left until the pending save is due, or `None` when nothing is pending.
+    pub fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.due.map(|due| due.saturating_duration_since(now))
+    }
 }
 
 /// Returns the chord of the first key press in `events` that is not a bare modifier, or
@@ -101,6 +200,8 @@ pub struct SettingsWindow {
     pub open: bool,
     /// Action waiting for a new chord, while capturing.
     capture: Option<Action>,
+    /// True when the last captured chord was rejected for lacking a modifier.
+    capture_rejected: bool,
     /// A captured chord already used by another action: (action, chord, other action).
     pending_conflict: Option<(Action, KeyChord, Action)>,
     /// Text filter of the font family list.
@@ -117,6 +218,7 @@ impl Default for SettingsWindow {
         SettingsWindow {
             open: false,
             capture: None,
+            capture_rejected: false,
             pending_conflict: None,
             font_filter: String::new(),
             monospace_only: true,
@@ -143,6 +245,7 @@ impl SettingsWindow {
     pub fn close(&mut self) {
         self.open = false;
         self.capture = None;
+        self.capture_rejected = false;
         self.pending_conflict = None;
     }
 
@@ -192,11 +295,36 @@ impl SettingsWindow {
         let Some(result) = result else {
             return Some(Vec::new());
         };
+        Some(self.finish_capture(action, result, keymap))
+    }
+
+    /// Ends the capture for `action` with `result`. A chord without a modifier (see
+    /// `chord_has_modifier`) is rejected with an inline message and the capture goes on.
+    fn finish_capture(
+        &mut self,
+        action: Action,
+        result: CaptureResult,
+        keymap: &mut Keymap,
+    ) -> Vec<SettingsEvent> {
+        let chord = match result {
+            CaptureResult::Chord(chord) if !chord_has_modifier(&chord) => {
+                self.capture_rejected = true;
+                return Vec::new();
+            }
+            CaptureResult::Chord(chord) => chord,
+            CaptureResult::Cancel => {
+                self.stop_capture();
+                return Vec::new();
+            }
+        };
+        self.stop_capture();
+        self.bind(action, chord, keymap)
+    }
+
+    /// Leaves capture mode and clears its message.
+    fn stop_capture(&mut self) {
         self.capture = None;
-        match result {
-            CaptureResult::Cancel => Some(Vec::new()),
-            CaptureResult::Chord(chord) => Some(self.bind(action, chord, keymap)),
-        }
+        self.capture_rejected = false;
     }
 
     /// Binds `chord` to `action`, or records a conflict when another action uses it.
@@ -293,14 +421,14 @@ impl SettingsWindow {
                         let size = egui::DragValue::new(&mut settings.font_size)
                             .range(FONT_SIZE_RANGE)
                             .speed(0.5);
-                        changed(ui.add(size), events);
+                        drag_changed(ui.add(size), events);
                         ui.end_row();
 
                         ui.label("Tab width");
                         let width = egui::DragValue::new(&mut settings.tab_width)
                             .range(TAB_WIDTH_RANGE)
                             .speed(0.1);
-                        changed(ui.add(width), events);
+                        drag_changed(ui.add(width), events);
                         ui.end_row();
                     });
                 changed(
@@ -498,7 +626,7 @@ impl SettingsWindow {
                     });
                 if ui.button("Reset to defaults").clicked() {
                     keymap.reset();
-                    self.capture = None;
+                    self.stop_capture();
                     self.pending_conflict = None;
                     events.extend([SettingsEvent::KeymapChanged, SettingsEvent::Changed]);
                 }
@@ -518,15 +646,22 @@ impl SettingsWindow {
             .chord(action)
             .map_or_else(|| UNBOUND_LABEL.to_string(), |c| c.to_string());
         ui.monospace(chord);
-        if self.capture == Some(action) {
+        let capturing = self.capture == Some(action);
+        if capturing {
             if ui.button(CAPTURE_PROMPT).clicked() {
-                self.capture = None;
+                self.stop_capture();
             }
         } else if ui.button("Change").clicked() {
             self.capture = Some(action);
+            self.capture_rejected = false;
             self.pending_conflict = None;
         }
         ui.end_row();
+        if capturing && self.capture_rejected {
+            ui.label("");
+            ui.colored_label(ui.visuals().warn_fg_color, NEEDS_MODIFIER_MESSAGE);
+            ui.end_row();
+        }
         let Some((conflict_action, chord, other)) = self.pending_conflict else {
             return;
         };
@@ -557,6 +692,12 @@ fn changed(response: egui::Response, events: &mut Vec<SettingsEvent>) {
     if response.changed() {
         events.push(SettingsEvent::Changed);
     }
+}
+
+/// Records the events of a dragged value widget (see `drag_value_events`).
+fn drag_changed(response: egui::Response, events: &mut Vec<SettingsEvent>) {
+    let committed = response.drag_stopped() || response.lost_focus();
+    events.extend(drag_value_events(response.changed(), committed));
 }
 
 /// A combo box choosing one of `names` for `value`.
@@ -653,6 +794,83 @@ mod tests {
             assert!(!chord.ctrl, "off macOS Ctrl is folded into command");
             assert_eq!(chord.to_string(), "Ctrl+Shift+K");
         }
+    }
+
+    #[test]
+    fn chords_need_a_modifier_unless_function_key() {
+        let chord = |s: &str| KeyChord::parse(s).expect("valid chord");
+        assert!(chord_has_modifier(&chord("Ctrl+K")));
+        assert!(chord_has_modifier(&chord("Alt+K")));
+        assert!(chord_has_modifier(&chord("F1")));
+        assert!(chord_has_modifier(&chord("Shift+F20")));
+        assert!(!chord_has_modifier(&chord("K")));
+        assert!(!chord_has_modifier(&chord("Shift+K")));
+        assert!(!chord_has_modifier(&KeyChord::from_egui(
+            Key::F21,
+            egui::Modifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn capture_rejects_chord_without_modifier_and_keeps_capturing() {
+        let mut window = SettingsWindow::new();
+        window.open = true;
+        window.capture = Some(Action::NewTab);
+        let mut keymap = Keymap::defaults();
+        let before = keymap.chord(Action::NewTab);
+        let bare = CaptureResult::Chord(KeyChord::parse("Shift+K").unwrap());
+        assert!(
+            window
+                .finish_capture(Action::NewTab, bare, &mut keymap)
+                .is_empty()
+        );
+        assert!(window.capture_rejected);
+        assert!(window.is_capturing(), "the user can try another chord");
+        assert_eq!(keymap.chord(Action::NewTab), before);
+
+        let f9 = KeyChord::parse("F9").unwrap();
+        assert_eq!(
+            window.finish_capture(Action::NewTab, CaptureResult::Chord(f9), &mut keymap),
+            vec![SettingsEvent::KeymapChanged, SettingsEvent::Changed]
+        );
+        assert!(!window.capture_rejected);
+        assert!(!window.is_capturing());
+        assert_eq!(keymap.chord(Action::NewTab), Some(f9));
+    }
+
+    #[test]
+    fn drag_values_apply_live_and_save_on_commit() {
+        assert!(drag_value_events(false, false).is_empty());
+        assert_eq!(
+            drag_value_events(true, false),
+            vec![SettingsEvent::ChangedLive]
+        );
+        assert_eq!(
+            drag_value_events(true, true),
+            vec![SettingsEvent::ChangedLive, SettingsEvent::CommitLive]
+        );
+    }
+
+    #[test]
+    fn save_debounce_saves_at_most_once_per_interval() {
+        let start = Instant::now();
+        let mut debounce = SaveDebounce::default();
+        assert!(!debounce.take_due(start));
+        assert_eq!(debounce.remaining(start), None);
+        debounce.schedule(start);
+        // Later changes do not push the deadline back.
+        debounce.schedule(start + Duration::from_millis(400));
+        assert!(debounce.is_pending());
+        assert_eq!(
+            debounce.remaining(start + Duration::from_millis(100)),
+            Some(Duration::from_millis(400))
+        );
+        assert!(!debounce.take_due(start + Duration::from_millis(499)));
+        assert!(debounce.take_due(start + SAVE_DEBOUNCE));
+        assert!(!debounce.is_pending());
+        debounce.schedule(start);
+        debounce.cancel();
+        assert!(!debounce.take_due(start + SAVE_DEBOUNCE));
     }
 
     #[test]
