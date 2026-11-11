@@ -1,6 +1,7 @@
 //! fed: a fast text editor built with Rust and egui.
 
 pub mod app;
+pub mod buffer;
 
 use std::path::PathBuf;
 
