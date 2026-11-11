@@ -1,5 +1,7 @@
 //! An open document: buffer, editor state and per-tab view caches.
 
+use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::buffer::Buffer;
@@ -26,6 +28,10 @@ pub struct Tab {
     pub highlight: HighlightCache,
     /// Name of the syntax used for highlighting (`None` until assets are loaded).
     pub syntax: Option<String>,
+    /// Markdown prose ranges (char ranges of the whole document) for the given buffer revision.
+    pub spell_md: Option<(u64, Vec<Range<usize>>)>,
+    /// Buffer char ranges of the misspelled words painted in the last frame.
+    pub spell_marks: HashSet<Range<usize>>,
     /// Rendering caches owned by the editor widget.
     pub(crate) view: ViewState,
 }
@@ -41,6 +47,8 @@ impl Tab {
             typing: false,
             highlight: HighlightCache::new(),
             syntax: None,
+            spell_md: None,
+            spell_marks: HashSet::new(),
             view: ViewState::default(),
         }
     }

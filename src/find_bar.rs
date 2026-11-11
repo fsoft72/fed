@@ -13,7 +13,7 @@ use crate::editing::Selection;
 use crate::search::{self, SearchQuery};
 use crate::tab::Tab;
 use crate::text_nav;
-use crate::view::Decorator;
+use crate::view::{self, Decorator};
 
 /// Width of the search and replacement text fields in points.
 const FIELD_WIDTH: f32 = 220.0;
@@ -536,38 +536,14 @@ fn expand_match(
     None
 }
 
-/// Overlays `background` on the parts of `spans` covered by `ranges`, splitting spans at the
-/// range borders. `ranges` are sorted, non-overlapping char ranges in the same coordinates
-/// as the spans. Order and non-overlap of the spans are preserved.
+/// Overlays `background` on the parts of `spans` covered by `ranges` (see
+/// `view::overlay_format`).
 pub fn overlay_background(
     spans: Vec<(Range<usize>, TextFormat)>,
     ranges: &[Range<usize>],
     background: Color32,
 ) -> Vec<(Range<usize>, TextFormat)> {
-    if ranges.is_empty() {
-        return spans;
-    }
-    let mut out = Vec::with_capacity(spans.len() + ranges.len() * 2);
-    for (span, format) in spans {
-        let mut pos = span.start;
-        for r in ranges
-            .iter()
-            .filter(|r| r.end > span.start && r.start < span.end)
-        {
-            let (a, b) = (r.start.max(span.start), r.end.min(span.end));
-            if a > pos {
-                out.push((pos..a, format.clone()));
-            }
-            let mut highlighted = format.clone();
-            highlighted.background = background;
-            out.push((a..b, highlighted));
-            pos = b;
-        }
-        if pos < span.end || span.is_empty() {
-            out.push((pos..span.end, format));
-        }
-    }
-    out
+    view::overlay_format(spans, ranges, |format| format.background = background)
 }
 
 /// Decorator that paints a translucent background behind search matches on top of the

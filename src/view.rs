@@ -72,6 +72,40 @@ pub trait Decorator {
     ) -> Vec<(Range<usize>, TextFormat)>;
 }
 
+/// Applies `apply` to the parts of `spans` covered by `ranges`, splitting spans at the range
+/// borders. `ranges` are sorted, non-overlapping char ranges in the same coordinates as the
+/// spans. Order and non-overlap of the spans are preserved.
+pub fn overlay_format(
+    spans: Vec<(Range<usize>, TextFormat)>,
+    ranges: &[Range<usize>],
+    apply: impl Fn(&mut TextFormat),
+) -> Vec<(Range<usize>, TextFormat)> {
+    if ranges.is_empty() {
+        return spans;
+    }
+    let mut out = Vec::with_capacity(spans.len() + ranges.len() * 2);
+    for (span, format) in spans {
+        let mut pos = span.start;
+        for r in ranges
+            .iter()
+            .filter(|r| r.end > span.start && r.start < span.end)
+        {
+            let (a, b) = (r.start.max(span.start), r.end.min(span.end));
+            if a > pos {
+                out.push((pos..a, format.clone()));
+            }
+            let mut changed = format.clone();
+            apply(&mut changed);
+            out.push((a..b, changed));
+            pos = b;
+        }
+        if pos < span.end || span.is_empty() {
+            out.push((pos..span.end, format));
+        }
+    }
+    out
+}
+
 /// Decorator drawing every line with the base format.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PlainDecorator;

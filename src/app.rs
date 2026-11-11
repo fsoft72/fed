@@ -14,6 +14,7 @@ use crate::editing::{EditCommand, EditSettings};
 use crate::find_bar::{BarMode, FindBar, MatchDecorator};
 use crate::highlight::{self, AssetsHandle, HighlightAssets, HighlightDecorator};
 use crate::keymap::{Action, KeyChord, Keymap};
+use crate::spell::{SpellDecorator, SpellMode, SpellService, SpellStatus};
 use crate::tab::Tab;
 use crate::view::{self, ViewOptions};
 use dialogs::Pending;
@@ -22,6 +23,8 @@ use dialogs::Pending;
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Status bar notice for tabs with highlighting disabled.
 const LARGE_FILE_NOTICE: &str = "large file: highlighting off";
+/// Status bar text while the dictionaries are downloading.
+const SPELL_DOWNLOADING_NOTICE: &str = "downloading dictionaries...";
 /// Name shown for a tab without a file path.
 const UNTITLED: &str = "untitled";
 /// Suffix of a tab label when the buffer has unsaved changes. Drawn with the monospace
@@ -143,6 +146,22 @@ enum TabBarAction {
     Close(usize),
 }
 
+/// The spelling suggestions popup opened by a right click on a misspelled word.
+struct SpellMenu {
+    /// Id of the tab the word belongs to.
+    tab_id: u64,
+    /// Screen position of the popup.
+    pos: egui::Pos2,
+    /// Char range of the word in the buffer.
+    range: std::ops::Range<usize>,
+    /// The misspelled word.
+    word: String,
+    /// Suggested replacements.
+    suggestions: Vec<String>,
+    /// True until the popup has been drawn once (the opening click must not close it).
+    fresh: bool,
+}
+
 /// Top-level editor application state.
 pub struct FedApp {
     /// Open documents, one per tab; never empty.
@@ -167,6 +186,10 @@ pub struct FedApp {
     assets: AssetsHandle,
     /// The loaded assets, once available.
     loaded_assets: Option<Arc<HighlightAssets>>,
+    /// Background spell checker; started when spell checking is on.
+    spell: Option<SpellService>,
+    /// Suggestions popup, when open.
+    spell_menu: Option<SpellMenu>,
     /// Set once the user agreed to close the window, so the close is not intercepted again.
     allow_close: bool,
 }
@@ -198,9 +221,12 @@ impl FedApp {
             find_bar: FindBar::new(),
             assets: AssetsHandle::spawn(cc.egui_ctx.clone()),
             loaded_assets: None,
+            spell: None,
+            spell_menu: None,
             allow_close: false,
         };
         app.apply_theme(&cc.egui_ctx);
+        app.ensure_spell(&cc.egui_ctx);
         if !problems.is_empty() {
             app.set_status(problems.join("; "), Severity::Warning);
         }
@@ -551,8 +577,29 @@ impl FedApp {
         }
     }
 
+    /// Starts the spell checker service when spell checking is on and none runs yet.
+    fn ensure_spell(&mut self, ctx: &egui::Context) {
+        if !self.settings.spell_check || self.spell.is_some() {
+            return;
+        }
+        let Some(paths) = self.paths.clone() else {
+            return;
+        };
+        self.spell = Some(SpellService::spawn(ctx.clone(), paths, true));
+    }
+
+    /// Returns the spell checking status (`Disabled` when off or not started).
+    fn spell_status(&self) -> SpellStatus {
+        match &self.spell {
+            Some(service) if self.settings.spell_check => service.status(),
+            _ => SpellStatus::Disabled,
+        }
+    }
+
     /// Draws the status bar: tab status on the left, notices and messages on the right.
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let spell_status = self.spell_status();
+        let mut retry = false;
         let tab = &self.tabs[self.active];
         egui::Panel::bottom("fed_status").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -569,9 +616,126 @@ impl FedApp {
                     if tab.buffer.is_large() {
                         ui.label(LARGE_FILE_NOTICE);
                     }
+                    match &spell_status {
+                        SpellStatus::Downloading => {
+                            ui.label(SPELL_DOWNLOADING_NOTICE);
+                        }
+                        SpellStatus::Failed(message) => {
+                            retry = ui.small_button("retry").clicked();
+                            ui.colored_label(ui.visuals().warn_fg_color, message);
+                        }
+                        _ => {}
+                    }
                 });
             });
         });
+        if retry && let Some(service) = &mut self.spell {
+            service.retry();
+        }
+    }
+
+    /// Opens the suggestions popup for the misspelled word under a right click, if any.
+    fn open_spell_menu(&mut self, pos: egui::Pos2, clicked: std::ops::Range<usize>) {
+        let Some(checker) = self.spell.as_ref().and_then(SpellService::checker) else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(range) = tab
+            .spell_marks
+            .iter()
+            .find(|m| m.start >= clicked.start && m.end <= clicked.end)
+            .cloned()
+        else {
+            return;
+        };
+        let word = tab.buffer.rope().slice(range.clone()).to_string();
+        let suggestions = checker
+            .read()
+            .expect("spell checker poisoned")
+            .suggest(&word);
+        self.spell_menu = Some(SpellMenu {
+            tab_id: tab.id,
+            pos,
+            range,
+            word,
+            suggestions,
+            fresh: true,
+        });
+    }
+
+    /// Draws the suggestions popup and applies the chosen action.
+    fn show_spell_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = &mut self.spell_menu else {
+            return;
+        };
+        let mut chosen: Option<Option<String>> = None;
+        let shown = egui::Area::new(egui::Id::unique("fed_spell_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.pos)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    for s in &menu.suggestions {
+                        if ui.button(s).clicked() {
+                            chosen = Some(Some(s.clone()));
+                        }
+                    }
+                    if menu.suggestions.is_empty() {
+                        ui.label("no suggestions");
+                    }
+                    ui.separator();
+                    if ui.button("Add to dictionary").clicked() {
+                        chosen = Some(None);
+                    }
+                });
+            });
+        let dismissed = !menu.fresh
+            && (shown.response.clicked_elsewhere()
+                || ctx.input(|i| i.key_pressed(egui::Key::Escape)));
+        menu.fresh = false;
+        if let Some(choice) = chosen {
+            self.apply_spell_choice(choice);
+        } else if dismissed {
+            self.spell_menu = None;
+        }
+    }
+
+    /// Replaces the word of the open popup with `replacement`, or adds it to the dictionary
+    /// when `replacement` is `None`. Closes the popup.
+    fn apply_spell_choice(&mut self, replacement: Option<String>) {
+        let Some(menu) = self.spell_menu.take() else {
+            return;
+        };
+        match replacement {
+            Some(text) => {
+                let Some(tab) = self.tabs.iter_mut().find(|t| t.id == menu.tab_id) else {
+                    return;
+                };
+                let rope = tab.buffer.rope();
+                if menu.range.end > rope.len_chars()
+                    || rope.slice(menu.range.clone()) != menu.word.as_str()
+                {
+                    return;
+                }
+                tab.end_typing();
+                tab.buffer.replace(menu.range.clone(), &text);
+                let caret = menu.range.start + text.chars().count();
+                tab.editor.selection = crate::editing::Selection::caret(caret);
+                tab.editor.preferred_col = None;
+                tab.scroll_to_cursor = true;
+                tab.focus_editor();
+            }
+            None => {
+                let result = self.spell.as_ref().map(|s| s.add_word(&menu.word));
+                if let Some(Err(e)) = result {
+                    self.set_status(
+                        format!("cannot save personal dictionary: {e}"),
+                        Severity::Error,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -582,6 +746,7 @@ impl eframe::App for FedApp {
         self.apply_theme(&ctx);
         self.expire_status(&ctx);
         self.handle_close_request(&ctx);
+        self.ensure_spell(&ctx);
         self.handle_shortcuts(&ctx);
         match self.tab_bar(ui) {
             Some(TabBarAction::Activate(i)) => self.activate(i),
@@ -591,6 +756,11 @@ impl eframe::App for FedApp {
         self.status_bar(ui);
         self.find_bar_panel(ui);
         let opts = self.view_options();
+        let checker = match self.settings.spell_check {
+            true => self.spell.as_ref().and_then(SpellService::checker),
+            false => None,
+        };
+        let mut context_click = None;
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(tab) = self.tabs.get_mut(self.active) else {
                 return;
@@ -609,18 +779,41 @@ impl eframe::App for FedApp {
                 &self.settings.code_theme_light
             };
             let syntax = tab.syntax.clone().unwrap_or_default();
-            // The cache is moved out of the tab so the decorator does not borrow the tab.
+            // Decorator state is moved out of the tab so the decorators do not borrow it.
             let mut cache = std::mem::take(&mut tab.highlight);
-            let enabled = !tab.buffer.is_large();
+            let mut markdown = tab.spell_md.take();
+            let mut marks = std::mem::take(&mut tab.spell_marks);
+            let large = tab.buffer.is_large();
             let mut highlighted =
-                HighlightDecorator::new(&mut cache, assets, &syntax, theme, enabled);
-            let mut deco = MatchDecorator::new(&mut highlighted, &matches);
-            let out = view::show_editor(ui, tab, &opts, &mut deco, None);
+                HighlightDecorator::new(&mut cache, assets, &syntax, theme, !large);
+            let spell_checker = checker.filter(|_| !large);
+            let out = match spell_checker {
+                Some(c) => {
+                    let mode = SpellMode::for_syntax(&syntax);
+                    let mut spell =
+                        SpellDecorator::new(&mut highlighted, c, mode, &mut markdown, &mut marks);
+                    let mut deco = MatchDecorator::new(&mut spell, &matches);
+                    view::show_editor(ui, tab, &opts, &mut deco, None)
+                }
+                None => {
+                    let mut deco = MatchDecorator::new(&mut highlighted, &matches);
+                    view::show_editor(ui, tab, &opts, &mut deco, None)
+                }
+            };
             tab.highlight = cache;
+            tab.spell_md = markdown;
+            tab.spell_marks = marks;
             if let Some(text) = out.clipboard {
                 ui.ctx().copy_text(text);
             }
+            if let Some((range, _)) = out.context_word {
+                context_click = ui.input(|i| i.pointer.latest_pos()).map(|pos| (pos, range));
+            }
         });
+        if let Some((pos, range)) = context_click {
+            self.open_spell_menu(pos, range);
+        }
+        self.show_spell_menu(&ctx);
         self.show_dialogs(&ctx);
     }
 

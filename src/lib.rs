@@ -8,6 +8,7 @@ pub mod find_bar;
 pub mod highlight;
 pub mod keymap;
 pub mod search;
+pub mod spell;
 pub mod tab;
 pub mod text_nav;
 pub mod view;

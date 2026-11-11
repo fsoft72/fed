@@ -1,0 +1,486 @@
+//! Spell checking: dictionaries, checker and background service.
+
+pub mod dict;
+pub mod words;
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Write;
+use std::ops::Range;
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
+
+use eframe::egui::{self, Color32, Stroke, TextFormat};
+use ropey::Rope;
+
+use crate::buffer::Buffer;
+use crate::config::ConfigPaths;
+use crate::highlight::HighlightDecorator;
+use crate::view::{self, Decorator};
+
+/// Maximum number of suggestions returned for a word.
+const MAX_SUGGESTIONS: usize = 8;
+/// Name of the Markdown syntax.
+const MARKDOWN_SYNTAX: &str = "Markdown";
+/// Name of the plain text syntax.
+const PLAIN_TEXT_SYNTAX: &str = "Plain Text";
+/// Color of the underline under misspelled words.
+const MISSPELLED_COLOR: Color32 = Color32::from_rgb(220, 50, 47);
+/// Width of the underline under misspelled words.
+const MISSPELLED_WIDTH: f32 = 1.0;
+
+/// Checks words against Hunspell dictionaries and a personal word list.
+pub struct SpellChecker {
+    /// Loaded dictionaries (a word is correct if any accepts it).
+    dicts: Vec<spellbook::Dictionary>,
+    /// Words added by the user.
+    personal: HashSet<String>,
+    /// Results of `is_correct`, cleared when the personal list changes.
+    cache: HashMap<String, bool>,
+}
+
+impl SpellChecker {
+    /// Creates a checker from parsed dictionaries and the personal word list.
+    pub fn new(dicts: Vec<spellbook::Dictionary>, personal: HashSet<String>) -> SpellChecker {
+        SpellChecker {
+            dicts,
+            personal,
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Returns true if `word` is accepted by a dictionary or the personal list. A capitalized
+    /// word is also tried in lowercase.
+    pub fn check(&self, word: &str) -> bool {
+        let lower = word.to_lowercase();
+        let capitalized = word.chars().next().is_some_and(char::is_uppercase);
+        let known = |w: &str| self.personal.contains(w) || self.dicts.iter().any(|d| d.check(w));
+        known(word) || (capitalized && known(&lower))
+    }
+
+    /// Like `check`, remembering the result for repeated lookups of the same word.
+    pub fn is_correct(&mut self, word: &str) -> bool {
+        if let Some(&known) = self.cache.get(word) {
+            return known;
+        }
+        let known = self.check(word);
+        self.cache.insert(word.to_string(), known);
+        known
+    }
+
+    /// Returns up to `MAX_SUGGESTIONS` distinct suggestions merged from all dictionaries.
+    pub fn suggest(&self, word: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for dict in &self.dicts {
+            let mut found = Vec::new();
+            dict.suggest(word, &mut found);
+            for s in found {
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+        out.truncate(MAX_SUGGESTIONS);
+        out
+    }
+
+    /// Adds `word` to the in-memory personal list and clears the result cache.
+    pub fn add_personal(&mut self, word: &str) {
+        self.personal.insert(word.to_string());
+        self.cache.clear();
+    }
+}
+
+/// Loads the personal word list (one word per line); a missing file is an empty list.
+pub fn load_personal(path: &Path) -> HashSet<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Appends `word` as a new line of the personal word list, creating the file and its
+/// directory when needed.
+pub fn append_personal(path: &Path, word: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{word}")
+}
+
+/// State of the background dictionary loading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpellStatus {
+    /// Spell checking is switched off.
+    Disabled,
+    /// Dictionaries are being read from disk.
+    Loading,
+    /// Missing dictionaries are being downloaded.
+    Downloading,
+    /// The checker is available.
+    Ready,
+    /// Loading failed (the message says why); the checker may still hold partial data.
+    Failed(String),
+}
+
+/// State shared between the service handle and its loader thread.
+struct Shared {
+    /// Current loading status.
+    status: Mutex<SpellStatus>,
+    /// The checker, once at least one dictionary is loaded.
+    checker: Mutex<Option<Arc<RwLock<SpellChecker>>>>,
+}
+
+/// Loads dictionaries on a background thread and hands out the checker.
+pub struct SpellService {
+    /// State shared with the loader thread.
+    shared: Arc<Shared>,
+    /// Context used to request a repaint when loading progresses.
+    ctx: egui::Context,
+    /// Config locations (dictionaries directory, personal word list).
+    paths: ConfigPaths,
+    /// Whether missing dictionaries may be downloaded.
+    allow_download: bool,
+}
+
+/// Reads and parses one dictionary from its `.aff` and `.dic` files.
+fn parse_dictionary(aff: &Path, dic: &Path) -> Result<spellbook::Dictionary, String> {
+    let read = |p: &Path| fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
+    spellbook::Dictionary::new(&read(aff)?, &read(dic)?)
+        .map_err(|e| format!("{}: {e}", aff.display()))
+}
+
+/// Updates the shared status and wakes the UI.
+fn set_status(shared: &Shared, ctx: &egui::Context, status: SpellStatus) {
+    *shared.status.lock().expect("spell status poisoned") = status;
+    ctx.request_repaint();
+}
+
+/// Loader thread body: locates (or downloads) and parses every language.
+fn load_all(shared: &Shared, ctx: &egui::Context, paths: &ConfigPaths, allow_download: bool) {
+    let dict_dir = paths.dictionaries_dir();
+    let system = dict::system_dirs();
+    let mut dicts = Vec::new();
+    let mut errors = Vec::new();
+    for lang in dict::LANGS {
+        let files = match dict::locate(lang, &dict_dir, &system) {
+            Some(files) => Ok(files),
+            None if allow_download => {
+                set_status(shared, ctx, SpellStatus::Downloading);
+                dict::download(lang, &dict_dir)
+            }
+            None => Err(format!("{lang}: dictionary not found")),
+        };
+        match files.and_then(|(aff, dic)| parse_dictionary(&aff, &dic)) {
+            Ok(d) => dicts.push(d),
+            Err(e) => errors.push(e),
+        }
+        set_status(shared, ctx, SpellStatus::Loading);
+    }
+    if !dicts.is_empty() {
+        let personal = load_personal(&paths.personal_dictionary());
+        let checker = Arc::new(RwLock::new(SpellChecker::new(dicts, personal)));
+        *shared.checker.lock().expect("spell checker slot poisoned") = Some(checker);
+    }
+    let status = if errors.is_empty() {
+        SpellStatus::Ready
+    } else {
+        SpellStatus::Failed(format!("spell check: {}", errors.join("; ")))
+    };
+    set_status(shared, ctx, status);
+}
+
+impl SpellService {
+    /// Starts loading the dictionaries in a thread and requests a repaint as it progresses.
+    pub fn spawn(ctx: egui::Context, paths: ConfigPaths, allow_download: bool) -> SpellService {
+        let shared = Arc::new(Shared {
+            status: Mutex::new(SpellStatus::Loading),
+            checker: Mutex::new(None),
+        });
+        let service = SpellService {
+            shared,
+            ctx,
+            paths,
+            allow_download,
+        };
+        service.start_thread();
+        service
+    }
+
+    /// Spawns the loader thread for the current shared state.
+    fn start_thread(&self) {
+        let shared = Arc::clone(&self.shared);
+        let ctx = self.ctx.clone();
+        let paths = self.paths.clone();
+        let allow_download = self.allow_download;
+        std::thread::spawn(move || load_all(&shared, &ctx, &paths, allow_download));
+    }
+
+    /// Returns the current loading status.
+    pub fn status(&self) -> SpellStatus {
+        self.shared
+            .status
+            .lock()
+            .expect("spell status poisoned")
+            .clone()
+    }
+
+    /// Returns the checker once at least one dictionary is loaded.
+    pub fn checker(&self) -> Option<Arc<RwLock<SpellChecker>>> {
+        self.shared
+            .checker
+            .lock()
+            .expect("spell checker slot poisoned")
+            .clone()
+    }
+
+    /// Adds `word` to the personal dictionary, in memory and on disk.
+    pub fn add_word(&self, word: &str) -> std::io::Result<()> {
+        if let Some(checker) = self.checker() {
+            checker
+                .write()
+                .expect("spell checker poisoned")
+                .add_personal(word);
+        }
+        append_personal(&self.paths.personal_dictionary(), word)
+    }
+
+    /// Starts loading again after a failure, unless a load is in progress.
+    pub fn retry(&mut self) {
+        if !matches!(self.status(), SpellStatus::Failed(_)) {
+            return;
+        }
+        set_status(&self.shared, &self.ctx, SpellStatus::Loading);
+        self.start_thread();
+    }
+}
+
+/// Which parts of a document are spell checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpellMode {
+    /// Source code: only comments and strings.
+    Code,
+    /// Markdown: prose only (no code, URLs or front matter).
+    Markdown,
+    /// Plain text: everything.
+    Plain,
+}
+
+impl SpellMode {
+    /// Picks the mode for a syntax name.
+    pub fn for_syntax(syntax: &str) -> SpellMode {
+        match syntax {
+            MARKDOWN_SYNTAX => SpellMode::Markdown,
+            PLAIN_TEXT_SYNTAX => SpellMode::Plain,
+            _ => SpellMode::Code,
+        }
+    }
+}
+
+/// Decorator that underlines misspelled words on top of the highlight decorator.
+pub struct SpellDecorator<'a, 'b> {
+    /// Highlight decorator providing the base spans and the token kinds for code.
+    inner: &'a mut HighlightDecorator<'b>,
+    /// Shared checker.
+    checker: Arc<RwLock<SpellChecker>>,
+    /// Which text is checked.
+    mode: SpellMode,
+    /// Markdown prose ranges cache of the tab (revision, ranges).
+    markdown: &'a mut Option<(u64, Vec<Range<usize>>)>,
+    /// Receives the buffer ranges of the misspelled words painted this frame.
+    marks: &'a mut HashSet<Range<usize>>,
+    /// Snapshot of the buffer text taken in `prepare`.
+    rope: Option<Rope>,
+}
+
+impl<'a, 'b> SpellDecorator<'a, 'b> {
+    /// Creates a decorator over `inner`; `markdown` and `marks` are the tab's spell caches.
+    pub fn new(
+        inner: &'a mut HighlightDecorator<'b>,
+        checker: Arc<RwLock<SpellChecker>>,
+        mode: SpellMode,
+        markdown: &'a mut Option<(u64, Vec<Range<usize>>)>,
+        marks: &'a mut HashSet<Range<usize>>,
+    ) -> SpellDecorator<'a, 'b> {
+        SpellDecorator {
+            inner,
+            checker,
+            mode,
+            markdown,
+            marks,
+            rope: None,
+        }
+    }
+
+    /// Returns the checkable char ranges of line `line_idx` (line coordinates).
+    fn checkable_ranges(&mut self, line_idx: usize, len: usize) -> Vec<Range<usize>> {
+        match self.mode {
+            SpellMode::Plain => std::iter::once(0..len).collect(),
+            SpellMode::Code => self
+                .inner
+                .spans(line_idx)
+                .map(words::code_checkable)
+                .unwrap_or_default(),
+            SpellMode::Markdown => {
+                let (Some(rope), Some((_, ranges))) = (&self.rope, &*self.markdown) else {
+                    return Vec::new();
+                };
+                let start = rope.line_to_char(line_idx);
+                let end = start + len;
+                let first = ranges.partition_point(|r| r.end <= start);
+                ranges[first..]
+                    .iter()
+                    .take_while(|r| r.start < end)
+                    .map(|r| r.start.max(start) - start..r.end.min(end) - start)
+                    .collect()
+            }
+        }
+    }
+}
+
+impl Decorator for SpellDecorator<'_, '_> {
+    /// Prepares the inner decorator, clears the marks and refreshes the Markdown ranges.
+    fn prepare(&mut self, buffer: &Buffer) {
+        self.inner.prepare(buffer);
+        self.rope = Some(buffer.rope().clone());
+        self.marks.clear();
+        let revision = buffer.revision();
+        let stale = self
+            .markdown
+            .as_ref()
+            .is_none_or(|(rev, _)| *rev != revision);
+        if self.mode == SpellMode::Markdown && stale {
+            *self.markdown = Some((revision, words::markdown_checkable(&buffer.text())));
+        }
+    }
+
+    /// Returns the inner spans with misspelled words underlined.
+    fn decorate(
+        &mut self,
+        line_idx: usize,
+        line: &str,
+        base: &TextFormat,
+    ) -> Vec<(Range<usize>, TextFormat)> {
+        let spans = self.inner.decorate(line_idx, line, base);
+        let chars: Vec<char> = line.chars().collect();
+        let ranges = self.checkable_ranges(line_idx, chars.len());
+        let candidates = words::words_in_ranges(line, &ranges);
+        if candidates.is_empty() {
+            return spans;
+        }
+        let misspelled: Vec<Range<usize>> = {
+            let mut checker = self.checker.write().expect("spell checker poisoned");
+            candidates
+                .into_iter()
+                .filter(|w| !checker.is_correct(&chars[w.clone()].iter().collect::<String>()))
+                .collect()
+        };
+        if let Some(rope) = &self.rope
+            && line_idx < rope.len_lines()
+        {
+            let start = rope.line_to_char(line_idx);
+            for w in &misspelled {
+                self.marks.insert(start + w.start..start + w.end);
+            }
+        }
+        view::overlay_format(spans, &misspelled, |format| {
+            format.underline = Stroke::new(MISSPELLED_WIDTH, MISSPELLED_COLOR);
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a checker with a tiny dictionary.
+    fn checker() -> SpellChecker {
+        let dict = spellbook::Dictionary::new("SET UTF-8\n", "2\nciao\nhello\n").unwrap();
+        SpellChecker::new(vec![dict], HashSet::new())
+    }
+
+    #[test]
+    fn personal_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("fed_personal_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("personal.dic");
+        assert!(load_personal(&path).is_empty());
+        append_personal(&path, "fabio").unwrap();
+        append_personal(&path, "wox").unwrap();
+        let got = load_personal(&path);
+        assert_eq!(got, HashSet::from(["fabio".to_string(), "wox".to_string()]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checker_uses_personal_and_capitalization() {
+        let mut c = checker();
+        assert!(c.check("ciao"));
+        assert!(c.check("Ciao"));
+        assert!(!c.check("xyz"));
+        assert!(!c.is_correct("xyz"));
+        c.add_personal("xyz");
+        assert!(c.check("xyz"));
+        assert!(c.is_correct("xyz"));
+    }
+
+    #[test]
+    fn suggestions_are_limited_and_deduplicated() {
+        let dict_a = spellbook::Dictionary::new("SET UTF-8\n", "2\nhello\nhallo\n").unwrap();
+        let dict_b = spellbook::Dictionary::new("SET UTF-8\n", "2\nhello\nhallo\n").unwrap();
+        let c = SpellChecker::new(vec![dict_a, dict_b], HashSet::new());
+        let s = c.suggest("helo");
+        assert!(s.len() <= MAX_SUGGESTIONS);
+        assert_eq!(s.iter().collect::<HashSet<_>>().len(), s.len());
+        assert!(s.contains(&"hello".to_string()), "{s:?}");
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn decorator_underlines_misspelled_words_in_plain_text() {
+        let checker = Arc::new(RwLock::new(checker()));
+        let mut cache = crate::highlight::HighlightCache::new();
+        let mut inner = HighlightDecorator::new(&mut cache, None, "Plain Text", "x", true);
+        let mut markdown = None;
+        let mut marks = HashSet::new();
+        let buffer = Buffer::from_text("ciao xyzzy\nhello");
+        let mut deco = SpellDecorator::new(
+            &mut inner,
+            checker,
+            SpellMode::Plain,
+            &mut markdown,
+            &mut marks,
+        );
+        deco.prepare(&buffer);
+        let base = TextFormat::default();
+        let spans = deco.decorate(0, "ciao xyzzy", &base);
+        let underlined: Vec<_> = spans
+            .iter()
+            .filter(|(_, f)| f.underline != Stroke::NONE)
+            .map(|(r, _)| r.clone())
+            .collect();
+        assert_eq!(underlined, vec![5..10]);
+        assert!(
+            deco.decorate(1, "hello", &base)
+                .iter()
+                .all(|(_, f)| f.underline == Stroke::NONE)
+        );
+        drop(deco);
+        assert_eq!(marks, HashSet::from([5..10]));
+    }
+
+    #[test]
+    fn mode_follows_syntax_name() {
+        assert_eq!(SpellMode::for_syntax("Markdown"), SpellMode::Markdown);
+        assert_eq!(SpellMode::for_syntax("Plain Text"), SpellMode::Plain);
+        assert_eq!(SpellMode::for_syntax("Rust"), SpellMode::Code);
+    }
+}
