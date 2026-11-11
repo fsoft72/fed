@@ -2,7 +2,9 @@
 
 pub mod app;
 pub mod buffer;
+pub mod editing;
 pub mod search;
+pub mod text_nav;
 
 use std::path::PathBuf;
 
