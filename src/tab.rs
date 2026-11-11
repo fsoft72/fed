@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::buffer::Buffer;
 use crate::editing::{self, EditCommand, EditSettings, EditorState};
 use crate::highlight::HighlightCache;
+use crate::markdown::Preview;
 use crate::view::ViewState;
 
 /// Source of unique tab ids.
@@ -32,6 +33,10 @@ pub struct Tab {
     pub spell_md: Option<(u64, Vec<Range<usize>>)>,
     /// Buffer char ranges of the misspelled words painted in the last frame.
     pub spell_marks: HashSet<Range<usize>>,
+    /// True while the Markdown preview panel is shown for this tab.
+    pub preview_open: bool,
+    /// Markdown preview state, created when the preview is first opened.
+    pub preview: Option<Preview>,
     /// Rendering caches owned by the editor widget.
     pub(crate) view: ViewState,
 }
@@ -49,6 +54,8 @@ impl Tab {
             syntax: None,
             spell_md: None,
             spell_marks: HashSet::new(),
+            preview_open: false,
+            preview: None,
             view: ViewState::default(),
         }
     }

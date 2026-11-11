@@ -14,6 +14,7 @@ use crate::editing::{EditCommand, EditSettings};
 use crate::find_bar::{BarMode, FindBar, MatchDecorator};
 use crate::highlight::{self, AssetsHandle, HighlightAssets, HighlightDecorator};
 use crate::keymap::{Action, KeyChord, Keymap};
+use crate::markdown::{self, Preview};
 use crate::spell::{SpellDecorator, SpellMode, SpellService, SpellStatus};
 use crate::tab::Tab;
 use crate::view::{self, ViewOptions};
@@ -27,6 +28,8 @@ const LARGE_FILE_NOTICE: &str = "large file: highlighting off";
 const SPELL_DOWNLOADING_NOTICE: &str = "downloading dictionaries...";
 /// Name shown for a tab without a file path.
 const UNTITLED: &str = "untitled";
+/// Status message shown when the preview is requested on a non-Markdown tab.
+const PREVIEW_UNAVAILABLE: &str = "preview is only available for Markdown";
 /// Suffix of a tab label when the buffer has unsaved changes. Drawn with the monospace
 /// font because the default proportional fonts have no glyph for it.
 const MODIFIED_LABEL_SUFFIX: &str = " ●";
@@ -144,6 +147,8 @@ enum TabBarAction {
     Activate(usize),
     /// Close the tab at this index.
     Close(usize),
+    /// Toggle the Markdown preview of the active tab.
+    TogglePreview,
 }
 
 /// The spelling suggestions popup opened by a right click on a misspelled word.
@@ -225,6 +230,7 @@ impl FedApp {
             spell_menu: None,
             allow_close: false,
         };
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         app.apply_theme(&cc.egui_ctx);
         app.ensure_spell(&cc.egui_ctx);
         if !problems.is_empty() {
@@ -290,7 +296,8 @@ impl FedApp {
             Action::Find => self.open_bar(BarMode::Find),
             Action::Replace => self.open_bar(BarMode::Replace),
             Action::GoToLine => self.open_bar(BarMode::GoToLine),
-            Action::OpenSettings | Action::TogglePreview => {
+            Action::TogglePreview => self.toggle_preview(),
+            Action::OpenSettings => {
                 self.set_status(
                     format!("{}: not available yet", action.label()),
                     Severity::Info,
@@ -528,8 +535,43 @@ impl FedApp {
         }
     }
 
+    /// Toggles the Markdown preview of the active tab, or reports that it is unavailable.
+    fn toggle_preview(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if !markdown::is_markdown_path(tab.buffer.path()) {
+            self.set_status(PREVIEW_UNAVAILABLE.to_string(), Severity::Info);
+            return;
+        }
+        tab.preview_open = !tab.preview_open;
+    }
+
+    /// Draws the right-hand preview panel for the active Markdown tab, if it is open.
+    fn preview_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if !tab.preview_open || !markdown::is_markdown_path(tab.buffer.path()) {
+            return;
+        }
+        let half = ui.available_width() / 2.0;
+        egui::Panel::right("fed_preview")
+            .resizable(true)
+            .default_size(half)
+            .show(ui, |ui| {
+                let preview = tab.preview.get_or_insert_with(Preview::new);
+                preview.show(ui, &tab.buffer);
+            });
+    }
+
     /// Draws the tab bar and returns what the user clicked.
     fn tab_bar(&self, ui: &mut egui::Ui) -> Option<TabBarAction> {
+        let preview_state = self
+            .tabs
+            .get(self.active)
+            .filter(|t| markdown::is_markdown_path(t.buffer.path()))
+            .map(|t| t.preview_open);
         let mut action = None;
         egui::Panel::top("fed_tabs").show(ui, |ui| {
             egui::ScrollArea::horizontal().show(ui, |ui| {
@@ -553,6 +595,11 @@ impl FedApp {
                             action = Some(TabBarAction::Close(i));
                         }
                         ui.separator();
+                    }
+                    if let Some(open) = preview_state
+                        && ui.selectable_label(open, "Preview").clicked()
+                    {
+                        action = Some(TabBarAction::TogglePreview);
                     }
                 });
             });
@@ -751,10 +798,12 @@ impl eframe::App for FedApp {
         match self.tab_bar(ui) {
             Some(TabBarAction::Activate(i)) => self.activate(i),
             Some(TabBarAction::Close(i)) => self.request_close_tab(&ctx, i),
+            Some(TabBarAction::TogglePreview) => self.toggle_preview(),
             None => {}
         }
         self.status_bar(ui);
         self.find_bar_panel(ui);
+        self.preview_panel(ui);
         let opts = self.view_options();
         let checker = match self.settings.spell_check {
             true => self.spell.as_ref().and_then(SpellService::checker),
