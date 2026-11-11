@@ -368,7 +368,7 @@ impl VimState {
             }
             's' => self.apply_operator(Operator::Change, chars_right, env),
             'S' => {
-                let range = OpRange::Lines(line, (line + n - 1).min(last_line(&rope)));
+                let range = OpRange::Lines(line, (line + n - 1).min(last_line(&rope)).max(line));
                 self.apply_operator(Operator::Change, range, env);
             }
             'D' | 'C' => {
@@ -480,7 +480,8 @@ impl VimState {
         let line = rope.char_to_line(pos);
         let m = match target {
             Target::Lines => {
-                return Some(OpRange::Lines(line, (line + n - 1).min(last_line(&rope))));
+                let last = (line + n - 1).min(last_line(&rope)).max(line);
+                return Some(OpRange::Lines(line, last));
             }
             Target::Object { kind, inner } => {
                 return text_object(kind, inner, env.buf, pos).map(OpRange::Chars);

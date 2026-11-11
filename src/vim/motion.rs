@@ -165,7 +165,8 @@ pub fn resolve(
         Motion::LineStart => exclusive(text_nav::line_start(rope, pos)),
         Motion::FirstNonBlank => exclusive(text_nav::first_non_blank(rope, pos)),
         Motion::LineEnd => {
-            let line = (rope.char_to_line(pos) + count - 1).min(last_line(rope));
+            let here = rope.char_to_line(pos);
+            let line = (here + count - 1).min(last_line(rope)).max(here);
             exclusive(line_end_of(rope, line))
         }
         Motion::DocStart => Some(line_target(rope, 0)),
@@ -226,10 +227,15 @@ fn line_target(rope: &Rope, line: usize) -> MotionResult {
     }
 }
 
-/// Returns the index of the last line. The empty line after a final `\n` counts, because the
-/// editor shows it (and `o` on a last line without a line break creates exactly that line).
+/// Returns the index of the last line motions may target. Like vim, the empty line after a
+/// final `\n` does not count (an edit may still leave the caret there).
 pub fn last_line(rope: &Rope) -> usize {
-    rope.len_lines().saturating_sub(1)
+    let len = rope.len_chars();
+    let lines = rope.len_lines();
+    if len > 0 && rope.char(len - 1) == '\n' {
+        return lines.saturating_sub(2);
+    }
+    lines.saturating_sub(1)
 }
 
 /// Returns the index of the `\n` ending `line` (or the document length).
@@ -267,7 +273,7 @@ fn vertical(
     } else {
         line.saturating_sub(count)
     };
-    if target == line {
+    if target == line || (down && target < line) {
         return None;
     }
     let want = state.preferred_col.unwrap_or(col);
@@ -441,10 +447,10 @@ mod tests {
     }
 
     #[test]
-    fn last_line_counts_final_empty_line() {
-        assert_eq!(last_line(&Rope::from_str("a\nb\n")), 2);
+    fn last_line_ignores_final_newline() {
+        assert_eq!(last_line(&Rope::from_str("a\nb\n")), 1);
         assert_eq!(last_line(&Rope::from_str("a\nb")), 1);
         assert_eq!(last_line(&Rope::from_str("")), 0);
-        assert_eq!(go("a\nb\n", 0, Motion::DocEnd), Some(4));
+        assert_eq!(go("a\nb\n", 0, Motion::DocEnd), Some(2));
     }
 }

@@ -493,3 +493,20 @@ fn empty_cmdline_is_a_no_op() {
     h.feed(":  <CR>");
     assert!(h.fx.is_empty());
 }
+
+#[test]
+fn trailing_empty_line_is_not_a_motion_target() {
+    assert_eq!(caret("a\nb\n", 0, "G"), 2);
+    assert_eq!(caret("a\nb\n", 0, "5G"), 2);
+    assert_eq!(caret("a\nb\n", 2, "j"), 2);
+    assert_eq!(caret("a\nb\n", 0, "5j"), 2);
+    assert_eq!(caret("a\nb\n", 0, "}"), 2);
+    assert_eq!(run("a\nb\n", 0, "5dd").0, "");
+    // An edit may leave the caret on it, and Normal-mode clamping keeps it there.
+    assert_eq!(run("abc", 0, "o<Esc>"), ("abc\n".into(), 4, Mode::Normal));
+    assert_eq!(caret("abc", 0, "o<Esc>j"), 4);
+    assert_eq!(caret("abc", 0, "o<Esc>k"), 0);
+    assert_eq!(caret("abc", 0, "o<Esc>$"), 4);
+    assert_eq!(run("abc", 0, "o<Esc>dd"), ("abc".into(), 0, Mode::Normal));
+    assert_eq!(run("abc", 0, "o<Esc>Vd").0, "abc");
+}

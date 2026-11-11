@@ -497,8 +497,9 @@ impl VimState {
         let range = match self.mode {
             Mode::VisualLine => {
                 let sel = env.ed.selection.range();
-                let last = rope.char_to_line(sel.end).min(last_line(rope));
-                OpRange::Lines(rope.char_to_line(sel.start), last)
+                let first = rope.char_to_line(sel.start);
+                let last = rope.char_to_line(sel.end).min(last_line(rope)).max(first);
+                OpRange::Lines(first, last)
             }
             _ => {
                 let Some(r) = self.visual_range(env.buf, env.ed) else {
@@ -609,8 +610,9 @@ fn render_keys(keys: &[VimKey]) -> String {
         .collect()
 }
 
-/// Clamps `pos` to a Normal-mode caret: on a char, never on `\n` unless the line is empty
-/// (the empty line after a final `\n` is a valid caret line).
+/// Clamps `pos` to a Normal-mode caret: on a char, never on `\n` unless the line is empty.
+/// The empty line after a final `\n` is kept when an edit left the caret there; motions never
+/// target it (see `motion::last_line`).
 fn clamp_normal(rope: &Rope, pos: usize) -> usize {
     let len = rope.len_chars();
     if len == 0 {
