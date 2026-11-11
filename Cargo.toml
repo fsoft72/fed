@@ -1,0 +1,37 @@
+[package]
+name = "fed"
+version = "0.1.0"
+edition = "2024"
+description = "A fast text editor built with Rust and egui"
+
+[lib]
+name = "fed"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fed"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "accesskit"] }
+egui_extras = { version = "0.37", features = ["file", "image"] }
+egui_commonmark = { version = "0.26", features = ["load-images"] }
+pulldown-cmark = "0.13"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+ropey = "1.6"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+regex = "1.13"
+spellbook = "0.4"
+ureq = "3"
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal", "wayland"] }
+fontdb = "0.24"
+directories = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+thiserror = "2"
+open = "5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
