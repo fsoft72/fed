@@ -43,7 +43,7 @@ fed [files...]
 
 ### Default shortcuts
 
-On macOS `Cmd` replaces `Ctrl` in every shortcut below, except `Ctrl+Tab` and `Ctrl+Shift+Tab`.
+On macOS `Cmd` replaces `Ctrl` in every shortcut below, except the `Ctrl+Tab` and `Ctrl+Shift+Tab` aliases.
 The shortcuts in the first table can be changed in the settings window.
 
 | Action          | Shortcut                                 |
@@ -53,8 +53,8 @@ The shortcuts in the first table can be changed in the settings window.
 | Save            | `Ctrl+S`                                 |
 | Save as         | `Ctrl+Shift+S`                           |
 | Close tab       | `Ctrl+W`                                 |
-| Next tab        | `Ctrl+Tab`                               |
-| Previous tab    | `Ctrl+Shift+Tab`                         |
+| Next tab        | `Ctrl+2` (also `Ctrl+Tab`, fixed)        |
+| Previous tab    | `Ctrl+1` (also `Ctrl+Shift+Tab`, fixed)  |
 | Open settings   | `Ctrl+,`                                 |
 | Find            | `Ctrl+F`                                 |
 | Replace         | `Ctrl+H`                                 |

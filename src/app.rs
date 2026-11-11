@@ -62,8 +62,13 @@ const PREVIEW_BUTTON_RADIUS: f32 = 4.0;
 const TAB_ACCENT_HEIGHT: f32 = 2.0;
 /// Suffix of the status text when the buffer has unsaved changes.
 const MODIFIED_STATUS_SUFFIX: &str = "  [+]";
-/// Fixed, non-configurable alias for Redo.
-const REDO_ALIAS: &str = "Cmd+Shift+Z";
+/// Fixed, non-configurable chord aliases, used only when the keymap has no binding for the
+/// pressed chord.
+const SHORTCUT_ALIASES: &[(&str, Action)] = &[
+    ("Cmd+Shift+Z", Action::Redo),
+    ("Ctrl+Tab", Action::NextTab),
+    ("Ctrl+Shift+Tab", Action::PrevTab),
+];
 /// Vim error for `:w {file}` on an existing file.
 const VIM_FILE_EXISTS: &str = "E13: File exists (add ! to override)";
 /// Vim error for `:q` on a buffer with unsaved changes.
@@ -158,14 +163,16 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// Returns the action fired by pressing `key` with `mods`: the keymap binding of that exact
-/// chord, or Redo for the fixed `REDO_ALIAS`.
+/// chord, or the action of a fixed `SHORTCUT_ALIASES` entry.
 fn shortcut_action(keymap: &Keymap, key: egui::Key, mods: egui::Modifiers) -> Option<Action> {
     let chord = KeyChord::from_egui(key, mods);
     if let Some(action) = keymap.lookup(&chord) {
         return Some(action);
     }
-    let alias = KeyChord::parse(REDO_ALIAS).expect("the redo alias is a valid chord");
-    (chord == alias).then_some(Action::Redo)
+    SHORTCUT_ALIASES.iter().find_map(|(text, action)| {
+        let alias = KeyChord::parse(text).expect("shortcut aliases are valid chords");
+        (alias == chord).then_some(*action)
+    })
 }
 
 /// True for actions that edit the text and must leave text fields (find bar) alone.
@@ -1573,6 +1580,38 @@ mod tests {
         assert_eq!(
             shortcut_action(&km, egui::Key::N, egui::Modifiers::NONE),
             None
+        );
+    }
+
+    #[test]
+    fn tab_switch_shortcuts_and_aliases() {
+        let km = Keymap::defaults();
+        let ctrl = egui::Modifiers::COMMAND;
+        assert_eq!(
+            shortcut_action(&km, egui::Key::Num1, ctrl),
+            Some(Action::PrevTab)
+        );
+        assert_eq!(
+            shortcut_action(&km, egui::Key::Num2, ctrl),
+            Some(Action::NextTab)
+        );
+        let chord = KeyChord::parse("Ctrl+Tab").unwrap();
+        let mods = egui::Modifiers {
+            command: chord.command,
+            ctrl: chord.ctrl || chord.command,
+            ..egui::Modifiers::NONE
+        };
+        assert_eq!(
+            shortcut_action(&km, egui::Key::Tab, mods),
+            Some(Action::NextTab)
+        );
+        let shifted = egui::Modifiers {
+            shift: true,
+            ..mods
+        };
+        assert_eq!(
+            shortcut_action(&km, egui::Key::Tab, shifted),
+            Some(Action::PrevTab)
         );
     }
 
