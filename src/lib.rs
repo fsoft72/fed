@@ -6,7 +6,9 @@ pub mod config;
 pub mod editing;
 pub mod keymap;
 pub mod search;
+pub mod tab;
 pub mod text_nav;
+pub mod view;
 
 use std::path::PathBuf;
 

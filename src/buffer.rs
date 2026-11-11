@@ -214,9 +214,10 @@ impl Buffer {
         self.line_ending
     }
 
-    /// Returns true when the content differs from the last saved state.
+    /// Returns true when the content differs from the last saved state, including edits
+    /// collected in a still open undo group.
     pub fn is_modified(&self) -> bool {
-        self.saved_position != Some(self.position)
+        self.saved_position != Some(self.position) || !self.group_edits.is_empty()
     }
 
     /// Returns true when the buffer is big or has very long lines (computed at creation).
