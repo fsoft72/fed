@@ -187,7 +187,9 @@ For `.md`, `.markdown` and `.mdown` tabs, `Ctrl+Shift+V` or the "Preview" button
 opens a live preview panel on the right. It renders CommonMark plus tables, task lists, footnotes
 and strikethrough, and local images relative to the file. Remote images are not fetched (their
 alt text is shown) and raw HTML is not rendered. Code blocks are shown in monospace without
-colors. Clicking a link does not open it yet (see `CHANGES.md`).
+colors. Clicking an `http`, `https`, `mailto` or `file` link opens it with the system handler
+(the default browser for web links); other links, such as relative ones, are ignored. If the
+system cannot open it, the error shows in the status bar.
 
 ## Large files
 

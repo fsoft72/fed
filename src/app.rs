@@ -4,6 +4,7 @@ mod dialogs;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -312,6 +313,10 @@ pub struct FedApp {
     settings_save: SaveDebounce,
     /// Process start time, while the first frame is still to be traced (`FED_TRACE_STARTUP`).
     startup_trace: Option<Instant>,
+    /// Sends errors from the threads that open clicked links.
+    link_error_tx: Sender<String>,
+    /// Receives the errors of `link_error_tx`, shown in the status bar.
+    link_error_rx: Receiver<String>,
 }
 
 impl FedApp {
@@ -334,6 +339,7 @@ impl FedApp {
         };
         let (keymap, key_warnings) = Keymap::from_overrides(&settings.keybindings);
         problems.extend(key_warnings);
+        let (link_error_tx, link_error_rx) = mpsc::channel();
         let mut app = FedApp {
             tabs: Vec::new(),
             active: 0,
@@ -356,6 +362,8 @@ impl FedApp {
             font_load: None,
             settings_save: SaveDebounce::default(),
             startup_trace,
+            link_error_tx,
+            link_error_rx,
         };
         app.vim_applied = app.settings.vim_mode;
         fonts::apply_editor_font(&cc.egui_ctx, None, None);
@@ -1053,6 +1061,41 @@ impl FedApp {
         }
     }
 
+    /// Takes this frame's link open requests (clicked links in the Markdown preview) from
+    /// egui's output and opens the allowed ones (see `markdown::is_openable_url`) with the
+    /// system opener on background threads; other URLs are ignored. Removing the commands
+    /// keeps the backend from trying (and failing) to open them itself.
+    fn open_links(&mut self, ctx: &egui::Context) {
+        let urls: Vec<String> = ctx.output_mut(|o| {
+            let mut urls = Vec::new();
+            o.commands.retain(|cmd| match cmd {
+                egui::OutputCommand::OpenUrl(open) => {
+                    urls.push(open.url.clone());
+                    false
+                }
+                _ => true,
+            });
+            urls
+        });
+        for url in urls.into_iter().filter(|u| markdown::is_openable_url(u)) {
+            let tx = self.link_error_tx.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let Err(e) = open::that(&url) else { return };
+                // The app may be gone already; then nobody needs the error.
+                let _ = tx.send(format!("cannot open {url}: {e}"));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// Shows the errors of link opener threads in the status bar.
+    fn poll_link_errors(&mut self) {
+        while let Ok(error) = self.link_error_rx.try_recv() {
+            self.set_status(error, Severity::Error);
+        }
+    }
+
     /// Prints the time from process start to the end of the first frame, once, when
     /// startup tracing is on.
     fn trace_first_frame(&mut self) {
@@ -1252,6 +1295,7 @@ impl eframe::App for FedApp {
         self.ensure_spell(&ctx);
         self.sync_vim_mode();
         self.poll_font_load(&ctx);
+        self.poll_link_errors();
         match self.settings_window.capture_keys(&ctx, &mut self.keymap) {
             Some(events) => self.apply_settings_events(&ctx, events),
             None => self.handle_shortcuts(&ctx),
@@ -1376,6 +1420,7 @@ impl eframe::App for FedApp {
         self.show_settings(&ctx);
         self.show_dialogs(&ctx);
         self.flush_settings_save(&ctx);
+        self.open_links(&ctx);
         self.trace_first_frame();
     }
 

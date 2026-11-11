@@ -20,6 +20,19 @@ pub fn is_markdown_path(path: Option<&Path>) -> bool {
     MARKDOWN_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
 }
 
+/// URL scheme prefixes (lowercase) that a clicked link may open in the system.
+const OPENABLE_URL_PREFIXES: [&str; 4] = ["http://", "https://", "mailto:", "file:"];
+
+/// Returns true when a clicked link may be handed to the system opener: only `http`,
+/// `https`, `mailto` and `file` URLs (scheme case-insensitive). Anything else is ignored.
+pub fn is_openable_url(url: &str) -> bool {
+    let url = url.trim_start();
+    OPENABLE_URL_PREFIXES.iter().any(|prefix| {
+        url.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
 /// Returns true for a URL that would be fetched over the network.
 fn is_remote_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
@@ -189,6 +202,32 @@ impl Preview {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn openable_urls_are_web_mail_and_file_only() {
+        for url in [
+            "http://example.com",
+            "HTTPS://example.com/a?b",
+            "mailto:me@example.com",
+            "file:///tmp/notes.md",
+        ] {
+            assert!(is_openable_url(url), "{url}");
+        }
+        for url in [
+            "",
+            "notes.md",
+            "../other.md",
+            "#heading",
+            "javascript:alert(1)",
+            "ftp://example.com",
+            "C:\\file.txt",
+            "smb://server/share",
+            "httpx://example.com",
+            "é",
+        ] {
+            assert!(!is_openable_url(url), "{url}");
+        }
+    }
 
     #[test]
     fn is_markdown_path_cases() {
