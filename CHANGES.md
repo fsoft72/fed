@@ -8,3 +8,4 @@
 - Task 2: added rope-backed `Buffer` (`src/buffer.rs`) with CRLF handling, atomic save, grouped undo/redo, marks and dirty-line tracking.
 - Task 3: added search engine (`src/search.rs`) with literal/regex queries, wrapping `find_next`, `find_all`, line-range `substitute` and `replace_all` (single undo step).
 - Task 4: added `src/text_nav.rs` (char classes, word motions, line helpers, bracket matching) and `src/editing.rs` (`Selection`, `EditorState`, `EditCommand`, `apply_command` for non-vim editing).
+- Task 5: added `src/config.rs` (lenient TOML `Settings`, `ConfigPaths`, `Session`) and `src/keymap.rs` (`Action`, `KeyChord`, `Keymap` with defaults, conflicts and overrides).
