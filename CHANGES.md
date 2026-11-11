@@ -31,3 +31,4 @@
 - Added "Markdown preview" settings section: `preview_font_family` and `preview_font_size` (new `preview` egui font family aliasing the proportional fonts; headings scale from the base size).
 - Fixed syntax highlighting of `.ts`/`.tsx` files: syntaxes now come from the `two-face` extra pack instead of syntect's defaults.
 - Fix: first view of a tab with a big grammar (TypeScript) froze the UI for ~300 ms in release (~3 s in debug) while syntect lazily compiled the syntax regexes. `HighlightAssets::ensure_warm` now compiles them once per syntax on a background thread by parsing the tab text; the tab shows plain text until it is done and repaints when the colors are ready.
+- Debug builds now compile dependencies with `opt-level = 3` (`[profile.dev.package."*"]`), so highlighting and rendering are not ~10x slower under `cargo run`.

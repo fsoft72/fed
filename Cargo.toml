@@ -32,6 +32,10 @@ thiserror = "2"
 open = "5"
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 
+# Optimize dependencies (syntect, egui, ...) in debug builds; the crate itself stays debuggable.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
