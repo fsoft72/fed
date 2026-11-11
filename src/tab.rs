@@ -9,6 +9,7 @@ use crate::editing::{self, EditCommand, EditSettings, EditorState};
 use crate::highlight::HighlightCache;
 use crate::markdown::Preview;
 use crate::view::ViewState;
+use crate::vim::VimState;
 
 /// Source of unique tab ids.
 static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
@@ -37,6 +38,8 @@ pub struct Tab {
     pub preview_open: bool,
     /// Markdown preview state, created when the preview is first opened.
     pub preview: Option<Preview>,
+    /// Vim emulation state (used only while vim mode is on).
+    pub vim: VimState,
     /// Rendering caches owned by the editor widget.
     pub(crate) view: ViewState,
 }
@@ -56,6 +59,7 @@ impl Tab {
             spell_marks: HashSet::new(),
             preview_open: false,
             preview: None,
+            vim: VimState::new(),
             view: ViewState::default(),
         }
     }
@@ -82,20 +86,31 @@ impl Tab {
         self.view.request_focus();
     }
 
-    /// Closes the open typing undo group, if any. Call before editing `buffer` directly,
-    /// saving it, or running undo/redo outside of `apply`.
+    /// Closes the open typing undo group and the undo group of a vim Insert session, if
+    /// any. Call before editing `buffer` directly, saving it, switching away from the tab,
+    /// or running undo/redo outside of `apply`. Vim stays in Insert mode.
     pub fn end_typing(&mut self) {
+        self.vim.end_insert_group(&mut self.buffer);
         if !self.typing {
             return;
         }
         self.buffer.end_group();
         self.typing = false;
     }
+
+    /// Replaces the vim state with a fresh one in Normal mode (vim mode switched on or off),
+    /// closing any open undo group first and collapsing the selection to the caret.
+    pub fn reset_vim(&mut self) {
+        self.end_typing();
+        self.vim = VimState::new();
+        self.editor.selection = crate::editing::Selection::caret(self.editor.selection.head);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vim::{Mode, VimKey};
 
     const SET: EditSettings = EditSettings {
         tab_width: 4,
@@ -134,5 +149,23 @@ mod tests {
         tab.end_typing();
         assert_eq!(tab.buffer.undo(), Some(1));
         assert_eq!(tab.buffer.text(), "a");
+    }
+
+    #[test]
+    fn end_typing_closes_vim_insert_group() {
+        let mut tab = Tab::new(Buffer::from_text(""));
+        for key in [VimKey::Char('i'), VimKey::Char('a')] {
+            tab.vim
+                .handle_key(key, &mut tab.buffer, &mut tab.editor, &SET);
+        }
+        tab.end_typing();
+        assert!(
+            tab.buffer.undo().is_some(),
+            "the insert session is a committed step"
+        );
+        assert_eq!(tab.buffer.text(), "");
+        assert_eq!(tab.vim.mode(), Mode::Insert);
+        tab.reset_vim();
+        assert_eq!(tab.vim.mode(), Mode::Normal);
     }
 }

@@ -392,7 +392,7 @@ fn paragraph_motions_with_operators() {
 }
 
 #[test]
-fn cmdline_editing_and_stub() {
+fn cmdline_editing_and_unknown_command() {
     let mut h = Harness::new("abc", 0);
     h.feed(":foo");
     assert_eq!((h.vim.mode(), h.vim.cmdline()), (Mode::CommandLine, ":foo"));
@@ -400,7 +400,7 @@ fn cmdline_editing_and_stub() {
     assert_eq!(h.vim.mode(), Mode::Normal);
     assert_eq!(
         h.fx,
-        vec![VimEffect::Error("E492: Not an editor command: foo".into())]
+        vec![VimEffect::Error("E492: not an editor command: foo".into())]
     );
     h.feed(":a<BS>");
     assert_eq!(h.vim.cmdline(), ":");
@@ -509,4 +509,59 @@ fn trailing_empty_line_is_not_a_motion_target() {
     assert_eq!(caret("abc", 0, "o<Esc>$"), 4);
     assert_eq!(run("abc", 0, "o<Esc>dd"), ("abc".into(), 0, Mode::Normal));
     assert_eq!(run("abc", 0, "o<Esc>Vd").0, "abc");
+}
+
+#[test]
+fn ex_substitute_through_keys() {
+    let mut h = Harness::new("aaa\nx aaa aaa\n", 0);
+    h.feed(":%s/aaa/b/g<CR>");
+    assert_eq!(h.buf.text(), "b\nx b b\n");
+    assert_eq!(h.fx, vec![VimEffect::Message("3 substitutions".into())]);
+    assert_eq!(h.vim.mode(), Mode::Normal);
+    h.feed("u");
+    assert_eq!(h.buf.text(), "aaa\nx aaa aaa\n");
+}
+
+#[test]
+fn ex_visual_range_uses_last_selection() {
+    let mut h = Harness::new("a\na\na\na\n", 2);
+    h.feed("Vj:s/a/b/<CR>");
+    assert_eq!(h.buf.text(), "a\nb\nb\na\n");
+    assert_eq!(h.vim.visual_marks(), Some((1, 2)));
+}
+
+#[test]
+fn ex_unknown_and_file_commands() {
+    let mut h = Harness::new("a\n", 0);
+    h.feed(":foo<CR>");
+    assert!(matches!(&h.fx[..], [VimEffect::Error(e)] if e.contains("not an editor command")));
+    h.fx.clear();
+    h.feed(":wq<CR>:q!<CR>");
+    assert_eq!(
+        h.fx,
+        vec![VimEffect::WriteQuit, VimEffect::Quit { force: true }]
+    );
+}
+
+#[test]
+fn ex_mark_address_and_goto() {
+    let mut h = Harness::new("a\nb\nc\nd\n", 2);
+    h.feed("majj:'a,.s/./x/<CR>");
+    assert_eq!(h.buf.text(), "a\nx\nx\nx\n");
+    h.feed(":1<CR>");
+    assert_eq!(h.caret(), 0);
+}
+
+#[test]
+fn insert_group_can_be_closed_and_reopened() {
+    let mut h = Harness::new("", 0);
+    h.feed("iab");
+    h.vim.end_insert_group(&mut h.buf);
+    assert!(h.buf.is_modified());
+    h.feed("c<Esc>");
+    assert_eq!(h.buf.text(), "abc");
+    h.feed("u");
+    assert_eq!(h.buf.text(), "ab", "the closed group is its own step");
+    h.feed("u");
+    assert_eq!(h.buf.text(), "");
 }

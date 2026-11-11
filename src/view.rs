@@ -15,6 +15,7 @@ use crate::buffer::Buffer;
 use crate::editing::{EditCommand, EditSettings};
 use crate::tab::Tab;
 use crate::text_nav::{self, CharClass};
+use crate::vim::{Mode, VimKey};
 
 /// Horizontal padding on each side of the line numbers.
 const GUTTER_PAD: f32 = 8.0;
@@ -24,6 +25,8 @@ const TEXT_PAD: f32 = 4.0;
 const MIN_GUTTER_DIGITS: usize = 3;
 /// Caret width in points.
 const CARET_WIDTH: f32 = 2.0;
+/// Opacity of the vim block caret, so the char under it stays readable.
+const BLOCK_CARET_ALPHA: f32 = 0.6;
 /// Smallest width used for wrapping text.
 const MIN_WRAP_WIDTH: f32 = 20.0;
 /// Extra horizontal room (in chars) kept right of the caret and the longest line.
@@ -42,6 +45,8 @@ pub struct ViewOptions {
     pub edit: EditSettings,
     /// Process keyboard events (false while a modal dialog owns the keyboard).
     pub keys_enabled: bool,
+    /// Vim mode is on: draw the Visual selection and a block caret outside Insert mode.
+    pub vim: bool,
 }
 
 /// Formatting of one line: char ranges within the line with their text format.
@@ -135,6 +140,8 @@ pub struct ViewOutput {
     pub context_word: Option<(Range<usize>, String)>,
     /// True when the buffer content changed this frame.
     pub changed: bool,
+    /// True when a mouse press, drag or multi-click set the selection this frame.
+    pub mouse_selected: bool,
 }
 
 /// Per-tab state kept by the widget between frames.
@@ -341,7 +348,6 @@ fn handle_keyboard(
         if let Some(handler) = key_handler.as_mut()
             && handler(ev, tab)
         {
-            tab.end_typing();
             tab.scroll_to_cursor = true;
             continue;
         }
@@ -352,6 +358,62 @@ fn handle_keyboard(
             out.clipboard = Some(text);
         }
     }
+}
+
+/// Translates a keyboard event into vim keys: text gives one `Char` per char; Escape, Enter,
+/// Backspace, Tab and the arrows map to their keys; Ctrl plus a letter gives `Ctrl`. Other
+/// events give nothing.
+pub fn egui_event_to_vim_keys(ev: &egui::Event) -> Vec<VimKey> {
+    match ev {
+        egui::Event::Text(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => text
+            .chars()
+            .filter(|c| !c.is_control())
+            .map(VimKey::Char)
+            .collect(),
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => key_to_vim_key(*key, *modifiers).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Translates a keyboard event that stands for exactly one vim key (see
+/// `egui_event_to_vim_keys`); `None` for other events and for multi-char text.
+pub fn egui_event_to_vim_key(ev: &egui::Event) -> Option<VimKey> {
+    let mut keys = egui_event_to_vim_keys(ev);
+    if keys.len() != 1 {
+        return None;
+    }
+    keys.pop()
+}
+
+/// Maps a key press to a vim key; printable keys without Ctrl arrive as text events instead.
+fn key_to_vim_key(key: Key, mods: Modifiers) -> Option<VimKey> {
+    if mods.ctrl {
+        let name = key.name();
+        let mut chars = name.chars();
+        return match (chars.next(), chars.next()) {
+            (Some(c), None) if c.is_ascii_alphabetic() => {
+                Some(VimKey::Ctrl(c.to_ascii_lowercase()))
+            }
+            _ => None,
+        };
+    }
+    let vim_key = match key {
+        Key::Escape => VimKey::Esc,
+        Key::Enter => VimKey::Enter,
+        Key::Backspace => VimKey::Backspace,
+        Key::Tab if !mods.shift => VimKey::Tab,
+        Key::ArrowLeft => VimKey::Left,
+        Key::ArrowRight => VimKey::Right,
+        Key::ArrowUp => VimKey::Up,
+        Key::ArrowDown => VimKey::Down,
+        _ => return None,
+    };
+    Some(vim_key)
 }
 
 /// True for events the editor (or its key handler) consumes from the keyboard.
@@ -793,6 +855,7 @@ impl Frame<'_> {
             )
         });
         let edit = self.opts.edit;
+        let before = self.tab.editor.selection;
         if response.hovered() && pressed {
             response.request_focus();
             // The pointer may already have moved within this frame: anchor at the press.
@@ -813,6 +876,10 @@ impl Frame<'_> {
         } else if response.double_clicked() {
             let pos = self.hit_test(ui, pointer, pl);
             self.tab.apply(EditCommand::SelectWordAt(pos), &edit);
+        }
+        let clicked = response.hovered() && pressed;
+        if clicked || response.double_clicked() || self.tab.editor.selection != before {
+            out.mouse_selected = true;
         }
         if response.secondary_clicked() {
             let pos = self.hit_test(ui, pointer, pl);
@@ -837,7 +904,7 @@ impl Frame<'_> {
         let (rows, origin, viewport) = (&pl.rows, pl.origin, pl.viewport);
         let painter = ui.painter();
         let rope = self.tab.buffer.rope();
-        let sel = self.tab.editor.selection.range();
+        let sel = self.selection_to_paint();
         let sel_color = ui.visuals().selection.bg_fill;
         let text_color = ui.visuals().text_color();
         for (line, galley) in galleys {
@@ -882,6 +949,22 @@ impl Frame<'_> {
         }
     }
 
+    /// Char range painted as selected: the Visual selection in vim mode, else the selection.
+    fn selection_to_paint(&self) -> Range<usize> {
+        if !self.opts.vim {
+            return self.tab.editor.selection.range();
+        }
+        let tab = &*self.tab;
+        tab.vim
+            .visual_range(&tab.buffer, &tab.editor)
+            .unwrap_or_default()
+    }
+
+    /// True when the caret is drawn as a block (vim outside Insert mode).
+    fn block_caret(&self) -> bool {
+        self.opts.vim && self.tab.vim.mode() != Mode::Insert
+    }
+
     /// Screen rect of the caret (zero width).
     fn caret_rect(&mut self, ui: &Ui, galleys: &[(usize, Arc<Galley>)], pl: &Placement) -> Rect {
         let rope = self.tab.buffer.rope();
@@ -900,9 +983,32 @@ impl Frame<'_> {
         if caret.min.x < gutter_right {
             return;
         }
+        let color = ui.visuals().text_cursor.stroke.color;
+        if self.block_caret() {
+            let rect = Rect::from_min_size(caret.min, vec2(self.block_width(ui), caret.height()));
+            ui.painter()
+                .rect_filled(rect, 0.0, color.gamma_multiply(BLOCK_CARET_ALPHA));
+            return;
+        }
         let rect = Rect::from_min_size(caret.min, vec2(CARET_WIDTH, caret.height()));
-        ui.painter()
-            .rect_filled(rect, 0.0, ui.visuals().text_cursor.stroke.color);
+        ui.painter().rect_filled(rect, 0.0, color);
+    }
+
+    /// Width of the block caret: the char under the caret (tabs expanded), at least one column.
+    fn block_width(&self, ui: &Ui) -> f32 {
+        let rope = self.tab.buffer.rope();
+        let head = self.tab.editor.selection.head;
+        let c = (head < rope.len_chars()).then(|| rope.char(head));
+        match c {
+            Some('\t') => self.m.char_width * self.m.tab_width as f32,
+            Some(c) if c != '\n' => {
+                let font = &self.m.base.font_id;
+                ui.ctx()
+                    .fonts_mut(|f| f.glyph_width(font, c))
+                    .max(self.m.char_width)
+            }
+            _ => self.m.char_width,
+        }
     }
 }
 
@@ -1042,6 +1148,56 @@ mod tests {
             event_to_command(&egui::Event::Paste("x".into()), 1),
             Some(EditCommand::Paste("x".into()))
         );
+    }
+
+    #[test]
+    fn events_map_to_vim_keys() {
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        assert_eq!(
+            egui_event_to_vim_key(&egui::Event::Text("n".into())),
+            Some(VimKey::Char('n'))
+        );
+        assert_eq!(
+            egui_event_to_vim_keys(&egui::Event::Text("ab".into())),
+            vec![VimKey::Char('a'), VimKey::Char('b')]
+        );
+        assert_eq!(egui_event_to_vim_key(&egui::Event::Text("ab".into())), None);
+        assert_eq!(
+            egui_event_to_vim_key(&key(Key::Escape, NONE)),
+            Some(VimKey::Esc)
+        );
+        assert_eq!(
+            egui_event_to_vim_key(&key(Key::Enter, NONE)),
+            Some(VimKey::Enter)
+        );
+        assert_eq!(
+            egui_event_to_vim_key(&key(Key::Backspace, NONE)),
+            Some(VimKey::Backspace)
+        );
+        assert_eq!(
+            egui_event_to_vim_key(&key(Key::Tab, NONE)),
+            Some(VimKey::Tab)
+        );
+        assert_eq!(
+            egui_event_to_vim_key(&key(Key::ArrowUp, NONE)),
+            Some(VimKey::Up)
+        );
+        assert_eq!(
+            egui_event_to_vim_key(&key(Key::R, CTRL)),
+            Some(VimKey::Ctrl('r'))
+        );
+        assert_eq!(
+            egui_event_to_vim_key(&key(Key::N, NONE)),
+            None,
+            "text event follows"
+        );
+        assert_eq!(egui_event_to_vim_key(&egui::Event::Copy), None);
     }
 
     #[test]

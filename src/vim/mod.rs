@@ -3,6 +3,7 @@
 //! Pure logic over a [`Buffer`] and an [`EditorState`]; the UI translates input into
 //! [`VimKey`]s and acts on the returned [`VimEffect`]s.
 
+pub mod cmdline;
 pub mod motion;
 mod normal;
 pub mod textobj;
@@ -150,6 +151,8 @@ pub struct VimState {
     group_open: bool,
     /// The caret line holds only indentation inserted automatically (removed on Esc).
     auto_indent: bool,
+    /// First and last line (0-based) of the last Visual selection, for `'<` and `'>`.
+    last_visual: Option<(usize, usize)>,
 }
 
 impl Default for VimState {
@@ -172,6 +175,7 @@ impl VimState {
             recording: None,
             group_open: false,
             auto_indent: false,
+            last_visual: None,
         }
     }
 
@@ -188,6 +192,49 @@ impl VimState {
     /// Returns the pending normal-mode keys (e.g. `"2d"`).
     pub fn pending(&self) -> &str {
         &self.pending_text
+    }
+
+    /// Returns the first and last line (0-based) of the last Visual selection.
+    pub fn visual_marks(&self) -> Option<(usize, usize)> {
+        self.last_visual
+    }
+
+    /// Closes the undo group of an Insert session (before saving, switching tabs or editing
+    /// the buffer from outside). Insert mode continues; the next typed key opens a new group.
+    pub fn end_insert_group(&mut self, buf: &mut Buffer) {
+        self.end_change(buf);
+    }
+
+    /// Syncs the mode with a selection the mouse just made: a non-empty selection enters
+    /// Visual mode (the head becomes the inclusive end), an empty one leaves Visual mode.
+    pub fn mouse_selection(&mut self, buf: &mut Buffer, ed: &mut EditorState) {
+        let sel = ed.selection;
+        if sel.is_empty() {
+            if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
+                self.mode = Mode::Normal;
+            }
+            if self.mode == Mode::Normal {
+                ed.selection = Selection::caret(clamp_normal(buf.rope(), sel.head));
+            }
+            return;
+        }
+        if self.mode == Mode::Insert {
+            self.end_change(buf);
+            if let Some(rec) = self.recording.take() {
+                self.last_change = rec;
+            }
+        }
+        self.keys.clear();
+        self.pending_text.clear();
+        self.cmdline.clear();
+        if self.mode != Mode::VisualLine {
+            self.mode = Mode::Visual;
+        }
+        let head = match sel.head > sel.anchor {
+            true => sel.head - 1,
+            false => sel.head,
+        };
+        ed.selection.head = clamp_normal(buf.rope(), head);
     }
 
     /// Returns the selected char range to render in Visual modes, `None` otherwise.
@@ -234,17 +281,17 @@ impl VimState {
         }
     }
 
-    /// Executes an ex command line (text after `:`). Task 13 replaces this stub.
+    /// Parses and executes an ex command line (text after `:`).
     fn run_cmdline(
         &mut self,
         line: &str,
-        _buf: &mut Buffer,
-        _ed: &mut EditorState,
-        _settings: &EditSettings,
+        buf: &mut Buffer,
+        ed: &mut EditorState,
     ) -> Vec<VimEffect> {
-        vec![VimEffect::Error(format!(
-            "E492: Not an editor command: {line}"
-        ))]
+        match cmdline::parse(line) {
+            Ok(cmd) => cmdline::execute(cmd, buf, ed, self.last_visual),
+            Err(e) => vec![VimEffect::Error(e)],
+        }
     }
 
     /// Opens the undo group of a change.
@@ -348,6 +395,8 @@ impl VimState {
 
     /// Handles a key in Insert mode.
     fn insert_key(&mut self, key: VimKey, env: &mut Env) {
+        // The group may have been closed from outside (`end_insert_group`).
+        self.begin_change(env.buf);
         if let Some(rec) = &mut self.recording {
             rec.push(key.clone());
         }
@@ -529,8 +578,15 @@ impl VimState {
     /// Returns to Normal mode, recording the selection in marks `<` and `>`.
     fn leave_visual(&mut self, env: &mut Env) {
         let sel = env.ed.selection;
-        env.buf.set_mark('<', sel.anchor.min(sel.head));
-        env.buf.set_mark('>', sel.anchor.max(sel.head));
+        let (first, last) = (sel.anchor.min(sel.head), sel.anchor.max(sel.head));
+        env.buf.set_mark('<', first);
+        env.buf.set_mark('>', last);
+        let rope = env.buf.rope();
+        let len = rope.len_chars();
+        self.last_visual = Some((
+            rope.char_to_line(first.min(len)),
+            rope.char_to_line(last.min(len)),
+        ));
         self.mode = Mode::Normal;
         let p = clamp_normal(env.buf.rope(), sel.head);
         env.set_caret(p);
@@ -554,7 +610,7 @@ impl VimState {
                 match prefix {
                     Some(':') if rest.trim().is_empty() => {}
                     Some(':') => {
-                        let fx = self.run_cmdline(rest, env.buf, env.ed, env.settings);
+                        let fx = self.run_cmdline(rest, env.buf, env.ed);
                         env.fx.extend(fx);
                     }
                     Some('/') => self.run_search(rest, true, env),

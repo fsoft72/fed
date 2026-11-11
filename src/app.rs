@@ -17,7 +17,8 @@ use crate::keymap::{Action, KeyChord, Keymap};
 use crate::markdown::{self, Preview};
 use crate::spell::{SpellDecorator, SpellMode, SpellService, SpellStatus};
 use crate::tab::Tab;
-use crate::view::{self, ViewOptions};
+use crate::view::{self, KeyHandler, ViewOptions};
+use crate::vim::{Mode, VimEffect, VimKey, VimState};
 use dialogs::Pending;
 
 /// How long a status bar message stays visible.
@@ -37,6 +38,10 @@ const MODIFIED_LABEL_SUFFIX: &str = " ●";
 const MODIFIED_STATUS_SUFFIX: &str = "  [+]";
 /// Fixed, non-configurable alias for Redo.
 const REDO_ALIAS: &str = "Cmd+Shift+Z";
+/// Vim error for `:q` on a buffer with unsaved changes.
+const VIM_NO_WRITE: &str = "No write since last change (add ! to override)";
+/// The vim command bar font is this much larger than the editor font.
+const VIM_BAR_FONT_EXTRA: f32 = 2.0;
 
 /// Returns true when closing `tab` would lose unsaved changes.
 pub fn close_requires_confirmation(tab: &Tab) -> bool {
@@ -68,6 +73,37 @@ pub fn status_text(tab: &Tab) -> String {
         text.push_str(MODIFIED_STATUS_SUFFIX);
     }
     text
+}
+
+/// Returns the vim part of the status bar: the mode (`-- NORMAL --`, `-- INSERT --`,
+/// `-- VISUAL --`, `-- VISUAL LINE --`, nothing on the command line) and the pending keys.
+pub fn vim_status_text(vim: &VimState) -> String {
+    let mode = match vim.mode() {
+        Mode::Normal => "-- NORMAL --",
+        Mode::Insert => "-- INSERT --",
+        Mode::Visual => "-- VISUAL --",
+        Mode::VisualLine => "-- VISUAL LINE --",
+        Mode::CommandLine => "",
+    };
+    format!("{mode}  {}", vim.pending()).trim().to_string()
+}
+
+/// True when the app shortcut `action` bound to a chord with `mods` may fire while vim mode is
+/// on: only chords with Ctrl/Cmd, and never Undo/Redo/SelectAll (vim owns `u`, `Ctrl+R`).
+fn shortcut_allowed_in_vim(action: Action, mods: egui::Modifiers) -> bool {
+    (mods.ctrl || mods.command) && !needs_editor_focus(action)
+}
+
+/// Resolves a path typed in a vim command: relative paths are taken from the directory of
+/// `current` (the active file), else from the process working directory.
+fn resolve_vim_path(path: PathBuf, current: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    match current.and_then(Path::parent) {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(path),
+        _ => path,
+    }
 }
 
 /// Path of `tab` as opened, or "untitled".
@@ -141,6 +177,14 @@ struct StatusMessage {
     shown_at: Instant,
 }
 
+/// Text shown in the vim command bar until the next key.
+struct VimMessage {
+    /// Message text.
+    text: String,
+    /// Drawn in the error color.
+    error: bool,
+}
+
 /// Something the user did in the tab bar.
 enum TabBarAction {
     /// Switch to the tab at this index.
@@ -197,6 +241,10 @@ pub struct FedApp {
     spell_menu: Option<SpellMenu>,
     /// Set once the user agreed to close the window, so the close is not intercepted again.
     allow_close: bool,
+    /// Vim mode state the tabs were last set up for (to react to settings changes).
+    vim_applied: bool,
+    /// Last vim message or error, shown in the command bar.
+    vim_message: Option<VimMessage>,
 }
 
 impl FedApp {
@@ -229,7 +277,10 @@ impl FedApp {
             spell: None,
             spell_menu: None,
             allow_close: false,
+            vim_applied: false,
+            vim_message: None,
         };
+        app.vim_applied = app.settings.vim_mode;
         egui_extras::install_image_loaders(&cc.egui_ctx);
         app.apply_theme(&cc.egui_ctx);
         app.ensure_spell(&cc.egui_ctx);
@@ -277,6 +328,7 @@ impl FedApp {
         let count = self.tabs.len();
         match action {
             Action::NewTab => {
+                self.leave_active();
                 self.tabs.push(Tab::new(Buffer::new()));
                 self.active = self.tabs.len() - 1;
             }
@@ -325,6 +377,7 @@ impl FedApp {
             return Ok(());
         }
         let tab = Tab::new(Buffer::load(&path).map_err(|e| e.to_string())?);
+        self.leave_active();
         match self.tabs.get(self.active) {
             Some(current) if is_blank(current) => self.tabs[self.active] = tab,
             _ => {
@@ -413,6 +466,7 @@ impl FedApp {
             word_wrap: self.settings.word_wrap,
             edit: self.edit_settings(),
             keys_enabled: self.pending.is_none(),
+            vim: self.settings.vim_mode,
         }
     }
 
@@ -427,11 +481,21 @@ impl FedApp {
 
     /// Makes the tab at `idx` active and gives it keyboard focus.
     fn activate(&mut self, idx: usize) {
-        let Some(tab) = self.tabs.get_mut(idx) else {
+        if idx >= self.tabs.len() {
             return;
-        };
-        tab.focus_editor();
+        }
+        if idx != self.active {
+            self.leave_active();
+        }
+        self.tabs[idx].focus_editor();
         self.active = idx;
+    }
+
+    /// Closes the open undo groups of the active tab before another tab becomes active.
+    fn leave_active(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.end_typing();
+        }
     }
 
     /// Shows the native open dialog and opens every picked file.
@@ -508,6 +572,7 @@ impl FedApp {
             return;
         }
         let editor_focused = self.editor_has_focus(ctx);
+        let vim = self.settings.vim_mode;
         let mut fired = Vec::new();
         ctx.input_mut(|i| {
             i.events.retain(|event| {
@@ -523,6 +588,9 @@ impl FedApp {
                 let Some(action) = shortcut_action(&self.keymap, *key, *modifiers) else {
                     return true;
                 };
+                if vim && !shortcut_allowed_in_vim(action, *modifiers) {
+                    return true;
+                }
                 if needs_editor_focus(action) && !editor_focused {
                     return true;
                 }
@@ -647,10 +715,14 @@ impl FedApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let spell_status = self.spell_status();
         let mut retry = false;
+        let vim = self.settings.vim_mode;
         let tab = &self.tabs[self.active];
         egui::Panel::bottom("fed_status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(status_text(tab));
+                if vim {
+                    ui.label(vim_status_text(&tab.vim));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(msg) = &self.status {
                         let color = match msg.severity {
@@ -784,6 +856,145 @@ impl FedApp {
             }
         }
     }
+
+    /// Resets every tab's vim state when vim mode was switched on or off in the settings.
+    fn sync_vim_mode(&mut self) {
+        if self.vim_applied == self.settings.vim_mode {
+            return;
+        }
+        self.vim_applied = self.settings.vim_mode;
+        self.vim_message = None;
+        self.tabs.iter_mut().for_each(Tab::reset_vim);
+    }
+
+    /// Shows `text` in the vim command bar, in the error color when `error`.
+    fn set_vim_message(&mut self, text: String, error: bool) {
+        self.vim_message = Some(VimMessage { text, error });
+    }
+
+    /// Carries out the effects of the vim keys handled this frame on the active tab.
+    fn apply_vim_effects(&mut self, ctx: &egui::Context, effects: Vec<VimEffect>) {
+        for effect in effects {
+            match effect {
+                VimEffect::SetClipboard(text) => ctx.copy_text(text),
+                VimEffect::Message(text) => self.set_vim_message(text, false),
+                VimEffect::Error(text) => self.set_vim_message(text, true),
+                VimEffect::Write(None) => {
+                    self.vim_write();
+                }
+                VimEffect::Write(Some(path)) => self.vim_write_copy(path),
+                VimEffect::Quit { force } => self.vim_quit(ctx, force),
+                VimEffect::WriteQuit => {
+                    if self.vim_write() {
+                        self.remove_tab(ctx, self.active);
+                    }
+                }
+                VimEffect::Edit(path) => self.vim_edit(path),
+                VimEffect::GotoLine(line) => self.vim_goto_line(line),
+            }
+        }
+    }
+
+    /// `:w`: saves the active tab (Save As dialog when untitled) and reports the outcome in
+    /// the command bar. Returns true when the file was written.
+    fn vim_write(&mut self) -> bool {
+        let saved = self.save_tab(self.active);
+        if saved {
+            let path = tab_path(&self.tabs[self.active]);
+            self.set_vim_message(format!("\"{path}\" written"), false);
+            return true;
+        }
+        let error = self
+            .status
+            .as_ref()
+            .filter(|s| s.severity == Severity::Error)
+            .map(|s| s.text.clone());
+        if let Some(text) = error {
+            self.set_vim_message(text, true);
+        }
+        false
+    }
+
+    /// `:w {file}`: writes a copy of the active tab, which stays bound to its own path.
+    fn vim_write_copy(&mut self, path: PathBuf) {
+        let tab = &mut self.tabs[self.active];
+        let path = resolve_vim_path(path, tab.buffer.path());
+        tab.end_typing();
+        match tab.buffer.write_copy(&path) {
+            Ok(()) => self.set_vim_message(format!("\"{}\" written", path.display()), false),
+            Err(e) => self.set_vim_message(e.to_string(), true),
+        }
+    }
+
+    /// `:q` / `:q!`: closes the active tab; without `force` it refuses unsaved changes.
+    fn vim_quit(&mut self, ctx: &egui::Context, force: bool) {
+        let tab = &mut self.tabs[self.active];
+        tab.end_typing();
+        if !force && close_requires_confirmation(tab) {
+            self.set_vim_message(VIM_NO_WRITE.to_string(), true);
+            return;
+        }
+        self.remove_tab(ctx, self.active);
+    }
+
+    /// `:e {file}`: opens the file (relative to the active file's directory) in a tab.
+    fn vim_edit(&mut self, path: PathBuf) {
+        let path = resolve_vim_path(path, self.tabs[self.active].buffer.path());
+        if let Err(e) = self.try_open(path) {
+            self.set_vim_message(e.clone(), true);
+            self.set_status(e, Severity::Error);
+        }
+    }
+
+    /// Moves the caret of the active tab to the first non-blank of 1-based `line`.
+    fn vim_goto_line(&mut self, line: usize) {
+        let tab = &mut self.tabs[self.active];
+        let rope = tab.buffer.rope();
+        let line = line.clamp(1, rope.len_lines()) - 1;
+        let pos = crate::text_nav::first_non_blank(rope, rope.line_to_char(line));
+        tab.editor.selection = crate::editing::Selection::caret(pos);
+        tab.scroll_to_cursor = true;
+    }
+
+    /// Draws the vim command bar above the status bar: the command line with a block cursor
+    /// while typing a command, otherwise the last message.
+    fn vim_command_bar(&mut self, ui: &mut egui::Ui) {
+        if !self.settings.vim_mode {
+            return;
+        }
+        let vim = &self.tabs[self.active].vim;
+        let fill = ui.visuals().extreme_bg_color;
+        let strong = ui.visuals().strong_text_color();
+        let error = ui.visuals().error_fg_color;
+        let format = |color: egui::Color32| egui::TextFormat {
+            font_id: egui::FontId::monospace(self.settings.font_size + VIM_BAR_FONT_EXTRA),
+            color,
+            ..Default::default()
+        };
+        let mut job = egui::text::LayoutJob::default();
+        match (vim.mode(), &self.vim_message) {
+            (Mode::CommandLine, _) => {
+                job.append(vim.cmdline(), 0.0, format(strong));
+                let cursor = egui::TextFormat {
+                    background: strong,
+                    ..format(fill)
+                };
+                job.append(" ", 0.0, cursor);
+            }
+            (_, Some(msg)) => {
+                let color = if msg.error { error } else { strong };
+                job.append(&msg.text, 0.0, format(color));
+            }
+            // A blank keeps the bar one line high.
+            _ => job.append(" ", 0.0, format(strong)),
+        }
+        let frame = egui::Frame::side_top_panel(ui.style()).fill(fill);
+        egui::Panel::bottom("fed_vim_cmdline")
+            .frame(frame)
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Truncate));
+            });
+    }
 }
 
 impl eframe::App for FedApp {
@@ -794,6 +1005,7 @@ impl eframe::App for FedApp {
         self.expire_status(&ctx);
         self.handle_close_request(&ctx);
         self.ensure_spell(&ctx);
+        self.sync_vim_mode();
         self.handle_shortcuts(&ctx);
         match self.tab_bar(ui) {
             Some(TabBarAction::Activate(i)) => self.activate(i),
@@ -802,6 +1014,7 @@ impl eframe::App for FedApp {
             None => {}
         }
         self.status_bar(ui);
+        self.vim_command_bar(ui);
         self.find_bar_panel(ui);
         self.preview_panel(ui);
         let opts = self.view_options();
@@ -810,6 +1023,9 @@ impl eframe::App for FedApp {
             false => None,
         };
         let mut context_click = None;
+        let vim_mode = self.settings.vim_mode;
+        let mut vim_effects: Vec<VimEffect> = Vec::new();
+        let mut vim_key_seen = false;
         egui::CentralPanel::default().show(ui, |ui| {
             let Some(tab) = self.tabs.get_mut(self.active) else {
                 return;
@@ -833,6 +1049,30 @@ impl eframe::App for FedApp {
             let mut markdown = tab.spell_md.take();
             let mut marks = std::mem::take(&mut tab.spell_marks);
             let large = tab.buffer.is_large();
+            let edit = opts.edit;
+            let mut route_to_vim = |ev: &egui::Event, tab: &mut Tab| {
+                vim_key_seen = true;
+                let keys: Vec<VimKey> = match ev {
+                    // Pasting types the text in Insert mode only (p/P use the register).
+                    egui::Event::Paste(text) if tab.vim.mode() == Mode::Insert => text
+                        .chars()
+                        .filter(|&c| c != '\r')
+                        .map(VimKey::Char)
+                        .collect(),
+                    _ => view::egui_event_to_vim_keys(ev),
+                };
+                for key in keys {
+                    let fx = tab
+                        .vim
+                        .handle_key(key, &mut tab.buffer, &mut tab.editor, &edit);
+                    vim_effects.extend(fx);
+                }
+                true
+            };
+            let key_handler: Option<&mut KeyHandler<'_>> = match vim_mode {
+                true => Some(&mut route_to_vim),
+                false => None,
+            };
             let mut highlighted =
                 HighlightDecorator::new(&mut cache, assets, &syntax, theme, !large);
             let spell_checker = checker.filter(|_| !large);
@@ -842,16 +1082,19 @@ impl eframe::App for FedApp {
                     let mut spell =
                         SpellDecorator::new(&mut highlighted, c, mode, &mut markdown, &mut marks);
                     let mut deco = MatchDecorator::new(&mut spell, &matches);
-                    view::show_editor(ui, tab, &opts, &mut deco, None)
+                    view::show_editor(ui, tab, &opts, &mut deco, key_handler)
                 }
                 None => {
                     let mut deco = MatchDecorator::new(&mut highlighted, &matches);
-                    view::show_editor(ui, tab, &opts, &mut deco, None)
+                    view::show_editor(ui, tab, &opts, &mut deco, key_handler)
                 }
             };
             tab.highlight = cache;
             tab.spell_md = markdown;
             tab.spell_marks = marks;
+            if vim_mode && out.mouse_selected {
+                tab.vim.mouse_selection(&mut tab.buffer, &mut tab.editor);
+            }
             if let Some(text) = out.clipboard {
                 ui.ctx().copy_text(text);
             }
@@ -859,6 +1102,10 @@ impl eframe::App for FedApp {
                 context_click = ui.input(|i| i.pointer.latest_pos()).map(|pos| (pos, range));
             }
         });
+        if vim_key_seen {
+            self.vim_message = None;
+        }
+        self.apply_vim_effects(&ctx, vim_effects);
         if let Some((pos, range)) = context_click {
             self.open_spell_menu(pos, range);
         }
@@ -947,5 +1194,75 @@ mod tests {
 
         tab.apply(EditCommand::InsertText("x".into()), &SET);
         assert_eq!(status_text(&tab), "src/lib.rs  2:3  CRLF  [+]");
+    }
+    #[test]
+    fn vim_status_shows_mode_and_pending_keys() {
+        let mut tab = Tab::new(Buffer::from_text("abc\n"));
+        assert_eq!(vim_status_text(&tab.vim), "-- NORMAL --");
+        let feed = |tab: &mut Tab, key: VimKey| {
+            tab.vim
+                .handle_key(key, &mut tab.buffer, &mut tab.editor, &SET);
+        };
+        feed(&mut tab, VimKey::Char('2'));
+        feed(&mut tab, VimKey::Char('d'));
+        assert_eq!(vim_status_text(&tab.vim), "-- NORMAL --  2d");
+        feed(&mut tab, VimKey::Esc);
+        feed(&mut tab, VimKey::Char('V'));
+        assert_eq!(vim_status_text(&tab.vim), "-- VISUAL LINE --");
+        feed(&mut tab, VimKey::Char('v'));
+        assert_eq!(vim_status_text(&tab.vim), "-- VISUAL --");
+        feed(&mut tab, VimKey::Esc);
+        feed(&mut tab, VimKey::Char('i'));
+        assert_eq!(vim_status_text(&tab.vim), "-- INSERT --");
+    }
+
+    #[test]
+    fn vim_mode_keeps_only_ctrl_shortcuts_and_leaves_undo_to_vim() {
+        let ctrl = egui::Modifiers::COMMAND;
+        assert!(shortcut_allowed_in_vim(Action::Save, ctrl));
+        assert!(shortcut_allowed_in_vim(Action::Find, ctrl));
+        assert!(!shortcut_allowed_in_vim(
+            Action::Save,
+            egui::Modifiers::NONE
+        ));
+        assert!(!shortcut_allowed_in_vim(
+            Action::NextTab,
+            egui::Modifiers::ALT
+        ));
+        assert!(!shortcut_allowed_in_vim(Action::Undo, ctrl));
+        assert!(!shortcut_allowed_in_vim(Action::Redo, ctrl));
+        assert!(!shortcut_allowed_in_vim(Action::SelectAll, ctrl));
+    }
+
+    #[test]
+    fn vim_paths_are_relative_to_the_current_file() {
+        let current = Path::new("/work/src/main.rs");
+        assert_eq!(
+            resolve_vim_path(PathBuf::from("other.txt"), Some(current)),
+            PathBuf::from("/work/src/other.txt")
+        );
+        assert_eq!(
+            resolve_vim_path(PathBuf::from("/abs/x"), Some(current)),
+            PathBuf::from("/abs/x")
+        );
+        assert_eq!(
+            resolve_vim_path(PathBuf::from("a.txt"), None),
+            PathBuf::from("a.txt")
+        );
+        assert_eq!(
+            resolve_vim_path(PathBuf::from("a.txt"), Some(Path::new("b.txt"))),
+            PathBuf::from("a.txt")
+        );
+    }
+
+    #[test]
+    fn quit_refusal_depends_on_modified_state() {
+        let mut tab = Tab::new(Buffer::from_text("a\n"));
+        tab.vim
+            .handle_key(VimKey::Char('x'), &mut tab.buffer, &mut tab.editor, &SET);
+        assert!(close_requires_confirmation(&tab), "`:q` must refuse");
+        tab.vim
+            .handle_key(VimKey::Char('u'), &mut tab.buffer, &mut tab.editor, &SET);
+        assert!(!close_requires_confirmation(&tab), "`:q` may close");
     }
 }

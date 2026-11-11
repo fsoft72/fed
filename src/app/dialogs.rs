@@ -123,7 +123,7 @@ impl FedApp {
     }
 
     /// Removes the tab at `idx` without asking. Closing the last tab closes the window.
-    fn remove_tab(&mut self, ctx: &egui::Context, idx: usize) {
+    pub(super) fn remove_tab(&mut self, ctx: &egui::Context, idx: usize) {
         if self.tabs.len() <= 1 {
             self.close_window(ctx);
             return;
