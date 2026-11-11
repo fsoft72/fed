@@ -13,7 +13,11 @@ use crate::spell::SpellStatus;
 /// Window title.
 const WINDOW_TITLE: &str = "Settings";
 /// Default window size in logical pixels.
-const DEFAULT_SIZE: [f32; 2] = [520.0, 600.0];
+const DEFAULT_SIZE: [f32; 2] = [760.0, 560.0];
+/// Width of the section list on the left of the window.
+const NAV_WIDTH: f32 = 170.0;
+/// Inner margin of the section list frame, in logical pixels.
+const NAV_MARGIN: i8 = 4;
 /// Font size range offered by the settings window, in points.
 const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 6.0..=72.0;
 /// Tab width range offered by the settings window, in columns.
@@ -54,6 +58,52 @@ pub enum SettingsEvent {
     RetryDictionaries,
 }
 
+/// A page of the settings window, chosen in the section list on the left.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsSection {
+    /// Font, indentation, line numbers and word wrap.
+    #[default]
+    Editor,
+    /// UI theme and code themes.
+    Appearance,
+    /// Markdown preview font.
+    Preview,
+    /// Vim mode.
+    Vim,
+    /// Spell checking.
+    Spell,
+    /// Session restore.
+    Session,
+    /// Key bindings.
+    Keys,
+}
+
+impl SettingsSection {
+    /// Every section, in list order.
+    pub const ALL: &'static [SettingsSection] = &[
+        SettingsSection::Editor,
+        SettingsSection::Appearance,
+        SettingsSection::Preview,
+        SettingsSection::Vim,
+        SettingsSection::Spell,
+        SettingsSection::Session,
+        SettingsSection::Keys,
+    ];
+
+    /// Name shown in the section list.
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsSection::Editor => "Editor",
+            SettingsSection::Appearance => "Appearance",
+            SettingsSection::Preview => "Markdown preview",
+            SettingsSection::Vim => "Vim",
+            SettingsSection::Spell => "Spell check",
+            SettingsSection::Session => "Session",
+            SettingsSection::Keys => "Key bindings",
+        }
+    }
+}
+
 /// Draws a font family combo box ("default" plus the scanned families whose lowercase name
 /// contains `filter`, only monospaced ones when `monospace_only`). Returns true when the
 /// selection in `current` changed.
@@ -66,9 +116,7 @@ fn family_combo(
     filter: &str,
     monospace_only: bool,
 ) -> bool {
-    let selected = current
-        .clone()
-        .unwrap_or_else(|| default_label.to_string());
+    let selected = current.clone().unwrap_or_else(|| default_label.to_string());
     let mut choice: Option<Option<String>> = None;
     egui::ComboBox::from_id_salt(id)
         .selected_text(selected)
@@ -265,6 +313,8 @@ pub struct SettingsWindow {
     preview_font_filter: String,
     /// Layer of the window as last drawn, to tell whether it owns the keyboard focus.
     layer: Option<egui::LayerId>,
+    /// Section shown on the right of the window.
+    section: SettingsSection,
 }
 
 impl Default for SettingsWindow {
@@ -279,6 +329,7 @@ impl Default for SettingsWindow {
             monospace_only: true,
             preview_font_filter: String::new(),
             layer: None,
+            section: SettingsSection::default(),
         }
     }
 }
@@ -302,6 +353,17 @@ impl SettingsWindow {
         self.open = false;
         self.capture = None;
         self.capture_rejected = false;
+        self.pending_conflict = None;
+    }
+
+    /// Shows `section`. Leaving the key bindings drops any capture or pending conflict, so
+    /// no hidden capture keeps swallowing keys.
+    fn select_section(&mut self, section: SettingsSection) {
+        if section == self.section {
+            return;
+        }
+        self.section = section;
+        self.stop_capture();
         self.pending_conflict = None;
     }
 
@@ -420,17 +482,34 @@ impl SettingsWindow {
             .resizable(true)
             .default_size(DEFAULT_SIZE)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        self.editor_section(ui, settings, fonts, &mut events);
-                        self.appearance_section(ui, settings, theme_names, &mut events);
-                        self.preview_section(ui, settings, fonts, &mut events);
-                        self.vim_section(ui, settings, &mut events);
-                        self.spell_section(ui, settings, spell, &mut events);
-                        self.session_section(ui, settings, &mut events);
-                        self.keys_section(ui, keymap, &mut events);
+                ui.horizontal_top(|ui| {
+                    self.section_list(ui);
+                    ui.vertical(|ui| {
+                        ui.heading(self.section.label());
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| match self.section {
+                                SettingsSection::Editor => {
+                                    self.editor_section(ui, settings, fonts, &mut events)
+                                }
+                                SettingsSection::Appearance => {
+                                    self.appearance_section(ui, settings, theme_names, &mut events)
+                                }
+                                SettingsSection::Preview => {
+                                    self.preview_section(ui, settings, fonts, &mut events)
+                                }
+                                SettingsSection::Vim => self.vim_section(ui, settings, &mut events),
+                                SettingsSection::Spell => {
+                                    self.spell_section(ui, settings, spell, &mut events)
+                                }
+                                SettingsSection::Session => {
+                                    self.session_section(ui, settings, &mut events)
+                                }
+                                SettingsSection::Keys => self.keys_section(ui, keymap, &mut events),
+                            });
                     });
+                });
             });
         if let Some(shown) = &shown {
             self.layer = Some(shown.response.layer_id);
@@ -445,6 +524,28 @@ impl SettingsWindow {
         events
     }
 
+    /// The section list on the left: one full-width entry per section, the current one selected.
+    fn section_list(&mut self, ui: &mut egui::Ui) {
+        let mut clicked = None;
+        egui::Frame::new()
+            .fill(ui.visuals().extreme_bg_color)
+            .inner_margin(NAV_MARGIN)
+            .show(ui, |ui| {
+                ui.set_width(NAV_WIDTH);
+                ui.set_min_height(ui.available_height());
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                    for section in SettingsSection::ALL {
+                        let selected = *section == self.section;
+                        if ui.selectable_label(selected, section.label()).clicked() {
+                            clicked = Some(*section);
+                        }
+                    }
+                });
+            });
+        let Some(section) = clicked else { return };
+        self.select_section(section);
+    }
+
     /// Font family, size, indentation, line numbers and word wrap.
     fn editor_section(
         &mut self,
@@ -453,51 +554,47 @@ impl SettingsWindow {
         fonts: &FontCatalog,
         events: &mut Vec<SettingsEvent>,
     ) {
-        egui::CollapsingHeader::new("Editor")
-            .default_open(true)
+        egui::Grid::new("fed_settings_editor")
+            .num_columns(2)
             .show(ui, |ui| {
-                egui::Grid::new("fed_settings_editor")
-                    .num_columns(2)
-                    .show(ui, |ui| {
-                        ui.label("Font family");
-                        self.font_combo(ui, settings, fonts, events);
-                        ui.end_row();
+                ui.label("Font family");
+                self.font_combo(ui, settings, fonts, events);
+                ui.end_row();
 
-                        ui.label("");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.font_filter)
-                                    .hint_text("filter fonts")
-                                    .desired_width(140.0),
-                            );
-                            ui.checkbox(&mut self.monospace_only, "monospace only");
-                        });
-                        ui.end_row();
+                ui.label("");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.font_filter)
+                            .hint_text("filter fonts")
+                            .desired_width(140.0),
+                    );
+                    ui.checkbox(&mut self.monospace_only, "monospace only");
+                });
+                ui.end_row();
 
-                        ui.label("Font size");
-                        let size = egui::DragValue::new(&mut settings.font_size)
-                            .range(FONT_SIZE_RANGE)
-                            .speed(0.5);
-                        drag_changed(ui.add(size), events);
-                        ui.end_row();
+                ui.label("Font size");
+                let size = egui::DragValue::new(&mut settings.font_size)
+                    .range(FONT_SIZE_RANGE)
+                    .speed(0.5);
+                drag_changed(ui.add(size), events);
+                ui.end_row();
 
-                        ui.label("Tab width");
-                        let width = egui::DragValue::new(&mut settings.tab_width)
-                            .range(TAB_WIDTH_RANGE)
-                            .speed(0.1);
-                        drag_changed(ui.add(width), events);
-                        ui.end_row();
-                    });
-                changed(
-                    ui.checkbox(&mut settings.insert_spaces, "Insert spaces instead of tabs"),
-                    events,
-                );
-                changed(
-                    ui.checkbox(&mut settings.line_numbers, "Show line numbers"),
-                    events,
-                );
-                changed(ui.checkbox(&mut settings.word_wrap, "Word wrap"), events);
+                ui.label("Tab width");
+                let width = egui::DragValue::new(&mut settings.tab_width)
+                    .range(TAB_WIDTH_RANGE)
+                    .speed(0.1);
+                drag_changed(ui.add(width), events);
+                ui.end_row();
             });
+        changed(
+            ui.checkbox(&mut settings.insert_spaces, "Insert spaces instead of tabs"),
+            events,
+        );
+        changed(
+            ui.checkbox(&mut settings.line_numbers, "Show line numbers"),
+            events,
+        );
+        changed(ui.checkbox(&mut settings.word_wrap, "Word wrap"), events);
     }
 
     /// The editor font family combo box: "Default" plus the scanned families matching the filter.
@@ -531,46 +628,39 @@ impl SettingsWindow {
         fonts: &FontCatalog,
         events: &mut Vec<SettingsEvent>,
     ) {
-        egui::CollapsingHeader::new("Markdown preview")
-            .default_open(true)
+        egui::Grid::new("fed_settings_preview")
+            .num_columns(2)
             .show(ui, |ui| {
-                egui::Grid::new("fed_settings_preview")
-                    .num_columns(2)
-                    .show(ui, |ui| {
-                        ui.label("Font family");
-                        let filter = self.preview_font_filter.to_lowercase();
-                        let changed = family_combo(
-                            ui,
-                            "fed_settings_preview_font",
-                            &mut settings.preview_font_family,
-                            PREVIEW_DEFAULT_FONT_LABEL,
-                            fonts.families(),
-                            &filter,
-                            false,
-                        );
-                        if changed {
-                            events.extend([
-                                SettingsEvent::PreviewFontChanged,
-                                SettingsEvent::Changed,
-                            ]);
-                        }
-                        ui.end_row();
+                ui.label("Font family");
+                let filter = self.preview_font_filter.to_lowercase();
+                let changed = family_combo(
+                    ui,
+                    "fed_settings_preview_font",
+                    &mut settings.preview_font_family,
+                    PREVIEW_DEFAULT_FONT_LABEL,
+                    fonts.families(),
+                    &filter,
+                    false,
+                );
+                if changed {
+                    events.extend([SettingsEvent::PreviewFontChanged, SettingsEvent::Changed]);
+                }
+                ui.end_row();
 
-                        ui.label("");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.preview_font_filter)
-                                .hint_text("filter fonts")
-                                .desired_width(140.0),
-                        );
-                        ui.end_row();
+                ui.label("");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.preview_font_filter)
+                        .hint_text("filter fonts")
+                        .desired_width(140.0),
+                );
+                ui.end_row();
 
-                        ui.label("Font size");
-                        let size = egui::DragValue::new(&mut settings.preview_font_size)
-                            .range(FONT_SIZE_RANGE)
-                            .speed(0.5);
-                        drag_changed(ui.add(size), events);
-                        ui.end_row();
-                    });
+                ui.label("Font size");
+                let size = egui::DragValue::new(&mut settings.preview_font_size)
+                    .range(FONT_SIZE_RANGE)
+                    .speed(0.5);
+                drag_changed(ui.add(size), events);
+                ui.end_row();
             });
     }
 
@@ -582,44 +672,40 @@ impl SettingsWindow {
         theme_names: &[String],
         events: &mut Vec<SettingsEvent>,
     ) {
-        egui::CollapsingHeader::new("Appearance")
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("UI theme");
-                    for (theme, label) in [
-                        (UiTheme::System, "System"),
-                        (UiTheme::Light, "Light"),
-                        (UiTheme::Dark, "Dark"),
-                    ] {
-                        changed(ui.radio_value(&mut settings.ui_theme, theme, label), events);
-                    }
+        ui.horizontal(|ui| {
+            ui.label("UI theme");
+            for (theme, label) in [
+                (UiTheme::System, "System"),
+                (UiTheme::Light, "Light"),
+                (UiTheme::Dark, "Dark"),
+            ] {
+                changed(ui.radio_value(&mut settings.ui_theme, theme, label), events);
+            }
+        });
+        ui.add_enabled_ui(!theme_names.is_empty(), |ui| {
+            egui::Grid::new("fed_settings_themes")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Code theme (light)");
+                    theme_combo(
+                        ui,
+                        "fed_theme_light",
+                        &mut settings.code_theme_light,
+                        theme_names,
+                        events,
+                    );
+                    ui.end_row();
+                    ui.label("Code theme (dark)");
+                    theme_combo(
+                        ui,
+                        "fed_theme_dark",
+                        &mut settings.code_theme_dark,
+                        theme_names,
+                        events,
+                    );
+                    ui.end_row();
                 });
-                ui.add_enabled_ui(!theme_names.is_empty(), |ui| {
-                    egui::Grid::new("fed_settings_themes")
-                        .num_columns(2)
-                        .show(ui, |ui| {
-                            ui.label("Code theme (light)");
-                            theme_combo(
-                                ui,
-                                "fed_theme_light",
-                                &mut settings.code_theme_light,
-                                theme_names,
-                                events,
-                            );
-                            ui.end_row();
-                            ui.label("Code theme (dark)");
-                            theme_combo(
-                                ui,
-                                "fed_theme_dark",
-                                &mut settings.code_theme_dark,
-                                theme_names,
-                                events,
-                            );
-                            ui.end_row();
-                        });
-                });
-            });
+        });
     }
 
     /// Vim mode switch.
@@ -629,14 +715,10 @@ impl SettingsWindow {
         settings: &mut Settings,
         events: &mut Vec<SettingsEvent>,
     ) {
-        egui::CollapsingHeader::new("Vim")
-            .default_open(true)
-            .show(ui, |ui| {
-                changed(
-                    ui.checkbox(&mut settings.vim_mode, "Enable vim keybindings"),
-                    events,
-                );
-            });
+        changed(
+            ui.checkbox(&mut settings.vim_mode, "Enable vim keybindings"),
+            events,
+        );
     }
 
     /// Spell check switch, status and the dictionary download button.
@@ -647,26 +729,20 @@ impl SettingsWindow {
         spell: &SpellStatus,
         events: &mut Vec<SettingsEvent>,
     ) {
-        egui::CollapsingHeader::new("Spell check")
-            .default_open(true)
-            .show(ui, |ui| {
-                changed(
-                    ui.checkbox(
-                        &mut settings.spell_check,
-                        "Check spelling (Italian, English)",
-                    ),
-                    events,
-                );
-                ui.horizontal(|ui| {
-                    ui.label("Status:");
-                    ui.label(spell_status_text(spell));
-                });
-                if matches!(spell, SpellStatus::Failed(_))
-                    && ui.button("Download dictionaries").clicked()
-                {
-                    events.push(SettingsEvent::RetryDictionaries);
-                }
-            });
+        changed(
+            ui.checkbox(
+                &mut settings.spell_check,
+                "Check spelling (Italian, English)",
+            ),
+            events,
+        );
+        ui.horizontal(|ui| {
+            ui.label("Status:");
+            ui.label(spell_status_text(spell));
+        });
+        if matches!(spell, SpellStatus::Failed(_)) && ui.button("Download dictionaries").clicked() {
+            events.push(SettingsEvent::RetryDictionaries);
+        }
     }
 
     /// Session restore switch.
@@ -676,17 +752,13 @@ impl SettingsWindow {
         settings: &mut Settings,
         events: &mut Vec<SettingsEvent>,
     ) {
-        egui::CollapsingHeader::new("Session")
-            .default_open(true)
-            .show(ui, |ui| {
-                changed(
-                    ui.checkbox(
-                        &mut settings.restore_session,
-                        "Reopen files from the last session",
-                    ),
-                    events,
-                );
-            });
+        changed(
+            ui.checkbox(
+                &mut settings.restore_session,
+                "Reopen files from the last session",
+            ),
+            events,
+        );
     }
 
     /// The key binding grid with capture buttons, the conflict prompt and the reset button.
@@ -696,24 +768,20 @@ impl SettingsWindow {
         keymap: &mut Keymap,
         events: &mut Vec<SettingsEvent>,
     ) {
-        egui::CollapsingHeader::new("Key bindings")
-            .default_open(true)
+        egui::Grid::new("fed_settings_keys")
+            .num_columns(3)
+            .striped(true)
             .show(ui, |ui| {
-                egui::Grid::new("fed_settings_keys")
-                    .num_columns(3)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for action in Action::ALL {
-                            self.key_row(ui, *action, keymap, events);
-                        }
-                    });
-                if ui.button("Reset to defaults").clicked() {
-                    keymap.reset();
-                    self.stop_capture();
-                    self.pending_conflict = None;
-                    events.extend([SettingsEvent::KeymapChanged, SettingsEvent::Changed]);
+                for action in Action::ALL {
+                    self.key_row(ui, *action, keymap, events);
                 }
             });
+        if ui.button("Reset to defaults").clicked() {
+            keymap.reset();
+            self.stop_capture();
+            self.pending_conflict = None;
+            events.extend([SettingsEvent::KeymapChanged, SettingsEvent::Changed]);
+        }
     }
 
     /// One key binding row, followed by the conflict prompt when it concerns `action`.
@@ -954,6 +1022,19 @@ mod tests {
         debounce.schedule(start);
         debounce.cancel();
         assert!(!debounce.take_due(start + SAVE_DEBOUNCE));
+    }
+
+    #[test]
+    fn leaving_key_bindings_stops_capture() {
+        let mut window = SettingsWindow::new();
+        window.open = true;
+        window.select_section(SettingsSection::Keys);
+        window.capture = Some(Action::NewTab);
+        window.select_section(SettingsSection::Keys);
+        assert!(window.is_capturing(), "same section keeps the capture");
+        window.select_section(SettingsSection::Editor);
+        assert!(!window.is_capturing());
+        assert_eq!(window.section, SettingsSection::Editor);
     }
 
     #[test]
