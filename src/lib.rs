@@ -13,6 +13,7 @@ pub mod spell;
 pub mod tab;
 pub mod text_nav;
 pub mod view;
+pub mod vim;
 
 use std::path::PathBuf;
 
