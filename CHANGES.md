@@ -28,3 +28,5 @@
 - Tab bar restyle: tabs are drawn by `draw_tab` (`src/app.rs`) with a flat look, a blue accent line on top of the selected tab, thin separators, and a painted close "x" (shown on the selected or hovered tab; a modified tab shows a dot that turns into the "x" on hover).
 - "Preview" button moved to the right of the tab bar, wider (110 px) with slightly rounded corners (`draw_preview_button`); tabs scroll in the remaining space.
 - Tab bar fix: tabs stay left-aligned; the scroll area takes the width minus the Preview button, which sits at the right edge.
+- Added "Markdown preview" settings section: `preview_font_family` and `preview_font_size` (new `preview` egui font family aliasing the proportional fonts; headings scale from the base size).
+- Fixed syntax highlighting of `.ts`/`.tsx` files: syntaxes now come from the `two-face` extra pack instead of syntect's defaults.

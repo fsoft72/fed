@@ -13,7 +13,7 @@ use crate::buffer::{Buffer, LineEnding};
 use crate::config::{self, ConfigPaths, Session, Settings, UiTheme};
 use crate::editing::{EditCommand, EditSettings};
 use crate::find_bar::{BarMode, FindBar, MatchDecorator};
-use crate::fonts::{self, FontCatalog, FontLoad};
+use crate::fonts::{self, FontCatalog, FontLoad, LoadedFont};
 use crate::highlight::{AssetsHandle, HighlightAssets, HighlightDecorator};
 use crate::keymap::{Action, KeyChord, Keymap};
 use crate::markdown::{self, Preview};
@@ -44,6 +44,15 @@ const TAB_CLOSE_SIZE: f32 = 20.0;
 /// Accent line drawn on top of the selected tab.
 const TAB_ACCENT: egui::Color32 = egui::Color32::from_rgb(0, 122, 204);
 /// Thickness of the accent line.
+/// Which configurable font a load or apply refers to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FontSlot {
+    /// The editor font.
+    Editor,
+    /// The Markdown preview font.
+    Preview,
+}
+
 /// Width of the "Preview" button in the tab bar.
 const PREVIEW_BUTTON_WIDTH: f32 = 110.0;
 /// Corner radius of the "Preview" button.
@@ -321,6 +330,12 @@ pub struct FedApp {
     font_catalog: Option<FontCatalog>,
     /// Startup load of the configured editor font, until it finishes.
     font_load: Option<FontLoad>,
+    /// Startup load of the configured preview font, until it finishes.
+    preview_font_load: Option<FontLoad>,
+    /// The loaded editor font, if any.
+    editor_font: Option<LoadedFont>,
+    /// The loaded preview font, if any.
+    preview_font: Option<LoadedFont>,
     /// Deferred save of live (dragged) settings changes.
     settings_save: SaveDebounce,
     /// Process start time, while the first frame is still to be traced (`FED_TRACE_STARTUP`).
@@ -372,15 +387,21 @@ impl FedApp {
             settings_window: SettingsWindow::new(),
             font_catalog: None,
             font_load: None,
+            preview_font_load: None,
+            editor_font: None,
+            preview_font: None,
             settings_save: SaveDebounce::default(),
             startup_trace,
             link_error_tx,
             link_error_rx,
         };
         app.vim_applied = app.settings.vim_mode;
-        fonts::apply_editor_font(&cc.egui_ctx, None, None);
+        fonts::apply_fonts(&cc.egui_ctx, None, None);
         if let Some(family) = &app.settings.font_family {
             app.font_load = Some(FontLoad::spawn(cc.egui_ctx.clone(), family.clone()));
+        }
+        if let Some(family) = &app.settings.preview_font_family {
+            app.preview_font_load = Some(FontLoad::spawn(cc.egui_ctx.clone(), family.clone()));
         }
         egui_extras::install_image_loaders(&cc.egui_ctx);
         app.apply_theme(&cc.egui_ctx);
@@ -744,12 +765,13 @@ impl FedApp {
             return;
         }
         let half = ui.available_width() / 2.0;
+        let font_size = self.settings.preview_font_size;
         egui::Panel::right("fed_preview")
             .resizable(true)
             .default_size(half)
             .show(ui, |ui| {
                 let preview = tab.preview.get_or_insert_with(Preview::new);
-                preview.show(ui, &tab.buffer);
+                preview.show(ui, &tab.buffer, font_size);
             });
     }
 
@@ -1047,7 +1069,8 @@ impl FedApp {
                 SettingsEvent::Changed | SettingsEvent::KeymapChanged => save = true,
                 SettingsEvent::ChangedLive => self.settings_save.schedule(Instant::now()),
                 SettingsEvent::CommitLive => save |= self.settings_save.is_pending(),
-                SettingsEvent::FontChanged => self.load_editor_font(ctx),
+                SettingsEvent::FontChanged => self.load_font(ctx, FontSlot::Editor),
+                SettingsEvent::PreviewFontChanged => self.load_font(ctx, FontSlot::Preview),
                 SettingsEvent::RetryDictionaries => {
                     if let Some(service) = &mut self.spell {
                         service.retry();
@@ -1125,46 +1148,71 @@ impl FedApp {
         );
     }
 
-    /// Applies `settings.font_family` from the font catalog; an unknown family falls back to
-    /// the default font with a status bar warning. Cancels a pending startup load.
-    fn load_editor_font(&mut self, ctx: &egui::Context) {
-        self.font_load = None;
-        let Some(family) = self.settings.font_family.clone() else {
-            fonts::apply_editor_font(ctx, None, None);
+    /// The configured family of a font slot.
+    fn slot_family(&self, slot: FontSlot) -> Option<String> {
+        match slot {
+            FontSlot::Editor => self.settings.font_family.clone(),
+            FontSlot::Preview => self.settings.preview_font_family.clone(),
+        }
+    }
+
+    /// Applies the configured family of `slot` from the font catalog; an unknown family falls
+    /// back to the default font with a status bar warning. Cancels a pending startup load.
+    fn load_font(&mut self, ctx: &egui::Context, slot: FontSlot) {
+        match slot {
+            FontSlot::Editor => self.font_load = None,
+            FontSlot::Preview => self.preview_font_load = None,
+        }
+        let Some(family) = self.slot_family(slot) else {
+            self.apply_loaded_font(ctx, slot, "", None);
             return;
         };
         let font = self
             .font_catalog
             .as_ref()
             .and_then(|c| c.load_family_font(&family));
-        self.apply_loaded_font(ctx, &family, font);
+        self.apply_loaded_font(ctx, slot, &family, font);
     }
 
-    /// Applies the result of the startup font load once it is ready.
+    /// Applies the results of the startup font loads once they are ready.
     fn poll_font_load(&mut self, ctx: &egui::Context) {
-        let Some(load) = &self.font_load else { return };
-        let Some(font) = load.take() else { return };
-        let family = load.family().to_string();
-        self.font_load = None;
-        self.apply_loaded_font(ctx, &family, font);
+        for slot in [FontSlot::Editor, FontSlot::Preview] {
+            let pending = match slot {
+                FontSlot::Editor => &self.font_load,
+                FontSlot::Preview => &self.preview_font_load,
+            };
+            let Some(load) = pending else { continue };
+            let Some(font) = load.take() else { continue };
+            let family = load.family().to_string();
+            match slot {
+                FontSlot::Editor => self.font_load = None,
+                FontSlot::Preview => self.preview_font_load = None,
+            }
+            self.apply_loaded_font(ctx, slot, &family, font);
+        }
     }
 
-    /// Installs `font` as the editor font, or the default font plus a warning when the
-    /// family `family` was not found.
+    /// Installs `font` in `slot`, or the default font plus a warning when the family
+    /// `family` was not found (an empty `family` means "default", without a warning).
     fn apply_loaded_font(
         &mut self,
         ctx: &egui::Context,
+        slot: FontSlot,
         family: &str,
         font: Option<egui::FontData>,
     ) {
-        if font.is_none() {
+        if font.is_none() && !family.is_empty() {
             self.set_status(
                 format!("font '{family}' not found, using the default font"),
                 Severity::Warning,
             );
         }
-        let name = font.as_ref().map(|_| family);
-        fonts::apply_editor_font(ctx, name, font);
+        let loaded = font.map(|f| (family.to_string(), f));
+        match slot {
+            FontSlot::Editor => self.editor_font = loaded,
+            FontSlot::Preview => self.preview_font = loaded,
+        }
+        fonts::apply_fonts(ctx, self.editor_font.as_ref(), self.preview_font.as_ref());
     }
 
     /// Shows `text` in the vim command bar, in the error color when `error`.

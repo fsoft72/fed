@@ -24,6 +24,8 @@ const FONT_LIST_HEIGHT: f32 = 300.0;
 const COMBO_WIDTH: f32 = 260.0;
 /// Combo box text for "no custom font".
 const DEFAULT_FONT_LABEL: &str = "Default (Hack)";
+/// Combo entry that selects the built-in proportional font for the preview.
+const PREVIEW_DEFAULT_FONT_LABEL: &str = "Default";
 /// Button text while waiting for a key chord.
 const CAPTURE_PROMPT: &str = "Press keys... (Esc to cancel)";
 /// Chord column text of an action without a binding.
@@ -44,10 +46,61 @@ pub enum SettingsEvent {
     CommitLive,
     /// The editor font family changed: load and apply it.
     FontChanged,
+    /// The preview font family changed: load and apply it.
+    PreviewFontChanged,
     /// A key binding changed.
     KeymapChanged,
     /// The user asked to download the spelling dictionaries again.
     RetryDictionaries,
+}
+
+/// Draws a font family combo box ("default" plus the scanned families whose lowercase name
+/// contains `filter`, only monospaced ones when `monospace_only`). Returns true when the
+/// selection in `current` changed.
+fn family_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    current: &mut Option<String>,
+    default_label: &str,
+    families: Option<crate::fonts::FamilyList>,
+    filter: &str,
+    monospace_only: bool,
+) -> bool {
+    let selected = current
+        .clone()
+        .unwrap_or_else(|| default_label.to_string());
+    let mut choice: Option<Option<String>> = None;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .width(COMBO_WIDTH)
+        .height(FONT_LIST_HEIGHT)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(current.is_none(), default_label)
+                .clicked()
+            {
+                choice = Some(None);
+            }
+            let Some(families) = &families else {
+                ui.label("scanning fonts...");
+                return;
+            };
+            let visible = families.iter().filter(|(name, mono)| {
+                (*mono || !monospace_only) && name.to_lowercase().contains(filter)
+            });
+            for (name, _) in visible {
+                let is_current = current.as_deref() == Some(name.as_str());
+                if ui.selectable_label(is_current, name).clicked() {
+                    choice = Some(Some(name.clone()));
+                }
+            }
+        });
+    let Some(choice) = choice else { return false };
+    if choice == *current {
+        return false;
+    }
+    *current = choice;
+    true
 }
 
 /// Outcome of a key capture.
@@ -208,6 +261,8 @@ pub struct SettingsWindow {
     font_filter: String,
     /// Show only monospaced font families.
     monospace_only: bool,
+    /// Text filter of the preview font family list.
+    preview_font_filter: String,
     /// Layer of the window as last drawn, to tell whether it owns the keyboard focus.
     layer: Option<egui::LayerId>,
 }
@@ -222,6 +277,7 @@ impl Default for SettingsWindow {
             pending_conflict: None,
             font_filter: String::new(),
             monospace_only: true,
+            preview_font_filter: String::new(),
             layer: None,
         }
     }
@@ -369,6 +425,7 @@ impl SettingsWindow {
                     .show(ui, |ui| {
                         self.editor_section(ui, settings, fonts, &mut events);
                         self.appearance_section(ui, settings, theme_names, &mut events);
+                        self.preview_section(ui, settings, fonts, &mut events);
                         self.vim_section(ui, settings, &mut events);
                         self.spell_section(ui, settings, spell, &mut events);
                         self.session_section(ui, settings, &mut events);
@@ -443,7 +500,7 @@ impl SettingsWindow {
             });
     }
 
-    /// The font family combo box: "Default" plus the scanned families matching the filter.
+    /// The editor font family combo box: "Default" plus the scanned families matching the filter.
     fn font_combo(
         &mut self,
         ui: &mut egui::Ui,
@@ -451,44 +508,70 @@ impl SettingsWindow {
         fonts: &FontCatalog,
         events: &mut Vec<SettingsEvent>,
     ) {
-        let families = fonts.families();
-        let selected = settings
-            .font_family
-            .clone()
-            .unwrap_or_else(|| DEFAULT_FONT_LABEL.to_string());
         let filter = self.font_filter.to_lowercase();
-        let mut choice: Option<Option<String>> = None;
-        egui::ComboBox::from_id_salt("fed_settings_font")
-            .selected_text(selected)
-            .width(COMBO_WIDTH)
-            .height(FONT_LIST_HEIGHT)
-            .show_ui(ui, |ui| {
-                if ui
-                    .selectable_label(settings.font_family.is_none(), DEFAULT_FONT_LABEL)
-                    .clicked()
-                {
-                    choice = Some(None);
-                }
-                let Some(families) = &families else {
-                    ui.label("scanning fonts...");
-                    return;
-                };
-                let visible = families.iter().filter(|(name, mono)| {
-                    (*mono || !self.monospace_only) && name.to_lowercase().contains(&filter)
-                });
-                for (name, _) in visible {
-                    let current = settings.font_family.as_deref() == Some(name.as_str());
-                    if ui.selectable_label(current, name).clicked() {
-                        choice = Some(Some(name.clone()));
-                    }
-                }
-            });
-        let Some(choice) = choice else { return };
-        if choice == settings.font_family {
-            return;
+        let changed = family_combo(
+            ui,
+            "fed_settings_font",
+            &mut settings.font_family,
+            DEFAULT_FONT_LABEL,
+            fonts.families(),
+            &filter,
+            self.monospace_only,
+        );
+        if changed {
+            events.extend([SettingsEvent::FontChanged, SettingsEvent::Changed]);
         }
-        settings.font_family = choice;
-        events.extend([SettingsEvent::FontChanged, SettingsEvent::Changed]);
+    }
+
+    /// Font family and size of the Markdown preview.
+    fn preview_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        settings: &mut Settings,
+        fonts: &FontCatalog,
+        events: &mut Vec<SettingsEvent>,
+    ) {
+        egui::CollapsingHeader::new("Markdown preview")
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new("fed_settings_preview")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("Font family");
+                        let filter = self.preview_font_filter.to_lowercase();
+                        let changed = family_combo(
+                            ui,
+                            "fed_settings_preview_font",
+                            &mut settings.preview_font_family,
+                            PREVIEW_DEFAULT_FONT_LABEL,
+                            fonts.families(),
+                            &filter,
+                            false,
+                        );
+                        if changed {
+                            events.extend([
+                                SettingsEvent::PreviewFontChanged,
+                                SettingsEvent::Changed,
+                            ]);
+                        }
+                        ui.end_row();
+
+                        ui.label("");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.preview_font_filter)
+                                .hint_text("filter fonts")
+                                .desired_width(140.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("Font size");
+                        let size = egui::DragValue::new(&mut settings.preview_font_size)
+                            .range(FONT_SIZE_RANGE)
+                            .speed(0.5);
+                        drag_changed(ui.add(size), events);
+                        ui.end_row();
+                    });
+            });
     }
 
     /// UI theme and the syntax themes for light and dark mode.

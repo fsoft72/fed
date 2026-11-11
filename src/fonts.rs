@@ -2,7 +2,8 @@
 //!
 //! The editor and the vim command bar always draw with `FontFamily::Name("editor")`. That
 //! family aliases egui's bundled monospace font until a system font is loaded and placed in
-//! front of it, so the editor works before (and without) any font scan.
+//! front of it, so the editor works before (and without) any font scan. The Markdown preview
+//! has the same kind of family, `FontFamily::Name("preview")`, aliasing the proportional fonts.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -19,35 +20,68 @@ pub fn editor_font_id(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(EDITOR_FAMILY.into()))
 }
 
-/// Builds egui's default font definitions plus the editor family: the loaded `font` (named
-/// after `family_name`) first, egui's default monospace fonts as fallback. Without a font the
-/// editor family is just the default monospace list.
-pub fn editor_font_definitions(
-    family_name: Option<&str>,
-    font: Option<FontData>,
+/// Name of the egui font family used by the Markdown preview.
+pub const PREVIEW_FAMILY: &str = "preview";
+/// Prefix of the `FontDefinitions::font_data` key of a loaded preview font.
+const PREVIEW_FONT_KEY_PREFIX: &str = "fed-preview:";
+
+/// A loaded system font: the family name and its font data.
+pub type LoadedFont = (String, FontData);
+
+/// Returns the font id of the preview family at `size` points.
+pub fn preview_font_id(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(PREVIEW_FAMILY.into()))
+}
+
+/// Registers the family `alias` in `defs`: the loaded `font` first (keyed with `key_prefix`),
+/// then the `fallback` family of egui's defaults.
+fn add_family(
+    defs: &mut FontDefinitions,
+    alias: &str,
+    key_prefix: &str,
+    font: Option<&LoadedFont>,
+    fallback: FontFamily,
+) {
+    let base = defs.families.get(&fallback).cloned().unwrap_or_default();
+    let mut list = Vec::with_capacity(base.len() + 1);
+    if let Some((name, data)) = font {
+        let key = format!("{key_prefix}{name}");
+        defs.font_data.insert(key.clone(), Arc::new(data.clone()));
+        list.push(key);
+    }
+    list.extend(base);
+    defs.families.insert(FontFamily::Name(alias.into()), list);
+}
+
+/// Builds egui's default font definitions plus the editor and preview families. The editor
+/// family is the loaded editor font in front of egui's monospace fonts; the preview family is
+/// the loaded preview font in front of egui's proportional fonts. Without a font, a family
+/// just aliases its defaults.
+pub fn font_definitions(
+    editor: Option<&LoadedFont>,
+    preview: Option<&LoadedFont>,
 ) -> FontDefinitions {
     let mut defs = FontDefinitions::default();
-    let monospace = defs
-        .families
-        .get(&FontFamily::Monospace)
-        .cloned()
-        .unwrap_or_default();
-    let mut editor = Vec::with_capacity(monospace.len() + 1);
-    if let (Some(name), Some(font)) = (family_name, font) {
-        let key = format!("{EDITOR_FONT_KEY_PREFIX}{name}");
-        defs.font_data.insert(key.clone(), Arc::new(font));
-        editor.push(key);
-    }
-    editor.extend(monospace);
-    defs.families
-        .insert(FontFamily::Name(EDITOR_FAMILY.into()), editor);
+    add_family(
+        &mut defs,
+        EDITOR_FAMILY,
+        EDITOR_FONT_KEY_PREFIX,
+        editor,
+        FontFamily::Monospace,
+    );
+    add_family(
+        &mut defs,
+        PREVIEW_FAMILY,
+        PREVIEW_FONT_KEY_PREFIX,
+        preview,
+        FontFamily::Proportional,
+    );
     defs
 }
 
-/// Installs the editor family in `ctx` (see `editor_font_definitions`). `None` for either
-/// argument makes the editor family alias the bundled monospace font.
-pub fn apply_editor_font(ctx: &egui::Context, family_name: Option<&str>, font: Option<FontData>) {
-    ctx.set_fonts(editor_font_definitions(family_name, font));
+/// Installs the editor and preview families in `ctx` (see `font_definitions`).
+pub fn apply_fonts(ctx: &egui::Context, editor: Option<&LoadedFont>, preview: Option<&LoadedFont>) {
+    ctx.set_fonts(font_definitions(editor, preview));
 }
 
 /// Loads the system fonts into a new database (slow: call off the UI thread).
@@ -192,23 +226,28 @@ mod tests {
     }
 
     #[test]
-    fn editor_family_aliases_monospace_without_font() {
-        let defs = editor_font_definitions(None, None);
+    fn families_alias_defaults_without_fonts() {
+        let defs = font_definitions(None, None);
         let editor = &defs.families[&FontFamily::Name(EDITOR_FAMILY.into())];
         assert_eq!(editor, &defs.families[&FontFamily::Monospace]);
-        let defs = editor_font_definitions(Some("Missing"), None);
-        let editor = &defs.families[&FontFamily::Name(EDITOR_FAMILY.into())];
-        assert_eq!(editor, &defs.families[&FontFamily::Monospace]);
+        let preview = &defs.families[&FontFamily::Name(PREVIEW_FAMILY.into())];
+        assert_eq!(preview, &defs.families[&FontFamily::Proportional]);
     }
 
     #[test]
-    fn loaded_font_comes_first_with_monospace_fallback() {
+    fn loaded_fonts_come_first_with_default_fallback() {
         let font = family_font(&hack_database(), HACK).unwrap();
-        let defs = editor_font_definitions(Some("My Mono"), Some(font));
+        let editor_font = ("My Mono".to_string(), font.clone());
+        let preview_font = ("My Serif".to_string(), font);
+        let defs = font_definitions(Some(&editor_font), Some(&preview_font));
         let editor = &defs.families[&FontFamily::Name(EDITOR_FAMILY.into())];
         assert_eq!(editor[0], "fed-editor:My Mono");
         assert!(defs.font_data.contains_key("fed-editor:My Mono"));
         assert_eq!(&editor[1..], &defs.families[&FontFamily::Monospace][..]);
+        let preview = &defs.families[&FontFamily::Name(PREVIEW_FAMILY.into())];
+        assert_eq!(preview[0], "fed-preview:My Serif");
+        assert!(defs.font_data.contains_key("fed-preview:My Serif"));
+        assert_eq!(&preview[1..], &defs.families[&FontFamily::Proportional][..]);
     }
 
     #[test]

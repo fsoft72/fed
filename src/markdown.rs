@@ -183,6 +183,31 @@ fn absolute_base_dir(path: Option<&Path>) -> PathBuf {
     })
 }
 
+/// Heading size relative to the preview base font size.
+const HEADING_SCALE: f32 = 1.6;
+/// Small text size relative to the preview base font size.
+const SMALL_SCALE: f32 = 0.8;
+
+/// Points the text styles of `style` at the preview family, sized from `base` points. The
+/// monospace style (code) keeps its own font and only follows the size.
+fn apply_preview_fonts(style: &mut egui::Style, base: f32) {
+    use egui::TextStyle;
+    let sizes = [
+        (TextStyle::Body, base),
+        (TextStyle::Button, base),
+        (TextStyle::Heading, base * HEADING_SCALE),
+        (TextStyle::Small, base * SMALL_SCALE),
+    ];
+    for (text_style, size) in sizes {
+        style
+            .text_styles
+            .insert(text_style, crate::fonts::preview_font_id(size));
+    }
+    if let Some(mono) = style.text_styles.get_mut(&TextStyle::Monospace) {
+        mono.size = base;
+    }
+}
+
 /// Rendered-preview state of one tab: the Markdown render cache and the last prepared source.
 pub struct Preview {
     /// Render cache of egui_commonmark (images, layout).
@@ -209,7 +234,8 @@ impl Preview {
 
     /// Draws the rendered Markdown of `buf` inside a scroll area. The text is re-read and
     /// image paths are rewritten only when the buffer revision changed.
-    pub fn show(&mut self, ui: &mut egui::Ui, buf: &Buffer) {
+    pub fn show(&mut self, ui: &mut egui::Ui, buf: &Buffer, font_size: f32) {
+        apply_preview_fonts(ui.style_mut(), font_size);
         if self.source.0 != buf.revision() {
             let base = absolute_base_dir(buf.path());
             self.source = (

@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_FONT_SIZE: f32 = 14.0;
 /// Allowed font size range in points.
 const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 6.0..=72.0;
+/// Default Markdown preview font size in points.
+const DEFAULT_PREVIEW_FONT_SIZE: f32 = 14.0;
 /// Default tab width in columns.
 const DEFAULT_TAB_WIDTH: usize = 4;
 /// Allowed tab width range in columns.
@@ -50,6 +52,11 @@ pub struct Settings {
     pub font_family: Option<String>,
     /// Font size in points (6..=72).
     pub font_size: f32,
+    /// Markdown preview font family name; `None` uses the built-in proportional font.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_font_family: Option<String>,
+    /// Markdown preview base font size in points (6..=72).
+    pub preview_font_size: f32,
     /// Tab width in columns (1..=16).
     pub tab_width: usize,
     /// Insert spaces instead of tab characters.
@@ -80,6 +87,8 @@ impl Default for Settings {
         Settings {
             font_family: None,
             font_size: DEFAULT_FONT_SIZE,
+            preview_font_family: None,
+            preview_font_size: DEFAULT_PREVIEW_FONT_SIZE,
             tab_width: DEFAULT_TAB_WIDTH,
             insert_spaces: true,
             line_numbers: true,
@@ -167,6 +176,10 @@ impl Settings {
         match key {
             "font_family" => self.font_family = Some(convert(key, value)?),
             "font_size" => self.font_size = convert_f32(key, value, &FONT_SIZE_RANGE)?,
+            "preview_font_family" => self.preview_font_family = Some(convert(key, value)?),
+            "preview_font_size" => {
+                self.preview_font_size = convert_f32(key, value, &FONT_SIZE_RANGE)?
+            }
             "tab_width" => self.tab_width = convert_usize(key, value, &TAB_WIDTH_RANGE)?,
             "insert_spaces" => self.insert_spaces = convert(key, value)?,
             "line_numbers" => self.line_numbers = convert(key, value)?,
@@ -312,6 +325,19 @@ mod tests {
         let (def, warnings) = Settings::from_toml_str(&Settings::default().to_toml_string());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(def, Settings::default());
+    }
+
+    #[test]
+    fn preview_font_settings_roundtrip_and_validate() {
+        let mut s = Settings::default();
+        s.preview_font_family = Some("Georgia".into());
+        s.preview_font_size = 18.0;
+        let (back, warnings) = Settings::from_toml_str(&s.to_toml_string());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(back, s);
+        let (d, warnings) = Settings::from_toml_str("preview_font_size = 500\n");
+        assert_eq!(d.preview_font_size, 14.0);
+        assert!(warnings.iter().any(|w| w.contains("preview_font_size")));
     }
 
     #[test]

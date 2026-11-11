@@ -42,7 +42,7 @@ impl HighlightAssets {
     /// Loads the bundled syntaxes and themes (slow: call off the UI thread).
     pub fn load() -> HighlightAssets {
         HighlightAssets {
-            syntaxes: SyntaxSet::load_defaults_newlines(),
+            syntaxes: two_face::syntax::extra_newlines(),
             themes: ThemeSet::load_defaults(),
         }
     }
@@ -378,6 +378,13 @@ impl Decorator for HighlightDecorator<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typescript_extension_has_a_syntax() {
+        let assets = HighlightAssets::load();
+        assert!(assets.syntaxes.find_syntax_by_extension("ts").is_some());
+        assert!(assets.syntaxes.find_syntax_by_extension("tsx").is_some());
+    }
+
     use super::*;
 
     /// Loads the assets synchronously for tests.
