@@ -1,6 +1,7 @@
 //! Application shell: tabs, file dialogs, shortcuts, status bar and session handling.
 
 mod dialogs;
+mod menu;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use crate::tab::Tab;
 use crate::view::{self, KeyHandler, ViewOptions};
 use crate::vim::{Mode, VimEffect, VimKey, VimState};
 use dialogs::Pending;
+use menu::MenuChoice;
 
 /// How long a status bar message stays visible.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -272,6 +274,8 @@ enum TabBarAction {
     Close(usize),
     /// Toggle the Markdown preview of the active tab.
     TogglePreview,
+    /// An entry of the application menu was picked.
+    Menu(MenuChoice),
 }
 
 /// The spelling suggestions popup opened by a right click on a misspelled word.
@@ -320,6 +324,8 @@ pub struct FedApp {
     spell_menu: Option<SpellMenu>,
     /// Set once the user agreed to close the window, so the close is not intercepted again.
     allow_close: bool,
+    /// True while the About dialog is shown.
+    about_open: bool,
     /// Vim mode state the tabs were last set up for (to react to settings changes).
     vim_applied: bool,
     /// Last vim message or error, shown in the command bar.
@@ -382,6 +388,7 @@ impl FedApp {
             spell: None,
             spell_menu: None,
             allow_close: false,
+            about_open: false,
             vim_applied: false,
             vim_message: None,
             settings_window: SettingsWindow::new(),
@@ -785,12 +792,13 @@ impl FedApp {
         let mut action = None;
         egui::Panel::top("fed_tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Reserve room for the Preview button on the right; tabs scroll in the rest.
-                let reserved = if preview_state.is_some() {
-                    PREVIEW_BUTTON_WIDTH + ui.spacing().item_spacing.x
-                } else {
-                    0.0
-                };
+                // Reserve room for the Preview and menu buttons on the right; tabs scroll in
+                // the rest.
+                let spacing = ui.spacing().item_spacing.x;
+                let mut reserved = menu::MENU_BUTTON_SIZE + spacing;
+                if preview_state.is_some() {
+                    reserved += PREVIEW_BUTTON_WIDTH + spacing;
+                }
                 let tabs_width = (ui.available_width() - reserved).max(0.0);
                 egui::ScrollArea::horizontal()
                     .max_width(tabs_width)
@@ -812,6 +820,9 @@ impl FedApp {
                     && draw_preview_button(ui, open)
                 {
                     action = Some(TabBarAction::TogglePreview);
+                }
+                if let Some(choice) = menu::hamburger_menu(ui, &self.keymap) {
+                    action = Some(TabBarAction::Menu(choice));
                 }
             });
         });
@@ -1215,6 +1226,27 @@ impl FedApp {
         fonts::apply_fonts(ctx, self.editor_font.as_ref(), self.preview_font.as_ref());
     }
 
+    /// Carries out an entry picked in the application menu.
+    fn run_menu_choice(&mut self, ctx: &egui::Context, choice: MenuChoice) {
+        match choice {
+            MenuChoice::Action(action) => self.dispatch(ctx, action),
+            MenuChoice::About => self.about_open = true,
+            // Goes through the regular close request, which asks about unsaved files.
+            MenuChoice::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    /// Shows the About dialog while it is open.
+    fn show_about(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        if menu::show_about(ctx) {
+            self.about_open = false;
+            self.tabs[self.active].focus_editor();
+        }
+    }
+
     /// Shows `text` in the vim command bar, in the error color when `error`.
     fn set_vim_message(&mut self, text: String, error: bool) {
         self.vim_message = Some(VimMessage { text, error });
@@ -1369,6 +1401,7 @@ impl eframe::App for FedApp {
             Some(TabBarAction::Activate(i)) => self.activate(i),
             Some(TabBarAction::Close(i)) => self.request_close_tab(&ctx, i),
             Some(TabBarAction::TogglePreview) => self.toggle_preview(),
+            Some(TabBarAction::Menu(choice)) => self.run_menu_choice(&ctx, choice),
             None => {}
         }
         self.status_bar(ui);
@@ -1488,6 +1521,7 @@ impl eframe::App for FedApp {
         }
         self.show_spell_menu(&ctx);
         self.show_settings(&ctx);
+        self.show_about(&ctx);
         self.show_dialogs(&ctx);
         self.flush_settings_save(&ctx);
         self.open_links(&ctx);
