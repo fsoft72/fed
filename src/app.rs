@@ -36,7 +36,15 @@ const UNTITLED: &str = "untitled";
 const PREVIEW_UNAVAILABLE: &str = "preview is only available for Markdown";
 /// Suffix of a tab label when the buffer has unsaved changes. Drawn with the monospace
 /// font because the default proportional fonts have no glyph for it.
-const MODIFIED_LABEL_SUFFIX: &str = " ●";
+const TAB_HEIGHT: f32 = 32.0;
+/// Horizontal padding inside a tab.
+const TAB_PADDING: f32 = 14.0;
+/// Size of the close button hit area of a tab.
+const TAB_CLOSE_SIZE: f32 = 20.0;
+/// Accent line drawn on top of the selected tab.
+const TAB_ACCENT: egui::Color32 = egui::Color32::from_rgb(0, 122, 204);
+/// Thickness of the accent line.
+const TAB_ACCENT_HEIGHT: f32 = 2.0;
 /// Suffix of the status text when the buffer has unsaved changes.
 const MODIFIED_STATUS_SUFFIX: &str = "  [+]";
 /// Fixed, non-configurable alias for Redo.
@@ -752,25 +760,14 @@ impl FedApp {
         egui::Panel::top("fed_tabs").show(ui, |ui| {
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
                     for (i, tab) in self.tabs.iter().enumerate() {
-                        let mut label = egui::Atoms::new(tab.buffer.display_name());
-                        if tab.buffer.is_modified() {
-                            label
-                                .push_right(egui::RichText::new(MODIFIED_LABEL_SUFFIX).monospace());
+                        if let Some(tab_action) = draw_tab(ui, tab, i == self.active) {
+                            action = Some(match tab_action {
+                                TabClick::Activate => TabBarAction::Activate(i),
+                                TabClick::Close => TabBarAction::Close(i),
+                            });
                         }
-                        let resp = ui
-                            .selectable_label(i == self.active, label)
-                            .on_hover_text(tab_path(tab));
-                        if resp.clicked() {
-                            action = Some(TabBarAction::Activate(i));
-                        }
-                        if resp.middle_clicked() {
-                            action = Some(TabBarAction::Close(i));
-                        }
-                        if ui.small_button("x").on_hover_text("Close tab").clicked() {
-                            action = Some(TabBarAction::Close(i));
-                        }
-                        ui.separator();
                     }
                     if let Some(open) = preview_state
                         && ui.selectable_label(open, "Preview").clicked()
@@ -1629,4 +1626,103 @@ mod tests {
             .handle_key(VimKey::Char('u'), &mut tab.buffer, &mut tab.editor, &SET);
         assert!(!close_requires_confirmation(&tab), "`:q` may close");
     }
+}
+
+/// What the user did on a single tab.
+enum TabClick {
+    Activate,
+    Close,
+}
+
+/// Draws one tab (label, close button, accent line when selected) and returns the click, if any.
+fn draw_tab(ui: &mut egui::Ui, tab: &Tab, selected: bool) -> Option<TabClick> {
+    let visuals = ui.visuals().clone();
+    let text_color = if selected {
+        visuals.strong_text_color()
+    } else {
+        visuals.weak_text_color()
+    };
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let galley =
+        ui.painter()
+            .layout_no_wrap(tab.buffer.display_name().to_string(), font, text_color);
+    let width =
+        TAB_PADDING + galley.size().x + TAB_PADDING / 2.0 + TAB_CLOSE_SIZE + TAB_PADDING / 2.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, TAB_HEIGHT), egui::Sense::click());
+    let resp = resp.on_hover_text(tab_path(tab));
+    let mut result = None;
+    if resp.clicked() {
+        result = Some(TabClick::Activate);
+    }
+    if resp.middle_clicked() {
+        result = Some(TabClick::Close);
+    }
+    let bg = if selected {
+        visuals.extreme_bg_color
+    } else {
+        visuals.panel_fill
+    };
+    let bg = if !selected && resp.hovered() {
+        visuals.faint_bg_color
+    } else {
+        bg
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, bg);
+    if selected {
+        let line = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), TAB_ACCENT_HEIGHT));
+        painter.rect_filled(line, 0.0, TAB_ACCENT);
+    }
+    painter.vline(
+        rect.right(),
+        rect.y_range(),
+        egui::Stroke::new(1.0, visuals.window_stroke.color),
+    );
+    painter.galley(
+        egui::pos2(
+            rect.left() + TAB_PADDING,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        text_color,
+    );
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.right() - TAB_PADDING / 2.0 - TAB_CLOSE_SIZE / 2.0,
+            rect.center().y,
+        ),
+        egui::Vec2::splat(TAB_CLOSE_SIZE),
+    );
+    let close_resp = ui
+        .interact(
+            close_rect,
+            egui::Id::unique(("fed_tab_close", tab.id)),
+            egui::Sense::click(),
+        )
+        .on_hover_text("Close tab");
+    if close_resp.clicked() {
+        result = Some(TabClick::Close);
+    }
+    let modified = tab.buffer.is_modified();
+    let show_x = close_resp.hovered() || (!modified && (selected || resp.hovered()));
+    let painter = ui.painter();
+    if close_resp.hovered() {
+        painter.rect_filled(close_rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
+    }
+    if show_x {
+        let half = 4.0;
+        let c = close_rect.center();
+        let stroke = egui::Stroke::new(1.3, visuals.strong_text_color());
+        painter.line_segment(
+            [c + egui::vec2(-half, -half), c + egui::vec2(half, half)],
+            stroke,
+        );
+        painter.line_segment(
+            [c + egui::vec2(-half, half), c + egui::vec2(half, -half)],
+            stroke,
+        );
+    } else if modified {
+        painter.circle_filled(close_rect.center(), 3.5, text_color);
+    }
+    result
 }
