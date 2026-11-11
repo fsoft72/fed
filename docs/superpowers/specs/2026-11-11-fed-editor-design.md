@@ -1,7 +1,7 @@
 # fed - design
 
 Date: 2026-11-11
-Status: draft, awaiting user approval
+Status: approved
 
 ## 1. Intent and why
 
