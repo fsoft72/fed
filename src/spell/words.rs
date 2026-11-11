@@ -33,33 +33,122 @@ fn is_checkable(run: &[char]) -> bool {
     !run[1..].iter().any(|c| c.is_uppercase())
 }
 
-/// Returns the char ranges of checkable words in `text`. Words are runs of letters;
-/// apostrophes and other punctuation split them. Runs with digits or `_`, short ALL-CAPS
-/// acronyms and camelCase words are skipped.
-pub fn words(text: &str) -> Vec<Range<usize>> {
+/// One spell checked token: a word, or an apostrophe joined group of words ("don't").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Token {
+    /// Range of the whole `letters'letters` group; `None` for a single word.
+    pub whole: Option<Range<usize>>,
+    /// Checkable parts when the whole group is not accepted (the word itself for a
+    /// single word, the elision-split pieces such as "albero" in "l'albero" otherwise).
+    pub parts: Vec<Range<usize>>,
+}
+
+/// True for the apostrophes that join or split words.
+fn is_apostrophe(c: char) -> bool {
+    c == '\'' || c == '\u{2019}'
+}
+
+/// Returns the char ranges of bare URLs (`http://`, `https://`, `www.`, up to whitespace)
+/// and HTML entities (`&name;`), which are never spell checked.
+fn skip_ranges(chars: &[char]) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    let starts_with = |i: usize, p: &str| {
+        p.chars().enumerate().all(|(k, c)| {
+            chars
+                .get(i + k)
+                .is_some_and(|x| x.to_ascii_lowercase() == c)
+        })
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        let boundary = i == 0 || !chars[i - 1].is_alphanumeric();
+        let url = boundary
+            && (starts_with(i, "http://") || starts_with(i, "https://") || starts_with(i, "www."));
+        if url {
+            let end = chars[i..]
+                .iter()
+                .position(|c| c.is_whitespace())
+                .map_or(chars.len(), |n| i + n);
+            out.push(i..end);
+            i = end;
+            continue;
+        }
+        if chars[i] == '&' {
+            let body = chars[i + 1..]
+                .iter()
+                .take_while(|c| c.is_alphanumeric() || **c == '#')
+                .count();
+            if body > 0 && chars.get(i + 1 + body) == Some(&';') {
+                out.push(i..i + body + 2);
+                i += body + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Returns the checkable tokens of `text`. Words are runs of letters; punctuation splits
+/// them, and `letters'letters` groups keep their whole range so the caller can try the
+/// contraction first and the elision split second. Runs with digits or `_`, short ALL-CAPS
+/// acronyms, camelCase words, bare URLs and HTML entities are skipped.
+pub fn tokens(text: &str) -> Vec<Token> {
     let chars: Vec<char> = text.chars().collect();
+    let skip = skip_ranges(&chars);
     let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
+        if let Some(r) = skip.iter().find(|r| r.contains(&i)) {
+            i = r.end;
+            continue;
+        }
         if !is_run_char(chars[i]) {
             i += 1;
             continue;
         }
-        let start = i;
-        while i < chars.len() && is_run_char(chars[i]) {
+        let mut runs: Vec<Range<usize>> = Vec::new();
+        loop {
+            let start = i;
+            while i < chars.len() && is_run_char(chars[i]) {
+                i += 1;
+            }
+            runs.push(start..i);
+            let joined = i + 1 < chars.len()
+                && is_apostrophe(chars[i])
+                && is_run_char(chars[i + 1])
+                && !skip.iter().any(|r| r.contains(&(i + 1)));
+            if !joined {
+                break;
+            }
             i += 1;
         }
-        if is_checkable(&chars[start..i]) {
-            out.push(start..i);
+        let parts: Vec<Range<usize>> = runs
+            .iter()
+            .filter(|r| is_checkable(&chars[r.start..r.end]))
+            .cloned()
+            .collect();
+        let pure = runs
+            .iter()
+            .all(|r| chars[r.clone()].iter().all(|c| c.is_alphabetic()));
+        let whole = (runs.len() > 1 && pure).then(|| runs[0].start..runs[runs.len() - 1].end);
+        if whole.is_some() || !parts.is_empty() {
+            out.push(Token { whole, parts });
         }
     }
     out
 }
 
-/// Returns the char ranges (relative to `text`) of the words inside `ranges`, which are
-/// sorted char ranges of `text`.
-pub fn words_in_ranges(text: &str, ranges: &[Range<usize>]) -> Vec<Range<usize>> {
+/// Returns the char ranges of the words of `text` (the split parts of every token).
+pub fn words(text: &str) -> Vec<Range<usize>> {
+    tokens(text).into_iter().flat_map(|t| t.parts).collect()
+}
+
+/// Returns the tokens inside `ranges` (sorted char ranges of `text`), with ranges relative
+/// to `text`.
+pub fn tokens_in_ranges(text: &str, ranges: &[Range<usize>]) -> Vec<Token> {
     let chars: Vec<char> = text.chars().collect();
+    let shift = |r: Range<usize>, by: usize| r.start + by..r.end + by;
     let mut out = Vec::new();
     for r in ranges {
         let (start, end) = (r.start.min(chars.len()), r.end.min(chars.len()));
@@ -67,11 +156,10 @@ pub fn words_in_ranges(text: &str, ranges: &[Range<usize>]) -> Vec<Range<usize>>
             continue;
         }
         let piece: String = chars[start..end].iter().collect();
-        out.extend(
-            words(&piece)
-                .into_iter()
-                .map(|w| w.start + start..w.end + start),
-        );
+        out.extend(tokens(&piece).into_iter().map(|t| Token {
+            whole: t.whole.map(|w| shift(w, start)),
+            parts: t.parts.into_iter().map(|p| shift(p, start)).collect(),
+        }));
     }
     out
 }
@@ -189,6 +277,27 @@ mod tests {
     }
 
     #[test]
+    fn tokens_keep_whole_contraction_range() {
+        let t = tokens("don't l'albero x");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].whole, Some(0..5));
+        assert_eq!(t[0].parts, vec![0..3]);
+        assert_eq!(t[1].whole, Some(6..14));
+        assert_eq!(t[1].parts, vec![8..14]);
+        assert_eq!(tokens("hello")[0].whole, None);
+    }
+
+    #[test]
+    fn words_skip_urls_and_entities() {
+        assert_eq!(
+            word_strings(
+                "see https://exmple.com/pagina_x, www.exmple.org and (http://abcdef.it) &nbsp; &amp;done wrld"
+            ),
+            vec!["see", "and", "done", "wrld"]
+        );
+    }
+
+    #[test]
     fn words_skip_identifiers_and_numbers() {
         assert_eq!(
             word_strings("foo_bar abc123 42 camelCase HTTP URLS hello WORLDS x"),
@@ -203,11 +312,15 @@ mod tests {
 
     #[test]
     #[allow(clippy::single_range_in_vec_init)]
-    fn words_in_ranges_offsets_are_relative_to_text() {
+    fn tokens_in_ranges_offsets_are_relative_to_text() {
         let text = "let ciao = 1; // hello wrld";
         let start = text.find("hello").unwrap();
         let ranges = vec![start..text.len()];
-        assert_eq!(words_in_ranges(text, &ranges), vec![17..22, 23..27]);
+        let got: Vec<_> = tokens_in_ranges(text, &ranges)
+            .into_iter()
+            .flat_map(|t| t.parts)
+            .collect();
+        assert_eq!(got, vec![17..22, 23..27]);
     }
 
     #[test]

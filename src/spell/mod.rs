@@ -52,6 +52,8 @@ impl SpellChecker {
     /// Returns true if `word` is accepted by a dictionary or the personal list. A capitalized
     /// word is also tried in lowercase.
     pub fn check(&self, word: &str) -> bool {
+        let word = word.replace('\u{2019}', "'");
+        let word = word.as_str();
         let lower = word.to_lowercase();
         let capitalized = word.chars().next().is_some_and(char::is_uppercase);
         let known = |w: &str| self.personal.contains(w) || self.dicts.iter().any(|d| d.check(w));
@@ -82,6 +84,12 @@ impl SpellChecker {
         }
         out.truncate(MAX_SUGGESTIONS);
         out
+    }
+
+    /// Adds a dictionary loaded after the checker was created and clears the result cache.
+    pub fn add_dictionary(&mut self, dict: spellbook::Dictionary) {
+        self.dicts.push(dict);
+        self.cache.clear();
     }
 
     /// Adds `word` to the in-memory personal list and clears the result cache.
@@ -164,12 +172,36 @@ fn set_status(shared: &Shared, ctx: &egui::Context, status: SpellStatus) {
     ctx.request_repaint();
 }
 
+/// Makes `dict` available: creates and publishes the checker for the first dictionary, adds
+/// later ones to it, so a language works as soon as it is parsed.
+fn publish_dictionary(
+    shared: &Shared,
+    checker: &mut Option<Arc<RwLock<SpellChecker>>>,
+    dict: spellbook::Dictionary,
+    personal_path: &Path,
+) {
+    match checker {
+        Some(c) => c
+            .write()
+            .expect("spell checker poisoned")
+            .add_dictionary(dict),
+        None => {
+            let c = Arc::new(RwLock::new(SpellChecker::new(
+                vec![dict],
+                load_personal(personal_path),
+            )));
+            *shared.checker.lock().expect("spell checker slot poisoned") = Some(Arc::clone(&c));
+            *checker = Some(c);
+        }
+    }
+}
+
 /// Loader thread body: locates (or downloads) and parses every language.
 fn load_all(shared: &Shared, ctx: &egui::Context, paths: &ConfigPaths, allow_download: bool) {
     let dict_dir = paths.dictionaries_dir();
     let system = dict::system_dirs();
-    let mut dicts = Vec::new();
     let mut errors = Vec::new();
+    let mut checker: Option<Arc<RwLock<SpellChecker>>> = None;
     for lang in dict::LANGS {
         let files = match dict::locate(lang, &dict_dir, &system) {
             Some(files) => Ok(files),
@@ -180,15 +212,10 @@ fn load_all(shared: &Shared, ctx: &egui::Context, paths: &ConfigPaths, allow_dow
             None => Err(format!("{lang}: dictionary not found")),
         };
         match files.and_then(|(aff, dic)| parse_dictionary(&aff, &dic)) {
-            Ok(d) => dicts.push(d),
+            Ok(d) => publish_dictionary(shared, &mut checker, d, &paths.personal_dictionary()),
             Err(e) => errors.push(e),
         }
         set_status(shared, ctx, SpellStatus::Loading);
-    }
-    if !dicts.is_empty() {
-        let personal = load_personal(&paths.personal_dictionary());
-        let checker = Arc::new(RwLock::new(SpellChecker::new(dicts, personal)));
-        *shared.checker.lock().expect("spell checker slot poisoned") = Some(checker);
     }
     let status = if errors.is_empty() {
         SpellStatus::Ready
@@ -372,16 +399,28 @@ impl Decorator for SpellDecorator<'_, '_> {
         let spans = self.inner.decorate(line_idx, line, base);
         let chars: Vec<char> = line.chars().collect();
         let ranges = self.checkable_ranges(line_idx, chars.len());
-        let candidates = words::words_in_ranges(line, &ranges);
-        if candidates.is_empty() {
+        let tokens = words::tokens_in_ranges(line, &ranges);
+        if tokens.is_empty() {
             return spans;
         }
         let misspelled: Vec<Range<usize>> = {
             let mut checker = self.checker.write().expect("spell checker poisoned");
-            candidates
-                .into_iter()
-                .filter(|w| !checker.is_correct(&chars[w.clone()].iter().collect::<String>()))
-                .collect()
+            let text = |r: &Range<usize>| chars[r.clone()].iter().collect::<String>();
+            let mut bad = Vec::new();
+            for token in tokens {
+                if let Some(whole) = &token.whole
+                    && checker.is_correct(&text(whole))
+                {
+                    continue;
+                }
+                bad.extend(
+                    token
+                        .parts
+                        .into_iter()
+                        .filter(|p| !checker.is_correct(&text(p))),
+                );
+            }
+            bad
         };
         if let Some(rope) = &self.rope
             && line_idx < rope.len_lines()
@@ -475,6 +514,39 @@ mod tests {
         );
         drop(deco);
         assert_eq!(marks, HashSet::from([5..10]));
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn contractions_are_checked_whole_before_splitting() {
+        let en = spellbook::Dictionary::new("SET UTF-8\n", "2\ndon't\nhello\n").unwrap();
+        let it = spellbook::Dictionary::new("SET UTF-8\n", "1\nalbero\n").unwrap();
+        let checker = Arc::new(RwLock::new(SpellChecker::new(vec![en, it], HashSet::new())));
+        let mut cache = crate::highlight::HighlightCache::new();
+        let mut inner = HighlightDecorator::new(&mut cache, None, "Plain Text", "x", true);
+        let (mut markdown, mut marks) = (None, HashSet::new());
+        let text = "don't l\u{2019}albero don\u{2019}t doesn't";
+        let buffer = Buffer::from_text(text);
+        let mut deco = SpellDecorator::new(
+            &mut inner,
+            checker,
+            SpellMode::Plain,
+            &mut markdown,
+            &mut marks,
+        );
+        deco.prepare(&buffer);
+        deco.decorate(0, text, &TextFormat::default());
+        drop(deco);
+        // "doesn't" is unknown: its split part "doesn" is flagged, "t" is too short.
+        assert_eq!(marks, HashSet::from_iter([21..26]));
+    }
+
+    #[test]
+    fn checker_publishes_first_dictionary_and_accepts_more() {
+        let mut c = checker();
+        assert!(!c.check("albero"));
+        c.add_dictionary(spellbook::Dictionary::new("SET UTF-8\n", "1\nalbero\n").unwrap());
+        assert!(c.check("albero"));
     }
 
     #[test]
