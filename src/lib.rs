@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod buffer;
+pub mod search;
 
 use std::path::PathBuf;
 
