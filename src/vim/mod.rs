@@ -148,6 +148,8 @@ pub struct VimState {
     recording: Option<Vec<VimKey>>,
     /// An undo group opened by a change is still open.
     group_open: bool,
+    /// The caret line holds only indentation inserted automatically (removed on Esc).
+    auto_indent: bool,
 }
 
 impl Default for VimState {
@@ -169,6 +171,7 @@ impl VimState {
             last_change: Vec::new(),
             recording: None,
             group_open: false,
+            auto_indent: false,
         }
     }
 
@@ -271,6 +274,7 @@ impl VimState {
     /// Switches to Insert mode with the caret at `pos`.
     fn enter_insert(&mut self, pos: usize, env: &mut Env) {
         self.mode = Mode::Insert;
+        self.auto_indent = false;
         env.ed.preferred_col = None;
         env.set_caret(pos);
     }
@@ -330,6 +334,7 @@ impl VimState {
                 let indent_len = indent.chars().count();
                 env.buf.replace(start..line_end_of(&rope, b), &indent);
                 self.enter_insert(start + indent_len, env);
+                self.auto_indent = true;
             }
             _ => {
                 env.buf.replace(linewise_delete_range(&rope, a, b), "");
@@ -346,17 +351,23 @@ impl VimState {
         if let Some(rec) = &mut self.recording {
             rec.push(key.clone());
         }
+        if !matches!(key, VimKey::Up | VimKey::Down) {
+            env.ed.preferred_col = None;
+        }
+        if !matches!(key, VimKey::Enter | VimKey::Esc) {
+            self.auto_indent = false;
+        }
         let pos = env.pos();
         let rope = env.buf.rope().clone();
         match key {
             VimKey::Char(c) => insert_at(env, pos, &c.to_string()),
             VimKey::Enter => {
-                let indent = leading_blanks(&rope, text_nav::line_start(&rope, pos));
-                let keep: String = indent
-                    .chars()
-                    .take(pos - text_nav::line_start(&rope, pos))
-                    .collect();
+                let line_start = text_nav::line_start(&rope, pos);
+                let indent = leading_blanks(&rope, line_start);
+                let keep: String = indent.chars().take(pos - line_start).collect();
+                let pos = self.drop_auto_indent(pos, env);
                 insert_at(env, pos, &format!("\n{keep}"));
+                self.auto_indent = true;
             }
             VimKey::Tab => {
                 let col = pos - text_nav::line_start(&rope, pos);
@@ -387,6 +398,8 @@ impl VimState {
                 }
             }
             VimKey::Esc => {
+                let pos = self.drop_auto_indent(pos, env);
+                let rope = env.buf.rope().clone();
                 self.end_change(env.buf);
                 if let Some(rec) = self.recording.take() {
                     self.last_change = rec;
@@ -401,6 +414,22 @@ impl VimState {
             }
             _ => {}
         }
+    }
+
+    /// Removes the untouched auto-indent of the caret line (vim); returns the new caret.
+    fn drop_auto_indent(&mut self, pos: usize, env: &mut Env) -> usize {
+        if !std::mem::take(&mut self.auto_indent) {
+            return pos;
+        }
+        let rope = env.buf.rope();
+        let start = text_nav::line_start(rope, pos);
+        let end = text_nav::line_end(rope, pos);
+        if pos != end || (start..end).any(|i| !matches!(rope.char(i), ' ' | '\t')) {
+            return pos;
+        }
+        env.buf.replace(start..end, "");
+        env.set_caret(start);
+        start
     }
 
     /// Handles a key in Visual and VisualLine mode.
@@ -488,6 +517,7 @@ impl VimState {
             OpRange::Lines(..) => sel_start,
         });
         self.apply_operator(op, range, env);
+        env.ed.preferred_col = None;
         if self.mode != Mode::Insert {
             self.end_change(env.buf);
             let p = clamp_normal(env.buf.rope(), env.pos());
@@ -521,6 +551,7 @@ impl VimState {
                 let prefix = chars.next();
                 let rest = chars.as_str();
                 match prefix {
+                    Some(':') if rest.trim().is_empty() => {}
                     Some(':') => {
                         let fx = self.run_cmdline(rest, env.buf, env.ed, env.settings);
                         env.fx.extend(fx);
@@ -578,16 +609,14 @@ fn render_keys(keys: &[VimKey]) -> String {
         .collect()
 }
 
-/// Clamps `pos` to a Normal-mode caret: on a char, never on `\n` unless the line is empty.
+/// Clamps `pos` to a Normal-mode caret: on a char, never on `\n` unless the line is empty
+/// (the empty line after a final `\n` is a valid caret line).
 fn clamp_normal(rope: &Rope, pos: usize) -> usize {
     let len = rope.len_chars();
     if len == 0 {
         return 0;
     }
-    let mut p = pos.min(len);
-    if p == len && rope.char(len - 1) == '\n' {
-        p = len - 1;
-    }
+    let p = pos.min(len);
     let start = text_nav::line_start(rope, p);
     let end = text_nav::line_end(rope, p);
     if end == start {

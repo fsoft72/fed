@@ -136,6 +136,7 @@ fn parse_motion(keys: &[VimKey]) -> Parse<Motion> {
         VimKey::Char(c @ ('w' | 'W')) => Motion::WordStart { big: *c == 'W' },
         VimKey::Char(c @ ('b' | 'B')) => Motion::WordBack { big: *c == 'B' },
         VimKey::Char(c @ ('e' | 'E')) => Motion::WordEnd { big: *c == 'E' },
+        VimKey::Enter => Motion::NextLineFirstNonBlank,
         VimKey::Char('0') => Motion::LineStart,
         VimKey::Char('^') => Motion::FirstNonBlank,
         VimKey::Char('$') => Motion::LineEnd,
@@ -304,10 +305,18 @@ impl VimState {
         let p = clamp_normal(env.buf.rope(), env.pos());
         env.set_caret(p);
         let change = parsed.cmd.is_change();
+        // Only vertical motions and `$` keep the preferred column.
+        let keep_col = matches!(
+            parsed.cmd,
+            NormalCmd::Move(Motion::Up | Motion::Down | Motion::LineEnd)
+        );
         if change {
             self.begin_change(env.buf);
         }
         self.run_normal(parsed, env);
+        if !keep_col {
+            env.ed.preferred_col = None;
+        }
         if change && self.mode == Mode::Insert {
             self.recording = Some(keys);
         } else if change {
@@ -392,6 +401,7 @@ impl VimState {
                 // The caret goes after the indent of the new line.
                 let caret = at + text.chars().count() - usize::from(c == 'O');
                 self.enter_insert(caret, env);
+                self.auto_indent = true;
             }
             'v' | 'V' => {
                 self.mode = if c == 'v' {
@@ -504,12 +514,17 @@ impl VimState {
                 return Some(OpRange::Lines(line, line));
             }
         }
+        let start_line = rope.char_to_line(start);
         let end_line = rope.char_to_line(end);
-        if !r.inclusive && end > start && end_line > line && rope.line_to_char(end_line) == end {
+        if !r.inclusive
+            && end > start
+            && end_line > start_line
+            && rope.line_to_char(end_line) == end
+        {
             // `:help exclusive`: an end in column 0 moves back to the previous line end,
             // and the whole thing becomes linewise when it started before the first non-blank.
             if start <= text_nav::first_non_blank(&rope, start) {
-                return Some(OpRange::Lines(line, end_line - 1));
+                return Some(OpRange::Lines(start_line, end_line - 1));
             }
             end = line_end_of(&rope, end_line - 1);
         }

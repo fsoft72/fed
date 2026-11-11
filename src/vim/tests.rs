@@ -7,7 +7,7 @@ const SET: EditSettings = EditSettings {
     insert_spaces: true,
 };
 
-/// Parses a key string: plain chars plus `<Esc>`, `<CR>`, `<BS>`, `<Tab>` and `<C-x>`.
+/// Parses a key string: plain chars plus `<Esc>`, `<CR>`, `<BS>`, `<Tab>`, arrows and `<C-x>`.
 fn keys(s: &str) -> Vec<VimKey> {
     let mut out = Vec::new();
     let mut rest = s;
@@ -21,6 +21,10 @@ fn keys(s: &str) -> Vec<VimKey> {
                 "CR" => Some(VimKey::Enter),
                 "BS" => Some(VimKey::Backspace),
                 "Tab" => Some(VimKey::Tab),
+                "Left" => Some(VimKey::Left),
+                "Right" => Some(VimKey::Right),
+                "Up" => Some(VimKey::Up),
+                "Down" => Some(VimKey::Down),
                 _ => name
                     .strip_prefix("C-")
                     .map(|x| VimKey::Ctrl(x.chars().next().unwrap())),
@@ -420,5 +424,72 @@ fn empty_buffer_never_panics() {
         assert_eq!(run("", 0, k).0, "", "keys {k}");
     }
     assert_eq!(run("", 0, "ohi<Esc>").0, "\nhi");
-    assert_eq!(run("a\n", 2, "x").0, "\n");
+    assert_eq!(run("a\n", 2, "x"), ("a\n".into(), 2, Mode::Normal));
+    assert_eq!(run("a\n", 0, "x").0, "\n");
+}
+
+#[test]
+fn backward_exclusive_motion_ending_in_column_zero() {
+    let mut h = Harness::new("x foo\nbar", 6);
+    h.feed("db");
+    assert_eq!((h.buf.text(), h.caret()), ("x \nbar".into(), 1));
+    assert_eq!(h.fx, vec![VimEffect::SetClipboard("foo".into())]);
+    assert_eq!(run("x foo\nbar", 6, "dB").0, "x \nbar");
+    // Starting before the first non-blank, the range becomes linewise.
+    let mut h = Harness::new("foo\nbar", 4);
+    h.feed("db");
+    assert_eq!(h.buf.text(), "bar");
+    assert_eq!(h.fx, vec![VimEffect::SetClipboard("foo\n".into())]);
+    assert_eq!(run("a\n\nb\nc", 5, "d{").0, "a\nc");
+    assert_eq!(run("foo\nfoo\nbar", 0, "/foo<CR>jdN").0, "foo\nbar");
+}
+
+#[test]
+fn preferred_column_resets_after_edits() {
+    assert_eq!(caret("abcdef\nab\nabcdef", 5, "jxj"), 9);
+    assert_eq!(caret("abcdef\nab\nabcdef", 5, "jj"), 15);
+    assert_eq!(caret("abcdef\nab\nabcdef", 0, "$jj"), 15);
+    assert_eq!(caret("abcdef\nab\nabcdef", 5, "jr.j"), 11);
+    assert_eq!(
+        run("abcdef\nab\nabcdef", 5, "jvd"),
+        ("abcdef\na\nabcdef".into(), 7, Mode::Normal)
+    );
+    assert_eq!(caret("abcdef\nab\nabcdef", 5, "jvd<Esc>j"), 9);
+    assert_eq!(caret("abcdef\nab\nabcdef", 5, "ja<Left><Esc>j"), 10);
+}
+
+#[test]
+fn esc_drops_untouched_auto_indent() {
+    assert_eq!(
+        run("  foo", 2, "o<Esc>"),
+        ("  foo\n".into(), 6, Mode::Normal)
+    );
+    assert_eq!(run("  foo", 2, "O<Esc>").0, "\n  foo");
+    assert_eq!(run("  foo", 2, "ox<Esc>").0, "  foo\n  x");
+    assert_eq!(run("  foo", 0, "A<CR><CR>x<Esc>").0, "  foo\n\n  x");
+    assert_eq!(
+        run("  foo", 0, "A<CR><Esc>"),
+        ("  foo\n".into(), 6, Mode::Normal)
+    );
+    assert_eq!(run("foo", 0, "o<Esc>"), ("foo\n".into(), 4, Mode::Normal));
+    assert_eq!(run("  foo\nbar", 2, "cc<Esc>").0, "\nbar");
+    assert_eq!(run("  foo", 2, "o<Tab><Esc>").0, "  foo\n    ");
+}
+
+#[test]
+fn enter_moves_to_next_line_first_non_blank() {
+    assert_eq!(caret("a\n  b\n  c", 0, "<CR>"), 4);
+    assert_eq!(caret("a\n  b\n  c", 0, "2<CR>"), 8);
+    assert_eq!(caret("a\n  b", 4, "<CR>"), 4);
+    assert_eq!(run("a\nb\nc", 0, "d<CR>").0, "c");
+}
+
+#[test]
+fn empty_cmdline_is_a_no_op() {
+    let mut h = Harness::new("abc", 1);
+    h.feed(":<CR>");
+    assert_eq!((h.vim.mode(), h.caret()), (Mode::Normal, 1));
+    assert!(h.fx.is_empty());
+    h.feed(":  <CR>");
+    assert!(h.fx.is_empty());
 }
