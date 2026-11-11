@@ -44,6 +44,10 @@ const TAB_CLOSE_SIZE: f32 = 20.0;
 /// Accent line drawn on top of the selected tab.
 const TAB_ACCENT: egui::Color32 = egui::Color32::from_rgb(0, 122, 204);
 /// Thickness of the accent line.
+/// Width of the "Preview" button in the tab bar.
+const PREVIEW_BUTTON_WIDTH: f32 = 110.0;
+/// Corner radius of the "Preview" button.
+const PREVIEW_BUTTON_RADIUS: f32 = 4.0;
 const TAB_ACCENT_HEIGHT: f32 = 2.0;
 /// Suffix of the status text when the buffer has unsaved changes.
 const MODIFIED_STATUS_SUFFIX: &str = "  [+]";
@@ -758,22 +762,24 @@ impl FedApp {
             .map(|t| t.preview_open);
         let mut action = None;
         egui::Panel::top("fed_tabs").show(ui, |ui| {
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    for (i, tab) in self.tabs.iter().enumerate() {
-                        if let Some(tab_action) = draw_tab(ui, tab, i == self.active) {
-                            action = Some(match tab_action {
-                                TabClick::Activate => TabBarAction::Activate(i),
-                                TabClick::Close => TabBarAction::Close(i),
-                            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(open) = preview_state
+                    && draw_preview_button(ui, open)
+                {
+                    action = Some(TabBarAction::TogglePreview);
+                }
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for (i, tab) in self.tabs.iter().enumerate() {
+                            if let Some(tab_action) = draw_tab(ui, tab, i == self.active) {
+                                action = Some(match tab_action {
+                                    TabClick::Activate => TabBarAction::Activate(i),
+                                    TabClick::Close => TabBarAction::Close(i),
+                                });
+                            }
                         }
-                    }
-                    if let Some(open) = preview_state
-                        && ui.selectable_label(open, "Preview").clicked()
-                    {
-                        action = Some(TabBarAction::TogglePreview);
-                    }
+                    });
                 });
             });
         });
@@ -1725,4 +1731,33 @@ fn draw_tab(ui: &mut egui::Ui, tab: &Tab, selected: bool) -> Option<TabClick> {
         painter.circle_filled(close_rect.center(), 3.5, text_color);
     }
     result
+}
+
+/// Draws the wide "Preview" toggle at the right of the tab bar; returns true when clicked.
+fn draw_preview_button(ui: &mut egui::Ui, open: bool) -> bool {
+    let visuals = ui.visuals().clone();
+    let size = egui::vec2(PREVIEW_BUTTON_WIDTH, TAB_HEIGHT - 8.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let bg = if open {
+        visuals.widgets.active.weak_bg_fill
+    } else if resp.hovered() {
+        visuals.widgets.hovered.weak_bg_fill
+    } else {
+        visuals.widgets.inactive.weak_bg_fill
+    };
+    let text_color = if open {
+        visuals.strong_text_color()
+    } else {
+        visuals.weak_text_color()
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, PREVIEW_BUTTON_RADIUS, bg);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Preview",
+        egui::TextStyle::Body.resolve(ui.style()),
+        text_color,
+    );
+    resp.clicked()
 }
