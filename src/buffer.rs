@@ -96,12 +96,7 @@ impl Buffer {
     /// Creates a buffer from `text`; CRLF is detected and normalized to LF.
     pub fn from_text(text: &str) -> Buffer {
         let crlf = text.contains("\r\n");
-        let normalized = if crlf {
-            text.replace("\r\n", "\n")
-        } else {
-            text.to_string()
-        };
-        let rope = Rope::from_str(&normalized);
+        let rope = Rope::from_str(&_normalize_newlines(text));
         let large =
             text.len() >= LARGE_FILE_BYTES || rope.lines().any(|l| l.len_chars() > LONG_LINE_CHARS);
         Buffer {
@@ -173,6 +168,14 @@ impl Buffer {
             path: path.to_path_buf(),
             source,
         };
+        // Write through symlinks so the link itself is preserved.
+        let is_link = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+        let resolved = if is_link {
+            fs::canonicalize(path).map_err(io_err)?
+        } else {
+            path.to_path_buf()
+        };
+        let path = resolved.as_path();
         let mut tmp_name = path.as_os_str().to_os_string();
         tmp_name.push(TMP_SUFFIX);
         let tmp = PathBuf::from(tmp_name);
@@ -181,6 +184,13 @@ impl Buffer {
             content = content.replace('\n', "\r\n");
         }
         fs::write(&tmp, content).map_err(io_err)?;
+        // Keep the original file mode (the rename creates a new inode).
+        if let Ok(meta) = fs::metadata(path)
+            && let Err(e) = fs::set_permissions(&tmp, meta.permissions())
+        {
+            let _ = fs::remove_file(&tmp);
+            return Err(io_err(e));
+        }
         if let Err(e) = fs::rename(&tmp, path) {
             // Best effort cleanup; the rename error is the one worth reporting.
             let _ = fs::remove_file(&tmp);
@@ -227,7 +237,8 @@ impl Buffer {
         if range.is_empty() && text.is_empty() {
             return;
         }
-        let edit = self.apply(range, text);
+        let text = _normalize_newlines(text);
+        let edit = self.apply(range, &text);
         if self.group_depth > 0 {
             self.group_edits.push(edit);
             return;
@@ -349,6 +360,14 @@ impl Buffer {
     }
 }
 
+/// Maps `\r\n` and lone `\r` to `\n` so the rope never contains `\r`.
+fn _normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\r') {
+        return text.into();
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n").into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +470,45 @@ mod tests {
         buf.replace(1..1, "c");
         buf.redo();
         assert!(buf.is_modified());
+    }
+
+    #[test]
+    fn replace_and_load_normalize_carriage_returns() {
+        let mut buf = Buffer::from_text("x\ry");
+        assert_eq!(buf.text(), "x\ny");
+        buf.replace(0..0, "a\r\nb");
+        assert!(!buf.text().contains('\r'));
+        assert_eq!(buf.text(), "a\nbx\ny");
+        buf.undo();
+        assert_eq!(buf.text(), "x\ny");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_mode_and_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = temp_dir("mode");
+        let path = dir.join("run.sh");
+        fs::write(&path, "echo\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut buf = Buffer::load(&path).unwrap();
+        buf.replace(0..0, "# ");
+        buf.save().unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let link = dir.join("link.sh");
+        symlink(&path, &link).unwrap();
+        let mut lbuf = Buffer::load(&link).unwrap();
+        lbuf.replace(0..0, "!");
+        lbuf.save().unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "!# echo\n");
     }
 }
