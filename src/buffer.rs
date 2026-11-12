@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
+use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -253,7 +254,7 @@ impl Buffer {
         if self.line_ending == LineEnding::Crlf {
             content = content.replace('\n', "\r\n");
         }
-        fs::write(&tmp, content).map_err(io_err)?;
+        write_synced(&tmp, &content).map_err(io_err)?;
         // Keep the original file mode (the rename creates a new inode).
         if let Ok(meta) = fs::metadata(path)
             && let Err(e) = fs::set_permissions(&tmp, meta.permissions())
@@ -266,7 +267,8 @@ impl Buffer {
             let _ = fs::remove_file(&tmp);
             return Err(io_err(e));
         }
-        Ok(())
+        // Without this a crash right after the rename may still lose the new directory entry.
+        sync_dir(parent_dir(path)).map_err(io_err)
     }
 
     /// Returns the underlying rope (always LF-only).
@@ -520,6 +522,35 @@ impl Buffer {
     }
 }
 
+/// Creates (or truncates) the file at `path`, writes `content` and flushes it to the disk,
+/// so a rename over the original never exposes a file whose data is not stored yet.
+fn write_synced(path: &Path, content: &str) -> std::io::Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()
+}
+
+/// Directory holding `path`: its parent, or `.` for a bare file name.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// Flushes the entries of directory `dir` (a rename into it) to the disk.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Directories cannot be opened for syncing on this platform; the rename is durable once the
+/// file system commits it.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Text size of an undo step: the bytes it removed plus the bytes it inserted.
 fn step_bytes(step: &[Edit]) -> usize {
     step.iter()
@@ -633,6 +664,38 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn parent_dir_of_bare_name_is_current_dir() {
+        assert_eq!(parent_dir(Path::new("a.txt")), Path::new("."));
+        assert_eq!(parent_dir(Path::new("/x/a.txt")), Path::new("/x"));
+        assert_eq!(parent_dir(Path::new("d/a.txt")), Path::new("d"));
+    }
+
+    #[test]
+    fn synced_write_stores_content_and_dir_syncs() {
+        let dir = temp_dir("synced");
+        let path = dir.join("a.txt");
+        write_synced(&path, "one").unwrap();
+        write_synced(&path, "two").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        sync_dir(&dir).unwrap();
+        assert!(sync_dir(&dir.join("missing")).is_err());
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file() {
+        let dir = temp_dir("no-tmp");
+        let path = dir.join("a.txt");
+        let mut buf = Buffer::from_text("hi\n");
+        buf.save_as(path.clone()).unwrap();
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("a.txt")]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hi\n");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 ## Critical
 
-- [ ] **Saves are not durable (no fsync before rename)** - `write_copy` writes the temp file with `fs::write` and renames it over the original without `File::sync_all` (and without syncing the parent directory), so a crash or power loss right after a save can leave a truncated or empty file on file systems that reorder data and metadata; this is the one place an editor must not lose data.
+- [x] **Saves are not durable (no fsync before rename)** - `write_copy` writes the temp file with `fs::write` and renames it over the original without `File::sync_all` (and without syncing the parent directory), so a crash or power loss right after a save can leave a truncated or empty file on file systems that reorder data and metadata; this is the one place an editor must not lose data.
   - File(s): `src/buffer.rs` (`Buffer::write_copy`)
 
 ## High
