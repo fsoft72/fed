@@ -1501,6 +1501,10 @@ impl eframe::App for FedApp {
                     view::show_editor(ui, tab, &opts, &mut deco, key_handler)
                 }
             };
+            if highlighted.is_incomplete() {
+                // Lines past the parse budget were drawn plain: continue next frame.
+                ui.ctx().request_repaint();
+            }
             tab.highlight = cache;
             tab.syntax = assets.map(|_| syntax);
             if !spell_active {

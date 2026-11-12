@@ -21,7 +21,7 @@
   - File(s): `src/view.rs`
 - [x] **Spell checking re-runs for every visible line every frame** - `SpellDecorator::decorate` re-tokenizes each visible line, takes `checker.write()` and allocates a `String` per word on every frame, with no per-line result cache, and `SpellChecker::cache` grows without limit; cache the misspelled ranges per `(line, revision)` and bound the word cache.
   - File(s): `src/spell/mod.rs`, `src/spell/words.rs`
-- [ ] **Syntax highlighting can stall a frame on big files** - `HighlightCache::line_spans` parses every line from the last cached one up to the requested one inside one frame (jumping to the end of a ~5 MB file parses all of it), and keeps a cloned `ParseState` + `HighlightState` for every line; add a per-frame line budget with `request_repaint` and checkpoint states every N lines instead of every line.
+- [x] **Syntax highlighting can stall a frame on big files** - `HighlightCache::line_spans` parses every line from the last cached one up to the requested one inside one frame (jumping to the end of a ~5 MB file parses all of it), and keeps a cloned `ParseState` + `HighlightState` for every line; add a per-frame line budget with `request_repaint` and checkpoint states every N lines instead of every line.
   - File(s): `src/highlight.rs`
 - [ ] **`FedApp` is a god object** - `src/app.rs` is ~1900 lines and `FedApp` holds ~27 fields covering tabs, fonts, spell, settings persistence, vim messages, links and dialogs; extract cohesive pieces (e.g. a `FontManager` owning the two `FontLoad`/`LoadedFont` pairs, a `StatusBar` owning status + link errors, vim effect handling into `app/vim.rs`) like `app/dialogs.rs` and `app/menu.rs` already do.
   - File(s): `src/app.rs`

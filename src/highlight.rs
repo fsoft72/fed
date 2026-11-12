@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Stroke, TextFormat};
 use ropey::Rope;
@@ -30,6 +31,10 @@ static STRING_PREFIX: LazyLock<Scope> =
     LazyLock::new(|| Scope::new(STRING_SCOPE).expect("valid scope"));
 /// Width of the underline stroke for underlined tokens.
 const UNDERLINE_WIDTH: f32 = 1.0;
+/// Parser states are kept at the start of every this many lines.
+const CHECKPOINT_LINES: usize = 32;
+/// Time a frame may spend parsing lines before the rest waits for the next frame.
+const FRAME_PARSE_BUDGET: Duration = Duration::from_millis(8);
 /// Maximum number of lines a background warm-up parses.
 const WARM_UP_LINES: usize = 2000;
 
@@ -203,15 +208,23 @@ struct LineState {
     highlight: HighlightState,
 }
 
-/// Per-line highlight cache: spans plus the parser state needed to resume after any line.
+/// Per-line highlight cache: spans of every parsed line, plus parser states at checkpoints
+/// (every `CHECKPOINT_LINES` lines) and at the parse frontier, so parsing can resume after an
+/// edit without keeping a state per line.
 #[derive(Default)]
 pub struct HighlightCache {
     /// `(syntax, theme)` the cache was built for.
     key: Option<(String, String)>,
-    /// State at the start of each line; one longer than `spans` when initialised.
-    states: Vec<LineState>,
+    /// State at the start of line `k * CHECKPOINT_LINES` for every checkpoint `k` reached.
+    checkpoints: Vec<LineState>,
+    /// State at the start of line `spans.len()`; `None` when that line is a checkpoint.
+    next_state: Option<LineState>,
     /// Spans of every line parsed so far.
     spans: Vec<Vec<StyledSpan>>,
+    /// Parsing stops (until the next frame) once this instant is passed; `None`: no limit.
+    deadline: Option<Instant>,
+    /// True when a request was left unanswered because the deadline passed.
+    starved: bool,
 }
 
 impl HighlightCache {
@@ -220,16 +233,35 @@ impl HighlightCache {
         HighlightCache::default()
     }
 
-    /// Forgets everything computed for `line` and the lines after it.
+    /// Starts a frame: parsing stops at `deadline` (`None`: never) and the starved flag is
+    /// cleared.
+    pub fn begin_frame(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+        self.starved = false;
+    }
+
+    /// True when a line was not highlighted this frame because the parse budget ran out.
+    pub fn is_starved(&self) -> bool {
+        self.starved
+    }
+
+    /// Forgets everything computed for `line` and the lines after it. Parsing resumes from
+    /// the checkpoint at or before `line`.
     pub fn invalidate_from(&mut self, line: usize) {
-        self.spans.truncate(line);
-        self.states.truncate(line + 1);
+        if line >= self.spans.len() {
+            return;
+        }
+        let keep = line / CHECKPOINT_LINES;
+        self.checkpoints.truncate(keep + 1);
+        self.spans.truncate(keep * CHECKPOINT_LINES);
+        self.next_state = None;
     }
 
     /// Drops the whole cache (theme or syntax change).
     pub fn reset(&mut self) {
         self.key = None;
-        self.states.clear();
+        self.checkpoints.clear();
+        self.next_state = None;
         self.spans.clear();
     }
 
@@ -240,9 +272,10 @@ impl HighlightCache {
             .is_some_and(|(s, t)| s == syntax && t == theme)
     }
 
-    /// Returns the styled spans of `line`, parsing forward from the last valid line state.
-    /// Spans cover the line text without its newline. A line already in the cache is
-    /// returned as is: callers must `invalidate_from` the first edited line.
+    /// Returns the styled spans of `line`, parsing forward from the parse frontier. Spans
+    /// cover the line text without its newline. A line already in the cache is returned as
+    /// is: callers must `invalidate_from` the first edited line. Returns `None` when the
+    /// frame deadline passed before `line` was reached (the progress made is kept).
     pub fn line_spans(
         &mut self,
         assets: &HighlightAssets,
@@ -250,13 +283,13 @@ impl HighlightCache {
         theme: &str,
         rope: &Rope,
         line: usize,
-    ) -> &[StyledSpan] {
+    ) -> Option<&[StyledSpan]> {
         if !self.has_key(syntax_name_or_ext, theme) {
             self.reset();
             self.key = Some((syntax_name_or_ext.to_string(), theme.to_string()));
         }
         if line < self.spans.len() {
-            return &self.spans[line];
+            return Some(&self.spans[line]);
         }
         let Some(theme) = assets
             .themes
@@ -264,28 +297,38 @@ impl HighlightCache {
             .get(theme)
             .or_else(|| assets.themes.themes.values().next())
         else {
-            return &[];
+            return Some(&[]);
         };
         if line >= rope.len_lines() {
-            return &[];
+            return Some(&[]);
         }
         let highlighter = Highlighter::new(theme);
-        if self.states.is_empty() {
+        if self.checkpoints.is_empty() {
             let syntax = find_syntax(assets, syntax_name_or_ext);
-            self.states.push(LineState {
+            self.checkpoints.push(LineState {
                 parse: ParseState::new(syntax),
                 highlight: HighlightState::new(&highlighter, ScopeStack::new()),
             });
         }
+        let mut state = match self.next_state.take() {
+            Some(state) => state,
+            None => self.checkpoints[self.spans.len() / CHECKPOINT_LINES].clone(),
+        };
         while self.spans.len() <= line {
-            let idx = self.spans.len();
-            let mut state = self.states[idx].clone();
-            let text = rope.line(idx).to_string();
+            if self.deadline.is_some_and(|d| Instant::now() >= d) {
+                self.starved = true;
+                self.next_state = Some(state);
+                return None;
+            }
+            let text = rope.line(self.spans.len()).to_string();
             let spans = parse_line(assets, &highlighter, &mut state, &text);
             self.spans.push(spans);
-            self.states.push(state);
+            if self.spans.len().is_multiple_of(CHECKPOINT_LINES) {
+                self.checkpoints.push(state.clone());
+            }
         }
-        &self.spans[line]
+        self.next_state = Some(state);
+        Some(&self.spans[line])
     }
 }
 
@@ -378,23 +421,31 @@ impl<'a> HighlightDecorator<'a> {
         self.last_dirty
     }
 
-    /// Returns the spans of `line_idx`, or `None` when highlighting is off.
+    /// Returns the spans of `line_idx`, or `None` when highlighting is off or the line was not
+    /// reached within this frame's parse budget.
     pub fn spans(&mut self, line_idx: usize) -> Option<&[StyledSpan]> {
         if !self.enabled {
             return None;
         }
         let assets = self.assets?;
         let rope = self.rope.as_ref()?;
-        Some(
-            self.cache
-                .line_spans(assets, self.syntax, self.theme, rope, line_idx),
-        )
+        self.cache
+            .line_spans(assets, self.syntax, self.theme, rope, line_idx)
+    }
+
+    /// True when some line was drawn plain this frame because the parse budget ran out:
+    /// the caller should repaint so highlighting catches up.
+    pub fn is_incomplete(&self) -> bool {
+        self.cache.is_starved()
     }
 }
 
 impl Decorator for HighlightDecorator<'_> {
-    /// Takes the buffer's dirty line, invalidates the cache from it and snapshots the text.
+    /// Takes the buffer's dirty line, invalidates the cache from it, snapshots the text and
+    /// starts this frame's parse budget.
     fn prepare(&mut self, buffer: &Buffer) {
+        self.cache
+            .begin_frame(Some(Instant::now() + FRAME_PARSE_BUDGET));
         self.last_dirty = buffer.take_dirty_line();
         if let Some(line) = self.last_dirty {
             self.cache.invalidate_from(line);
@@ -465,7 +516,9 @@ mod tests {
         let a = assets();
         let rope = Rope::from_str("let s = \"hi\"; // note\n");
         let mut cache = HighlightCache::new();
-        let spans = cache.line_spans(&a, "Rust", "base16-ocean.dark", &rope, 0);
+        let spans = cache
+            .line_spans(&a, "Rust", "base16-ocean.dark", &rope, 0)
+            .unwrap();
         let strings = ranges_of(spans, SpanKind::String);
         let comments = ranges_of(spans, SpanKind::Comment);
         assert!(
@@ -484,12 +537,12 @@ mod tests {
         let mut cache = HighlightCache::new();
         let theme = "base16-ocean.dark";
         let rope = Rope::from_str("/* open\nstill comment\n");
-        let spans = cache.line_spans(&a, "Rust", theme, &rope, 1);
+        let spans = cache.line_spans(&a, "Rust", theme, &rope, 1).unwrap();
         assert_eq!(ranges_of(spans, SpanKind::Comment), vec![0..13]);
 
         let edited = Rope::from_str("// open\nstill comment\n");
         cache.invalidate_from(0);
-        let spans = cache.line_spans(&a, "Rust", theme, &edited, 1);
+        let spans = cache.line_spans(&a, "Rust", theme, &edited, 1).unwrap();
         assert!(ranges_of(spans, SpanKind::Comment).is_empty());
     }
 
@@ -499,15 +552,82 @@ mod tests {
         let mut cache = HighlightCache::new();
         let theme = "base16-ocean.dark";
         let rope = Rope::from_str("// note\n");
-        let first = cache.line_spans(&a, "Rust", theme, &rope, 0).to_vec();
+        let first = cache
+            .line_spans(&a, "Rust", theme, &rope, 0)
+            .unwrap()
+            .to_vec();
         assert_eq!(ranges_of(&first, SpanKind::Comment), vec![0..7]);
         // Without invalidation a hit must not look at the text again.
         let other = Rope::from_str("let x = 1;\n");
-        let hit = cache.line_spans(&a, "Rust", theme, &other, 0);
+        let hit = cache.line_spans(&a, "Rust", theme, &other, 0).unwrap();
         assert_eq!(ranges_of(hit, SpanKind::Comment), vec![0..7]);
         // A different theme is a different key and rebuilds the cache.
-        let rebuilt = cache.line_spans(&a, "Rust", "InspiredGitHub", &other, 0);
+        let rebuilt = cache
+            .line_spans(&a, "Rust", "InspiredGitHub", &other, 0)
+            .unwrap();
         assert!(ranges_of(rebuilt, SpanKind::Comment).is_empty());
+    }
+
+    /// Returns the comment ranges of every line of `rope` parsed by `cache`.
+    fn comments(
+        cache: &mut HighlightCache,
+        a: &HighlightAssets,
+        rope: &Rope,
+    ) -> Vec<Vec<Range<usize>>> {
+        (0..rope.len_lines())
+            .map(|i| {
+                let spans = cache.line_spans(a, "Rust", "base16-ocean.dark", rope, i);
+                ranges_of(spans.unwrap(), SpanKind::Comment)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn checkpoints_resume_parsing_like_a_fresh_cache() {
+        let a = assets();
+        let mut lines: Vec<String> = (0..200).map(|i| format!("let v{i} = {i};")).collect();
+        lines[3] = "/* open".to_string();
+        lines[150] = "close */".to_string();
+        let rope = Rope::from_str(&lines.join("\n"));
+        let mut cache = HighlightCache::new();
+        comments(&mut cache, &a, &rope);
+        assert!(cache.checkpoints.len() <= 200 / CHECKPOINT_LINES + 1);
+        for edit in [70, 64, 199, 3, 40, 0] {
+            lines[edit] = format!("/* edited {edit}");
+            let rope = Rope::from_str(&lines.join("\n"));
+            cache.invalidate_from(edit);
+            assert_eq!(
+                comments(&mut cache, &a, &rope),
+                comments(&mut HighlightCache::new(), &a, &rope),
+                "edit at {edit}"
+            );
+            assert_eq!(
+                cache.checkpoints.len(),
+                cache.spans.len() / CHECKPOINT_LINES + 1
+            );
+        }
+    }
+
+    #[test]
+    fn parse_budget_defers_lines_and_keeps_progress() {
+        let a = assets();
+        let rope = Rope::from_str(&"let x = 1;\n".repeat(100));
+        let mut cache = HighlightCache::new();
+        cache.begin_frame(Some(Instant::now()));
+        assert!(
+            cache
+                .line_spans(&a, "Rust", "base16-ocean.dark", &rope, 50)
+                .is_none()
+        );
+        assert!(cache.is_starved());
+        cache.begin_frame(None);
+        assert!(!cache.is_starved());
+        assert!(
+            cache
+                .line_spans(&a, "Rust", "base16-ocean.dark", &rope, 50)
+                .is_some()
+        );
+        assert_eq!(cache.spans.len(), 51);
     }
 
     #[test]
@@ -541,7 +661,9 @@ mod tests {
         let a = assets();
         let rope = Rope::from_str("let s = \"città è\"; // né\n");
         let mut cache = HighlightCache::new();
-        let spans = cache.line_spans(&a, "Rust", "base16-ocean.dark", &rope, 0);
+        let spans = cache
+            .line_spans(&a, "Rust", "base16-ocean.dark", &rope, 0)
+            .unwrap();
         let len = rope.line(0).to_string().trim_end().chars().count();
         assert_eq!(spans.first().map(|s| s.range.start), Some(0));
         assert_eq!(spans.last().map(|s| s.range.end), Some(len));
