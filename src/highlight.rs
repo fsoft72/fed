@@ -15,6 +15,7 @@ use syntect::highlighting::{
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
 use crate::buffer::{Buffer, DirtyLines};
+use crate::job::{BackgroundJob, JobError};
 use crate::sync;
 use crate::view::Decorator;
 
@@ -145,26 +146,25 @@ impl HighlightAssets {
 
 /// Handle to assets that load on a background thread.
 pub struct AssetsHandle {
-    /// Filled by the loader thread when loading is done.
-    slot: Arc<Mutex<Option<Arc<HighlightAssets>>>>,
+    /// The load, until its result was taken.
+    job: Option<BackgroundJob<HighlightAssets>>,
 }
 
 impl AssetsHandle {
     /// Starts loading the assets in a thread and requests a repaint when they are ready.
-    pub fn spawn(ctx: egui::Context) -> AssetsHandle {
-        let slot = Arc::new(Mutex::new(None));
-        let thread_slot = Arc::clone(&slot);
-        std::thread::spawn(move || {
-            let assets = Arc::new(HighlightAssets::load());
-            *sync::lock(&thread_slot) = Some(assets);
-            ctx.request_repaint();
-        });
-        AssetsHandle { slot }
+    pub fn spawn(ctx: &egui::Context) -> AssetsHandle {
+        AssetsHandle {
+            job: Some(BackgroundJob::spawn(Some(ctx), HighlightAssets::load)),
+        }
     }
 
-    /// Returns the assets once loaded, without blocking on the loader.
-    pub fn get(&self) -> Option<Arc<HighlightAssets>> {
-        sync::lock(&self.slot).clone()
+    /// Returns the result of the load once, when it is done, without blocking on the
+    /// loader: the assets, or why loading them crashed. `None` while loading and after the
+    /// result was taken.
+    pub fn poll(&mut self) -> Option<Result<Arc<HighlightAssets>, JobError>> {
+        let result = self.job.as_ref()?.poll()?;
+        self.job = None;
+        Some(result.map(Arc::new))
     }
 }
 

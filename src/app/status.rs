@@ -1,13 +1,13 @@
 //! The status bar: tab status on the left, transient messages and notices on the right, and
 //! the errors reported by the background threads that open clicked links.
 
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use super::{FedApp, tab_path, vim};
 use crate::buffer::LineEnding;
+use crate::job::BackgroundJob;
 use crate::markdown;
 use crate::spell::SpellStatus;
 use crate::tab::Tab;
@@ -60,24 +60,20 @@ struct StatusMessage {
     shown_at: Instant,
 }
 
-/// The status bar message and the channel link opener threads report their errors on.
+/// The status bar message and the link opener jobs whose errors it reports.
 pub(super) struct StatusBar {
     /// Transient message, if any.
     message: Option<StatusMessage>,
-    /// Sends errors from the threads that open clicked links.
-    link_error_tx: Sender<String>,
-    /// Receives the errors of `link_error_tx`, shown as messages.
-    link_error_rx: Receiver<String>,
+    /// Links being opened by the system opener; each ends with the error text, if any.
+    link_jobs: Vec<BackgroundJob<Result<(), String>>>,
 }
 
 impl StatusBar {
     /// Creates a status bar without a message.
     pub(super) fn new() -> StatusBar {
-        let (link_error_tx, link_error_rx) = mpsc::channel();
         StatusBar {
             message: None,
-            link_error_tx,
-            link_error_rx,
+            link_jobs: Vec::new(),
         }
     }
 
@@ -101,9 +97,23 @@ impl StatusBar {
         ctx.request_repaint_after(STATUS_TIMEOUT - elapsed);
     }
 
-    /// Shows the errors the link opener threads reported since the last call.
+    /// Shows the errors of the link opener jobs that finished since the last call (a
+    /// crashed opener is an error too) and forgets the finished jobs.
     pub(super) fn poll_link_errors(&mut self) {
-        while let Ok(error) = self.link_error_rx.try_recv() {
+        let mut errors = Vec::new();
+        self.link_jobs.retain(|job| match job.poll() {
+            None => true,
+            Some(Ok(Ok(()))) => false,
+            Some(Ok(Err(error))) => {
+                errors.push(error);
+                false
+            }
+            Some(Err(crash)) => {
+                errors.push(crash.to_string());
+                false
+            }
+        });
+        for error in errors {
             self.set(error, Severity::Error);
         }
     }
@@ -111,20 +121,16 @@ impl StatusBar {
     /// Opens each allowed URL (see `markdown::is_openable_url`) with the system opener on a
     /// background thread; failures come back through `poll_link_errors`. Other URLs are
     /// ignored.
-    pub(super) fn open_links(&self, ctx: &egui::Context, urls: Vec<String>) {
+    pub(super) fn open_links(&mut self, ctx: &egui::Context, urls: Vec<String>) {
         let urls = urls
             .iter()
             .map(|u| u.trim().to_string())
             .filter(|u| markdown::is_openable_url(u));
         for url in urls {
-            let tx = self.link_error_tx.clone();
-            let ctx = ctx.clone();
-            std::thread::spawn(move || {
-                let Err(e) = open::that(&url) else { return };
-                // The app may be gone already; then nobody needs the error.
-                let _ = tx.send(format!("cannot open {url}: {e}"));
-                ctx.request_repaint();
+            let job = BackgroundJob::spawn(Some(ctx), move || {
+                open::that(&url).map_err(|e| format!("cannot open {url}: {e}"))
             });
+            self.link_jobs.push(job);
         }
     }
 
@@ -230,8 +236,13 @@ mod tests {
     #[test]
     fn link_errors_become_error_messages() {
         let mut status = StatusBar::new();
-        status.link_error_tx.send("cannot open x".into()).unwrap();
-        status.poll_link_errors();
+        let failing = BackgroundJob::spawn(None, || Err("cannot open x".to_string()));
+        status.link_jobs.push(failing);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !status.link_jobs.is_empty() {
+            assert!(Instant::now() < deadline, "the opener job never finished");
+            status.poll_link_errors();
+        }
         let msg = status.message.as_ref().expect("message set");
         assert_eq!(msg.text, "cannot open x");
         assert_eq!(msg.severity, Severity::Error);

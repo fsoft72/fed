@@ -77,16 +77,23 @@ impl FontManager {
     }
 
     /// Applies the results of the font loads once they are ready. Returns a warning for
-    /// every requested family that was not found.
+    /// every requested family that was not found or whose load crashed (the default font is
+    /// used then).
     pub(super) fn poll(&mut self, ctx: &egui::Context) -> Vec<String> {
         let mut warnings = Vec::new();
         for slot in [FontSlot::Editor, FontSlot::Preview] {
             let state = self.slot_mut(slot);
             let Some(load) = &state.load else { continue };
-            let Some(font) = load.take() else { continue };
+            let Some(result) = load.take() else { continue };
             let family = load.family().to_string();
             state.load = None;
-            warnings.extend(self.apply(ctx, slot, &family, font));
+            match result {
+                Ok(font) => warnings.extend(self.apply(ctx, slot, &family, font)),
+                Err(e) => {
+                    warnings.push(format!("font '{family}' could not be loaded: {e}"));
+                    self.apply(ctx, slot, "", None);
+                }
+            }
         }
         warnings
     }

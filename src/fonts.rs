@@ -10,6 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId};
 
+use crate::job::{BackgroundJob, JobError};
 use crate::sync;
 
 /// Name of the egui font family used by the editor and the vim command bar.
@@ -201,18 +202,13 @@ impl FontCatalog {
     /// Starts loading the regular face of `family` on a background thread, which waits for
     /// the scan when it is still running and then copies the face data, off the UI thread.
     pub fn load(&self, family: String) -> FontLoad {
-        let result = Arc::new(Mutex::new(None));
-        let thread_result = Arc::clone(&result);
         let slot = Arc::clone(&self.slot);
-        let ctx = self.ctx.clone();
         let wanted = family.clone();
-        std::thread::spawn(move || {
+        let job = BackgroundJob::spawn(Some(&self.ctx), move || {
             let scan = wait_for_scan(&slot);
-            let font = family_font(&scan.db, &wanted);
-            *sync::lock(&thread_result) = Some(font);
-            ctx.request_repaint();
+            family_font(&scan.db, &wanted)
         });
-        FontLoad { family, result }
+        FontLoad { family, job }
     }
 }
 
@@ -235,8 +231,8 @@ fn wait_for_scan(slot: &ScanSlot) -> Arc<Scan> {
 pub struct FontLoad {
     /// Requested family name.
     family: String,
-    /// `Some(result)` once the thread finished; `result` is `None` when the family was not found.
-    result: Arc<Mutex<Option<Option<FontData>>>>,
+    /// The load; its result is `None` when the family was not found.
+    job: BackgroundJob<Option<FontData>>,
 }
 
 impl FontLoad {
@@ -245,10 +241,11 @@ impl FontLoad {
         &self.family
     }
 
-    /// Takes the result once the thread finished: `Some(Some(font))` when found,
-    /// `Some(None)` when the family does not exist, `None` while still loading.
-    pub fn take(&self) -> Option<Option<FontData>> {
-        sync::lock(&self.result).take()
+    /// Takes the result once the thread finished: `Some(Ok(Some(font)))` when found,
+    /// `Some(Ok(None))` when the family does not exist, `Some(Err(_))` when the load crashed,
+    /// `None` while still loading.
+    pub fn take(&self) -> Option<Result<Option<FontData>, JobError>> {
+        self.job.poll()
     }
 }
 
@@ -326,7 +323,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(result) = load.take() {
-                return result;
+                return result.expect("the font load does not crash");
             }
             assert!(
                 std::time::Instant::now() < deadline,

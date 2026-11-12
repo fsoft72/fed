@@ -306,7 +306,7 @@ impl FedApp {
             pending: None,
             applied_theme: None,
             find_bar: FindBar::new(),
-            assets: AssetsHandle::spawn(ctx.clone()),
+            assets: AssetsHandle::spawn(ctx),
             loaded_assets: None,
             spell: None,
             spell_menu: None,
@@ -895,11 +895,16 @@ impl FedApp {
         }
     }
 
-    /// Takes the syntax assets once their background load is done and reports syntax
-    /// warm-ups that failed.
+    /// Takes the syntax assets once their background load is done (a crashed load is
+    /// reported) and reports syntax warm-ups that failed.
     fn poll_assets(&mut self) {
-        if self.loaded_assets.is_none() {
-            self.loaded_assets = self.assets.get();
+        match self.assets.poll() {
+            Some(Ok(assets)) => self.loaded_assets = Some(assets),
+            Some(Err(e)) => self.set_status(
+                format!("syntax highlighting unavailable: {e}"),
+                Severity::Error,
+            ),
+            None => {}
         }
         let Some(assets) = &self.loaded_assets else {
             return;

@@ -5,10 +5,11 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::SystemTime;
 
 use ropey::{Rope, RopeBuilder};
+
+use crate::job::BackgroundJob;
 
 /// Files at or above this many bytes are flagged as large.
 pub const LARGE_FILE_BYTES: usize = 5_000_000;
@@ -71,9 +72,9 @@ pub enum BufferError {
         /// The limit, `MAX_FILE_BYTES`.
         limit: u64,
     },
-    /// The background loader thread stopped without a result.
-    #[error("{0}: loading was interrupted")]
-    LoadInterrupted(PathBuf),
+    /// The background loader thread crashed or stopped without a result.
+    #[error("{0}: loading was interrupted ({1})")]
+    LoadInterrupted(PathBuf, crate::job::JobError),
     /// A save was requested but the buffer is not bound to a path.
     #[error("buffer has no file path")]
     NoPath,
@@ -813,24 +814,20 @@ pub struct LoadJob {
     path: PathBuf,
     /// Canonical form of `path` (`None` when the file does not exist).
     canonical: Option<PathBuf>,
-    /// Receives the load result.
-    rx: Receiver<Result<Buffer, BufferError>>,
+    /// The load running in the background.
+    job: BackgroundJob<Result<Buffer, BufferError>>,
 }
 
 impl LoadJob {
     /// Starts loading `path` with `Buffer::load` on a new thread.
     pub fn spawn(path: PathBuf) -> LoadJob {
-        let (tx, rx) = mpsc::channel();
         let thread_path = path.clone();
-        std::thread::spawn(move || {
-            // Nobody listening (the app closed) is fine.
-            let _ = tx.send(Buffer::load(&thread_path));
-        });
+        let job = BackgroundJob::spawn(None, move || Buffer::load(&thread_path));
         let canonical = fs::canonicalize(&path).ok();
         LoadJob {
             path,
             canonical,
-            rx,
+            job,
         }
     }
 
@@ -846,13 +843,8 @@ impl LoadJob {
 
     /// Returns the result once the thread is done, `None` while it is still loading.
     pub fn poll(&self) -> Option<Result<Buffer, BufferError>> {
-        match self.rx.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
-                Some(Err(BufferError::LoadInterrupted(self.path.clone())))
-            }
-        }
+        let result = self.job.poll()?;
+        Some(result.unwrap_or_else(|e| Err(BufferError::LoadInterrupted(self.path.clone(), e))))
     }
 }
 

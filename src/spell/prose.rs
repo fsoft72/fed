@@ -7,11 +7,11 @@
 //! parse is running it shows the last known ranges shifted by the edits made since.
 
 use std::ops::Range;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use eframe::egui;
 
 use crate::buffer::Buffer;
+use crate::job::BackgroundJob;
 
 use super::words;
 
@@ -21,8 +21,8 @@ struct Pending {
     revision: u64,
     /// Char length of the buffer at `revision`.
     len_chars: usize,
-    /// Receives the prose ranges when the parse is done.
-    rx: Receiver<Vec<Range<usize>>>,
+    /// The parse; its result is the prose ranges.
+    job: BackgroundJob<Vec<Range<usize>>>,
 }
 
 /// Last completed parse.
@@ -46,6 +46,8 @@ pub struct ProseRanges {
     shown: Vec<Range<usize>>,
     /// Buffer revision `shown` was computed for.
     shown_revision: Option<u64>,
+    /// Revision whose parse crashed: not parsed again until the buffer changes.
+    failed_revision: Option<u64>,
 }
 
 impl ProseRanges {
@@ -61,7 +63,8 @@ impl ProseRanges {
         self.poll();
         let revision = buffer.revision();
         let parsed_current = self.parsed.as_ref().is_some_and(|p| p.revision == revision);
-        if !parsed_current && self.pending.is_none() {
+        let failed = self.failed_revision == Some(revision);
+        if !parsed_current && !failed && self.pending.is_none() {
             self.spawn(buffer, ctx);
         }
         if self.shown_revision == Some(revision) {
@@ -88,7 +91,10 @@ impl ProseRanges {
     /// Takes the result of the running parse, if it is done.
     fn poll(&mut self) {
         let Some(pending) = &self.pending else { return };
-        match pending.rx.try_recv() {
+        let Some(result) = pending.job.poll() else {
+            return;
+        };
+        match result {
             Ok(ranges) => {
                 self.parsed = Some(Parsed {
                     revision: pending.revision,
@@ -97,29 +103,26 @@ impl ProseRanges {
                 });
                 // Force `shown` to be rebuilt from the new parse.
                 self.shown_revision = None;
-                self.pending = None;
             }
-            // The worker died (a parser panic): try again on the next refresh.
-            Err(TryRecvError::Disconnected) => self.pending = None,
-            Err(TryRecvError::Empty) => {}
+            // A parser panic: the last ranges stay (shifted); the next edit tries again.
+            Err(e) => {
+                eprintln!("fed: Markdown prose parse failed: {e}");
+                self.failed_revision = Some(pending.revision);
+            }
         }
+        self.pending = None;
     }
 
     /// Starts parsing a snapshot of `buffer` on a worker thread.
     fn spawn(&mut self, buffer: &Buffer, ctx: &egui::Context) {
         let rope = buffer.rope().clone();
-        let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let ranges = words::markdown_checkable(&rope.to_string());
-            // The tab may be gone: nobody listening is fine.
-            let _ = tx.send(ranges);
-            ctx.request_repaint();
+        let job = BackgroundJob::spawn(Some(ctx), move || {
+            words::markdown_checkable(&rope.to_string())
         });
         self.pending = Some(Pending {
             revision: buffer.revision(),
             len_chars: buffer.rope().len_chars(),
-            rx,
+            job,
         });
     }
 }

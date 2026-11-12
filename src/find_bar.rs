@@ -5,7 +5,6 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
 use eframe::egui::{self, Color32, Key, Modifiers, TextFormat};
@@ -14,6 +13,7 @@ use ropey::Rope;
 
 use crate::buffer::Buffer;
 use crate::editing::Selection;
+use crate::job::BackgroundJob;
 use crate::search::{self, SearchQuery};
 use crate::tab::Tab;
 use crate::text_nav;
@@ -66,8 +66,8 @@ struct SearchJob {
     query: SearchQuery,
     /// Set to stop the worker early.
     cancel: Arc<AtomicBool>,
-    /// Receives the matches (`None` when the worker was cancelled).
-    rx: Receiver<Option<Vec<Range<usize>>>>,
+    /// The search; its result is `None` when it was cancelled.
+    job: BackgroundJob<Option<Vec<Range<usize>>>>,
 }
 
 impl SearchJob {
@@ -76,11 +76,8 @@ impl SearchJob {
         let rope = buffer.rope().clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let found = search::find_all_until(&rope, &re, &worker_cancel);
-            // The bar may have moved on: nobody listening is fine.
-            let _ = tx.send(found);
+        let job = BackgroundJob::spawn(None, move || {
+            search::find_all_until(&rope, &re, &worker_cancel)
         });
         SearchJob {
             tab_id,
@@ -88,7 +85,7 @@ impl SearchJob {
             chars: buffer.rope().len_chars(),
             query: query.clone(),
             cancel,
-            rx,
+            job,
         }
     }
 
@@ -325,11 +322,10 @@ impl FindBar {
             *job = Some(SearchJob::spawn(tab_id, buffer, &self.query, re.clone()));
             return None;
         };
-        let base = match running.rx.try_recv() {
+        let base = match running.job.poll()? {
             Ok(Some(found)) => (running.revision, running.chars, Rc::new(found)),
-            Err(TryRecvError::Empty) => return None,
-            // The worker died (or was cancelled, which only happens on drop): search here.
-            Ok(None) | Err(TryRecvError::Disconnected) => here(),
+            // The worker crashed (or was cancelled, which only happens on drop): search here.
+            Ok(None) | Err(_) => here(),
         };
         *job = None;
         Some(base)

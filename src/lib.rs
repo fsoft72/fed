@@ -7,6 +7,7 @@ pub mod editing;
 pub mod find_bar;
 pub mod fonts;
 pub mod highlight;
+pub mod job;
 pub mod keymap;
 pub mod markdown;
 pub mod search;
