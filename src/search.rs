@@ -45,11 +45,6 @@ impl SearchQuery {
     }
 }
 
-/// Returns the text of line `index` without its trailing line break.
-fn line_content(rope: &Rope, index: usize) -> String {
-    line_text(rope, index).into_owned()
-}
-
 /// Returns the text of line `index` without its trailing line break, borrowed from the rope
 /// when the line is stored in one chunk (the common case).
 fn line_text(rope: &Rope, index: usize) -> Cow<'_, str> {
@@ -123,67 +118,82 @@ pub fn find_next(rope: &Rope, re: &Regex, from: usize, forward: bool) -> Option<
     })
 }
 
-/// Rewrites the content of `lines` (end-exclusive, 0-based) and returns the match count.
+/// Result of a successful `substitute`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Substitution {
+    /// Number of replacements made.
+    pub count: usize,
+    /// Last line (0-based, before the edit) that had a match.
+    pub last_line: usize,
+}
+
+/// Rewrites the content of `lines` (end-exclusive, 0-based) and returns the match count and
+/// the last line that matched.
 ///
 /// All edits happen inside the caller's undo group; they are applied bottom-up so
-/// earlier char offsets stay valid.
+/// earlier char offsets stay valid. Lines are borrowed from the rope while matching; only
+/// changed lines are copied.
 fn rewrite_lines(
     buf: &mut Buffer,
     re: &Regex,
     replacement: &str,
     lines: Range<usize>,
     global: bool,
-) -> usize {
+) -> (usize, Option<usize>) {
     let limit = if global { 0 } else { 1 };
     let end = lines.end.min(buf.rope().len_lines());
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     let mut count = 0;
+    let mut last_line = None;
     for index in lines.start..end {
-        let text = line_content(buf.rope(), index);
+        let rope = buf.rope();
+        let text = line_text(rope, index);
         let matches = if global {
             re.find_iter(&text).count()
         } else {
-            re.find(&text).iter().count()
+            usize::from(re.is_match(&text))
         };
         if matches == 0 {
             continue;
         }
         count += matches;
+        last_line = Some(index);
         let new_text = re.replacen(&text, limit, replacement).into_owned();
-        let start = buf.rope().line_to_char(index);
+        let start = rope.line_to_char(index);
         edits.push((start..start + text.chars().count(), new_text));
     }
     for (range, new_text) in edits.into_iter().rev() {
         buf.replace(range, &new_text);
     }
-    count
+    (count, last_line)
 }
 
 /// Substitutes matches within `lines` (end-exclusive, 0-based) as one undo step.
 ///
 /// With `global` false only the first match of each line is replaced. The replacement
-/// uses `regex` syntax (`$1`). Returns the number of replacements or `NotFound`.
+/// uses `regex` syntax (`$1`). Returns the number of replacements and the last line that
+/// matched, or `NotFound`.
 pub fn substitute(
     buf: &mut Buffer,
     re: &Regex,
     replacement: &str,
     lines: Range<usize>,
     global: bool,
-) -> Result<usize, SearchError> {
+) -> Result<Substitution, SearchError> {
     buf.begin_group();
-    let count = rewrite_lines(buf, re, replacement, lines, global);
+    let (count, last_line) = rewrite_lines(buf, re, replacement, lines, global);
     buf.end_group();
-    if count == 0 {
-        return Err(SearchError::NotFound);
+    match last_line {
+        Some(last_line) => Ok(Substitution { count, last_line }),
+        None => Err(SearchError::NotFound),
     }
-    Ok(count)
 }
 
 /// Replaces every match in the whole buffer as one undo step and returns the count.
 pub fn replace_all(buf: &mut Buffer, re: &Regex, replacement: &str) -> usize {
     let lines = 0..buf.rope().len_lines();
     buf.begin_group();
-    let count = rewrite_lines(buf, re, replacement, lines, true);
+    let (count, _) = rewrite_lines(buf, re, replacement, lines, true);
     buf.end_group();
     count
 }
@@ -287,17 +297,36 @@ mod tests {
     #[test]
     fn substitute_line_range_global() {
         let mut buf = Buffer::from_text("aa\naa\naa");
-        let count = substitute(&mut buf, &re("a"), "b", 1..3, true).unwrap();
-        assert_eq!(count, 4);
+        let done = substitute(&mut buf, &re("a"), "b", 1..3, true).unwrap();
+        assert_eq!(
+            done,
+            Substitution {
+                count: 4,
+                last_line: 2
+            }
+        );
         assert_eq!(buf.text(), "aa\nbb\nbb");
     }
 
     #[test]
     fn substitute_first_only() {
         let mut buf = Buffer::from_text("aa\naa\naa");
-        let count = substitute(&mut buf, &re("a"), "b", 0..3, false).unwrap();
-        assert_eq!(count, 3);
+        let done = substitute(&mut buf, &re("a"), "b", 0..3, false).unwrap();
+        assert_eq!(done.count, 3);
         assert_eq!(buf.text(), "ba\nba\nba");
+    }
+
+    #[test]
+    fn substitute_reports_the_last_matching_line() {
+        let mut buf = Buffer::from_text("x\na\nx\na\nx");
+        let done = substitute(&mut buf, &re("a"), "b", 0..5, true).unwrap();
+        assert_eq!(
+            done,
+            Substitution {
+                count: 2,
+                last_line: 3
+            }
+        );
     }
 
     #[test]

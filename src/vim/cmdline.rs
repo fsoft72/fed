@@ -347,17 +347,11 @@ fn substitute_lines(
         Ok(re) => re,
         Err(e) => return vec![VimEffect::Error(e.to_string())],
     };
-    // Like vim, the caret ends on the last line that had a match.
-    let rope = buf.rope();
-    let last_match = lines
-        .clone()
-        .filter(|&l| l < rope.len_lines())
-        .rfind(|&l| re.is_match(rope.line(l).to_string().trim_end_matches('\n')));
     match search::substitute(buf, &re, replacement, lines, global) {
-        Ok(n) => {
-            if let Some(line) = last_match {
-                caret_to_first_non_blank(buf, ed, line);
-            }
+        Ok(done) => {
+            // Like vim, the caret ends on the last line that had a match.
+            caret_to_first_non_blank(buf, ed, done.last_line);
+            let n = done.count;
             let plural = if n == 1 { "" } else { "s" };
             vec![VimEffect::Message(format!("{n} substitution{plural}"))]
         }
