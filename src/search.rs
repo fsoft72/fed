@@ -6,7 +6,7 @@ use std::ops::Range;
 use regex::{Regex, RegexBuilder};
 use ropey::Rope;
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, DirtyLines};
 
 /// A user search request: pattern text plus matching options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +83,42 @@ pub fn find_all(rope: &Rope, re: &Regex) -> Vec<Range<usize>> {
     (0..rope.len_lines())
         .flat_map(|index| line_matches(rope, re, index))
         .collect()
+}
+
+/// Brings `old`, the matches of a previous text of `old_chars` chars, up to date with `rope`
+/// after the edits described by `dirty`: matches before the changed lines are kept, the
+/// changed lines are searched again and the matches after them are shifted by the length
+/// change. Unknown edits (`dirty.old_end == usize::MAX`) search the whole rope.
+pub fn rescan_lines(
+    old: &[Range<usize>],
+    old_chars: usize,
+    rope: &Rope,
+    re: &Regex,
+    dirty: DirtyLines,
+) -> Vec<Range<usize>> {
+    let lines = rope.len_lines();
+    if dirty.old_end == usize::MAX || dirty.start > dirty.end || dirty.end > lines {
+        return find_all(rope, re);
+    }
+    let head_end = rope.line_to_char(dirty.start);
+    let tail_new = match dirty.end < lines {
+        true => rope.line_to_char(dirty.end),
+        false => rope.len_chars(),
+    };
+    let delta = rope.len_chars() as isize - old_chars as isize;
+    let tail_old = (tail_new as isize - delta) as usize;
+    let first_tail = old.partition_point(|m| m.start < tail_old);
+    let mut out: Vec<Range<usize>> = old
+        .iter()
+        .take_while(|m| m.start < head_end)
+        .cloned()
+        .collect();
+    out.extend((dirty.start..dirty.end).flat_map(|i| line_matches(rope, re, i)));
+    out.extend(old[first_tail..].iter().map(|m| {
+        let shift = |p: usize| (p as isize + delta) as usize;
+        shift(m.start)..shift(m.end)
+    }));
+    out
 }
 
 /// Finds the next match relative to char index `from`, wrapping around the document.
@@ -201,6 +237,30 @@ pub fn replace_all(buf: &mut Buffer, re: &Regex, replacement: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescan_lines_matches_a_full_search_after_edits() {
+        let re = Regex::new("ab").unwrap();
+        let mut buf = Buffer::from_text("ab x ab\nno\nab\n\nxab ab\nend ab");
+        let mut matches = find_all(buf.rope(), &re);
+        let edits: [(Range<usize>, &str); 7] = [
+            (0..0, "ab "),
+            (10..12, "abab\nab"),
+            (5..20, ""),
+            (3..3, "\n\n"),
+            (0..0, "zz"),
+            (8..9, "a"),
+            (2..4, "b\nab\nab"),
+        ];
+        for (range, text) in edits {
+            let (rev, chars) = (buf.revision(), buf.rope().len_chars());
+            let end = range.end.min(chars);
+            buf.replace(range.start.min(end)..end, text);
+            let dirty = buf.dirty_lines_since(rev).unwrap();
+            matches = rescan_lines(&matches, chars, buf.rope(), &re, dirty);
+            assert_eq!(matches, find_all(buf.rope(), &re), "after {text:?}");
+        }
+    }
 
     /// Builds a query with the given options.
     fn query(pattern: &str, regex: bool, case_sensitive: bool) -> SearchQuery {

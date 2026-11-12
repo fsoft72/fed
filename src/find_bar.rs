@@ -48,6 +48,8 @@ struct MatchCache {
     tab_id: u64,
     /// Buffer revision the matches were computed for.
     revision: u64,
+    /// Length in chars of the buffer at `revision` (to shift matches after an edit).
+    chars: usize,
     /// Query the matches were computed for.
     query: SearchQuery,
     /// Matches in document order.
@@ -182,28 +184,42 @@ impl FindBar {
         tab.focus_editor();
     }
 
-    /// Returns the matches of the current query in `tab` (empty while no search bar is
-    /// shown, the pattern is empty or invalid). Cached by tab, buffer revision and query.
+    /// Returns the matches of the current query in `tab` (see `matches_in`).
     pub fn matches(&self, tab: &Tab) -> Rc<Vec<Range<usize>>> {
+        self.matches_in(tab.id, &tab.buffer)
+    }
+
+    /// Returns the matches of the current query in `buffer` of the tab with id `tab_id`
+    /// (empty while no search bar is shown, the pattern is empty or invalid). Cached by tab,
+    /// buffer revision and query; after an edit only the changed lines are searched again.
+    pub fn matches_in(&self, tab_id: u64, buffer: &Buffer) -> Rc<Vec<Range<usize>>> {
         let empty = || Rc::new(Vec::new());
         if !matches!(self.mode, BarMode::Find | BarMode::Replace) || self.query.pattern.is_empty() {
             return empty();
         }
-        let revision = tab.buffer.revision();
-        if let Some(c) = &*self.cache.borrow()
-            && c.tab_id == tab.id
-            && c.revision == revision
-            && c.query == self.query
-        {
-            return c.matches.clone();
-        }
         let Ok(re) = self.regex() else {
             return empty();
         };
-        let matches = Rc::new(search::find_all(tab.buffer.rope(), &re));
+        let revision = buffer.revision();
+        let rope = buffer.rope();
+        let previous = self
+            .cache
+            .borrow()
+            .as_ref()
+            .filter(|c| c.tab_id == tab_id && c.query == self.query)
+            .map(|c| (c.revision, c.chars, c.matches.clone()));
+        let matches = match previous {
+            Some((rev, _, matches)) if rev == revision => return matches,
+            Some((rev, chars, old)) => match buffer.dirty_lines_since(rev) {
+                Some(dirty) => Rc::new(search::rescan_lines(&old, chars, rope, &re, dirty)),
+                None => old,
+            },
+            None => Rc::new(search::find_all(rope, &re)),
+        };
         *self.cache.borrow_mut() = Some(MatchCache {
-            tab_id: tab.id,
+            tab_id,
             revision,
+            chars: rope.len_chars(),
             query: self.query.clone(),
             matches: matches.clone(),
         });
@@ -590,27 +606,48 @@ pub fn overlay_background(
 pub struct MatchDecorator<'a> {
     /// Decorator providing the base spans (syntax highlighting, plain text, ...).
     inner: &'a mut dyn Decorator,
+    /// Find bar and tab id the matches are read from in `prepare`; `None` keeps `matches`.
+    source: Option<(&'a FindBar, u64)>,
     /// Matches as char ranges in the buffer, sorted by start.
-    matches: &'a [Range<usize>],
+    matches: Rc<Vec<Range<usize>>>,
     /// Snapshot of the buffer text taken in `prepare`, used to map lines to char offsets.
     rope: Option<Rope>,
 }
 
 impl<'a> MatchDecorator<'a> {
-    /// Wraps `inner`, highlighting `matches` (sorted char ranges in the buffer).
-    pub fn new(inner: &'a mut dyn Decorator, matches: &'a [Range<usize>]) -> MatchDecorator<'a> {
+    /// Wraps `inner`, highlighting the matches of `bar` in the tab with id `tab_id`. They are
+    /// read in `prepare`, after the frame's edits, so they always fit the drawn text.
+    pub fn new(inner: &'a mut dyn Decorator, bar: &'a FindBar, tab_id: u64) -> MatchDecorator<'a> {
         MatchDecorator {
             inner,
-            matches,
+            source: Some((bar, tab_id)),
+            matches: Rc::new(Vec::new()),
+            rope: None,
+        }
+    }
+
+    /// Wraps `inner`, highlighting the fixed `matches` (sorted char ranges in the buffer).
+    pub fn with_matches(
+        inner: &'a mut dyn Decorator,
+        matches: Vec<Range<usize>>,
+    ) -> MatchDecorator<'a> {
+        MatchDecorator {
+            inner,
+            source: None,
+            matches: Rc::new(matches),
             rope: None,
         }
     }
 }
 
 impl Decorator for MatchDecorator<'_> {
-    /// Prepares the inner decorator and snapshots the buffer text.
+    /// Prepares the inner decorator, reads the matches of the edited buffer and snapshots
+    /// its text.
     fn prepare(&mut self, buffer: &Buffer) {
         self.inner.prepare(buffer);
+        if let Some((bar, tab_id)) = self.source {
+            self.matches = bar.matches_in(tab_id, buffer);
+        }
         self.rope = Some(buffer.rope().clone());
     }
 
@@ -769,9 +806,8 @@ mod tests {
     #[test]
     fn match_decorator_maps_buffer_matches_to_lines() {
         let buf = Buffer::from_text("héllo\nfoo bar foo\n");
-        let matches = vec![6..9, 14..17];
         let mut plain = PlainDecorator;
-        let mut deco = MatchDecorator::new(&mut plain, &matches);
+        let mut deco = MatchDecorator::with_matches(&mut plain, vec![6..9, 14..17]);
         deco.prepare(&buf);
         let base = TextFormat::default();
         let line0 = deco.decorate(0, "héllo", &base);
@@ -781,6 +817,23 @@ mod tests {
         assert_eq!(ranges, vec![0..3, 3..8, 8..11]);
         assert_eq!(line1[0].1.background, MATCH_BACKGROUND);
         assert_eq!(line1[2].1.background, MATCH_BACKGROUND);
+    }
+
+    #[test]
+    fn match_decorator_reads_matches_after_the_edit() {
+        let mut tab = Tab::new(Buffer::from_text("ab"));
+        let mut bar = FindBar::new();
+        bar.open(BarMode::Find, &tab);
+        bar.query.pattern = "ab".to_string();
+        assert_eq!(*bar.matches(&tab), vec![0..2]);
+        tab.buffer.replace(0..0, "xx");
+        let mut plain = PlainDecorator;
+        let mut deco = MatchDecorator::new(&mut plain, &bar, tab.id);
+        deco.prepare(&tab.buffer);
+        let spans = deco.decorate(0, "xxab", &TextFormat::default());
+        let ranges: Vec<_> = spans.iter().map(|(r, _)| r.clone()).collect();
+        assert_eq!(ranges, vec![0..2, 2..4]);
+        assert_eq!(spans[1].1.background, MATCH_BACKGROUND);
     }
 
     #[test]
@@ -814,7 +867,9 @@ mod tests {
         assert_eq!(*first, vec![0..2, 3..5]);
         assert!(Rc::ptr_eq(&first, &bar.matches(&tab)));
         tab.buffer.replace(0..0, "ab ");
-        assert_eq!(bar.matches(&tab).len(), 3);
+        assert_eq!(*bar.matches(&tab), vec![0..2, 3..5, 6..8]);
+        tab.buffer.replace(4..8, "\nab");
+        assert_eq!(*bar.matches(&tab), vec![0..2, 5..7]);
         bar.mode = BarMode::Hidden;
         assert!(bar.matches(&tab).is_empty());
     }

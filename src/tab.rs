@@ -10,7 +10,7 @@ use eframe::egui;
 
 use crate::buffer::Buffer;
 use crate::editing::{self, EditCommand, EditSettings, EditorState};
-use crate::find_bar::MatchDecorator;
+use crate::find_bar::{FindBar, MatchDecorator};
 use crate::highlight::{self, HighlightAssets, HighlightCache, HighlightDecorator};
 use crate::markdown::Preview;
 use crate::spell::{SpellCache, SpellChecker, SpellDecorator, SpellMode};
@@ -31,8 +31,8 @@ pub struct EditorEnv<'a> {
     pub theme: &'a str,
     /// Spell checker, when spell checking is on and a dictionary is loaded.
     pub checker: Option<Arc<RwLock<SpellChecker>>>,
-    /// Find bar matches to highlight.
-    pub matches: &'a [Range<usize>],
+    /// Find bar whose matches are highlighted (read after the frame's edits).
+    pub find: &'a FindBar,
 }
 
 /// One open document shown in a tab.
@@ -165,7 +165,7 @@ impl Tab {
         let mode = SpellMode::for_document(self.buffer.path(), &syntax);
         let mut spelled =
             SpellDecorator::new(&mut highlighted, checker, mode, &mut spell, ui.ctx());
-        let mut deco = MatchDecorator::new(&mut spelled, env.matches);
+        let mut deco = MatchDecorator::new(&mut spelled, env.find, self.id);
         let out = view::show_editor(ui, self, opts, &mut deco, key_handler);
         drop(deco);
         drop(spelled);

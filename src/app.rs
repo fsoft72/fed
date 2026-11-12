@@ -834,7 +834,6 @@ impl eframe::App for FedApp {
             let Some(tab) = self.tabs.get_mut(self.active) else {
                 return;
             };
-            let matches = self.find_bar.matches(tab);
             if self.loaded_assets.is_none() {
                 self.loaded_assets = self.assets.get();
             }
@@ -846,7 +845,7 @@ impl eframe::App for FedApp {
                 assets: self.loaded_assets.as_ref(),
                 theme,
                 checker,
-                matches: &matches,
+                find: &self.find_bar,
             };
             let edit = opts.edit;
             let mut frame_ended = false;
