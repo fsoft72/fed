@@ -1,6 +1,7 @@
 //! Search engine shared by the find bar and the vim `/` and `:s` commands.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use regex::{Regex, RegexBuilder};
 use ropey::Rope;
@@ -66,9 +67,20 @@ fn line_matches(rope: &Rope, re: &Regex, index: usize) -> Vec<Range<usize>> {
 
 /// Returns every non-empty match in the rope as a char range, in document order.
 pub fn find_all(rope: &Rope, re: &Regex) -> Vec<Range<usize>> {
-    (0..rope.len_lines())
-        .flat_map(|index| line_matches(rope, re, index))
-        .collect()
+    find_all_until(rope, re, &AtomicBool::new(false)).unwrap_or_default()
+}
+
+/// `find_all` that gives up with `None` as soon as `cancel` is set (checked once per line),
+/// for searches running on a background thread.
+pub fn find_all_until(rope: &Rope, re: &Regex, cancel: &AtomicBool) -> Option<Vec<Range<usize>>> {
+    let mut found = Vec::new();
+    for index in 0..rope.len_lines() {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        found.extend(line_matches(rope, re, index));
+    }
+    Some(found)
 }
 
 /// Brings `old`, the matches of a previous text of `old_chars` chars, up to date with `rope`
@@ -459,6 +471,15 @@ mod tests {
         assert_eq!((dirty.start, dirty.end, dirty.old_end), (0, 2000, 2000));
         let matches = find_all(buf.rope(), &Regex::new("b").unwrap());
         assert_eq!(matches.len(), 2000);
+    }
+
+    #[test]
+    fn a_cancelled_search_gives_up() {
+        let rope = Rope::from_str("ab\nab\n");
+        let re = Regex::new("ab").unwrap();
+        assert_eq!(find_all_until(&rope, &re, &AtomicBool::new(true)), None);
+        let found = find_all_until(&rope, &re, &AtomicBool::new(false));
+        assert_eq!(found, Some(vec![0..2, 3..5]));
     }
 
     #[test]

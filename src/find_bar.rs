@@ -3,6 +3,10 @@
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::Duration;
 
 use eframe::egui::{self, Color32, Key, Modifiers, TextFormat};
 use regex::Regex;
@@ -41,6 +45,68 @@ pub enum BarMode {
     /// Go to line.
     GoToLine,
 }
+
+/// Documents of at least this many bytes are searched on a background thread when the query
+/// changes, so typing in the find field never waits for a whole-document regex pass.
+const BACKGROUND_SEARCH_BYTES: usize = 1024 * 1024;
+/// How often the bar polls a running background search.
+const SEARCH_POLL_INTERVAL: Duration = Duration::from_millis(30);
+/// Count label shown while a background search runs.
+const SEARCHING_LABEL: &str = "searching...";
+
+/// A whole-document search running on a background thread; dropping it cancels the search.
+struct SearchJob {
+    /// Tab searched.
+    tab_id: u64,
+    /// Buffer revision of the searched snapshot.
+    revision: u64,
+    /// Length in chars of that snapshot.
+    chars: usize,
+    /// Query searched.
+    query: SearchQuery,
+    /// Set to stop the worker early.
+    cancel: Arc<AtomicBool>,
+    /// Receives the matches (`None` when the worker was cancelled).
+    rx: Receiver<Option<Vec<Range<usize>>>>,
+}
+
+impl SearchJob {
+    /// Starts searching a snapshot of `buffer` for `re` (compiled from `query`).
+    fn spawn(tab_id: u64, buffer: &Buffer, query: &SearchQuery, re: Regex) -> SearchJob {
+        let rope = buffer.rope().clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let found = search::find_all_until(&rope, &re, &worker_cancel);
+            // The bar may have moved on: nobody listening is fine.
+            let _ = tx.send(found);
+        });
+        SearchJob {
+            tab_id,
+            revision: buffer.revision(),
+            chars: buffer.rope().len_chars(),
+            query: query.clone(),
+            cancel,
+            rx,
+        }
+    }
+
+    /// True when this job searches `query` in the tab with id `tab_id`.
+    fn is_for(&self, tab_id: u64, query: &SearchQuery) -> bool {
+        self.tab_id == tab_id && self.query == *query
+    }
+}
+
+impl Drop for SearchJob {
+    /// Stops the worker: its result is no longer wanted.
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Matches of a query at one buffer revision: `(revision, chars at that revision, matches)`.
+type MatchBase = (u64, usize, Rc<Vec<Range<usize>>>);
 
 /// Cached match list for one (tab, buffer revision, query) combination.
 struct MatchCache {
@@ -112,6 +178,10 @@ pub struct FindBar {
     /// Last compiled query and its result (the error message when it does not compile), so
     /// neither a valid nor an invalid pattern is compiled again every frame.
     compiled: RefCell<Option<(SearchQuery, Result<Regex, String>)>>,
+    /// Background search of a changed query in a big document, while it runs.
+    job: RefCell<Option<SearchJob>>,
+    /// The incremental selection of a changed query waits for the background search.
+    select_pending: bool,
     /// Number of regex compilations (tests check the cache with it).
     #[cfg(test)]
     compile_count: std::cell::Cell<usize>,
@@ -140,6 +210,8 @@ impl FindBar {
             focus_field: false,
             cache: RefCell::new(None),
             compiled: RefCell::new(None),
+            job: RefCell::new(None),
+            select_pending: false,
             #[cfg(test)]
             compile_count: std::cell::Cell::new(0),
         }
@@ -181,6 +253,8 @@ impl FindBar {
     pub fn close(&mut self, tab: &mut Tab) {
         self.mode = BarMode::Hidden;
         self.error = None;
+        self.job.borrow_mut().take();
+        self.select_pending = false;
         tab.focus_editor();
     }
 
@@ -208,13 +282,19 @@ impl FindBar {
             .as_ref()
             .filter(|c| c.tab_id == tab_id && c.query == self.query)
             .map(|c| (c.revision, c.chars, c.matches.clone()));
-        let matches = match previous {
-            Some((rev, _, matches)) if rev == revision => return matches,
-            Some((rev, chars, old)) => match buffer.dirty_lines_since(rev) {
+        let base = match previous {
+            Some(base) => base,
+            None => match self.search_whole(tab_id, buffer, &re) {
+                Some(base) => base,
+                None => return empty(),
+            },
+        };
+        let matches = match base {
+            (rev, _, matches) if rev == revision => matches,
+            (rev, chars, old) => match buffer.dirty_lines_since(rev) {
                 Some(dirty) => Rc::new(search::rescan_lines(&old, chars, rope, &re, dirty)),
                 None => old,
             },
-            None => Rc::new(search::find_all(rope, &re)),
         };
         *self.cache.borrow_mut() = Some(MatchCache {
             tab_id,
@@ -224,6 +304,40 @@ impl FindBar {
             matches: matches.clone(),
         });
         matches
+    }
+
+    /// Searches the whole of `buffer` for `re` (a query without cached matches). Small
+    /// documents are searched at once; big ones on a background thread, returning `None`
+    /// until its result is in (a job for another query or tab is cancelled first).
+    fn search_whole(&self, tab_id: u64, buffer: &Buffer, re: &Regex) -> Option<MatchBase> {
+        let rope = buffer.rope();
+        let here = || {
+            let found = Rc::new(search::find_all(rope, re));
+            (buffer.revision(), rope.len_chars(), found)
+        };
+        let mut job = self.job.borrow_mut();
+        if rope.len_bytes() < BACKGROUND_SEARCH_BYTES {
+            *job = None;
+            return Some(here());
+        }
+        let current = job.as_ref().filter(|j| j.is_for(tab_id, &self.query));
+        let Some(running) = current else {
+            *job = Some(SearchJob::spawn(tab_id, buffer, &self.query, re.clone()));
+            return None;
+        };
+        let base = match running.rx.try_recv() {
+            Ok(Some(found)) => (running.revision, running.chars, Rc::new(found)),
+            Err(TryRecvError::Empty) => return None,
+            // The worker died (or was cancelled, which only happens on drop): search here.
+            Ok(None) | Err(TryRecvError::Disconnected) => here(),
+        };
+        *job = None;
+        Some(base)
+    }
+
+    /// True while a background search of the current query runs.
+    pub fn is_searching(&self) -> bool {
+        self.job.borrow().is_some()
     }
 
     /// Draws the active bar and applies the user's actions to `tab`. Returns a status bar
@@ -241,6 +355,10 @@ impl FindBar {
 
     /// Draws the find (and replace) rows and applies what the user did.
     fn show_search(&mut self, ui: &mut egui::Ui, tab: &mut Tab) -> Option<String> {
+        self.finish_pending_select(tab);
+        if self.is_searching() {
+            ui.ctx().request_repaint_after(SEARCH_POLL_INTERVAL);
+        }
         let mut input = BarInput::default();
         let count = self.count_label(tab);
         let replace_mode = self.mode == BarMode::Replace;
@@ -346,14 +464,32 @@ impl FindBar {
         }
     }
 
-    /// Selects the first match at or after the caret (incremental search).
+    /// Selects the first match at or after the caret (incremental search). While a
+    /// background search runs the selection waits for its result.
     fn select_from_caret(&mut self, tab: &mut Tab) {
+        self.select_pending = false;
         if self.compiled().is_none() {
             return;
         }
+        let matches = self.matches(tab);
+        if self.is_searching() {
+            self.select_pending = true;
+            return;
+        }
         let from = tab.editor.selection.range().start;
-        if let Some(m) = next_match(&self.matches(tab), from, true) {
+        if let Some(m) = next_match(&matches, from, true) {
             select(tab, m);
+        }
+    }
+
+    /// Makes the incremental selection that waited for a background search, once it is done.
+    fn finish_pending_select(&mut self, tab: &mut Tab) {
+        if !self.select_pending {
+            return;
+        }
+        self.matches(tab);
+        if !self.is_searching() {
+            self.select_from_caret(tab);
         }
     }
 
@@ -419,6 +555,9 @@ impl FindBar {
             return String::new();
         }
         let matches = self.matches(tab);
+        if self.is_searching() {
+            return SEARCHING_LABEL.to_string();
+        }
         if matches.is_empty() {
             return "no matches".to_string();
         }
@@ -869,6 +1008,64 @@ mod tests {
         assert_eq!(*bar.matches(&tab), vec![0..2, 5..7]);
         bar.mode = BarMode::Hidden;
         assert!(bar.matches(&tab).is_empty());
+    }
+
+    /// Polls `bar` until its background search is done (at most a few seconds).
+    fn wait_for_search(bar: &FindBar, tab: &Tab) -> Rc<Vec<Range<usize>>> {
+        for _ in 0..500 {
+            let found = bar.matches(tab);
+            if !bar.is_searching() {
+                return found;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the background search did not finish");
+    }
+
+    /// A buffer of `lines` lines of 32 bytes, every one containing "needle" once.
+    fn big_tab(lines: usize) -> Tab {
+        let text: String = (0..lines).map(|i| format!("{i:>20} needle\n")).collect();
+        Tab::new(Buffer::from_text(&text))
+    }
+
+    #[test]
+    fn a_new_query_on_a_big_document_is_searched_in_the_background() {
+        let mut tab = big_tab(BACKGROUND_SEARCH_BYTES / 28 + 1);
+        let lines = tab.buffer.rope().len_lines() - 1;
+        let mut bar = FindBar::new();
+        bar.open(BarMode::Find, &tab);
+        bar.query.pattern = "needle".to_string();
+        assert!(
+            bar.matches(&tab).is_empty(),
+            "nothing until the search is done"
+        );
+        assert!(bar.is_searching());
+        assert_eq!(bar.count_label(&tab), SEARCHING_LABEL);
+        // An edit while the worker runs is applied to its result incrementally.
+        tab.buffer.replace(0..0, "needle ");
+        let found = wait_for_search(&bar, &tab);
+        assert_eq!(found.len(), lines + 1);
+        assert_eq!(found[0], 0..6);
+    }
+
+    #[test]
+    fn a_changed_query_cancels_the_running_search() {
+        let tab = big_tab(BACKGROUND_SEARCH_BYTES / 28 + 1);
+        let mut bar = FindBar::new();
+        bar.open(BarMode::Find, &tab);
+        bar.query.pattern = "needle".to_string();
+        bar.matches(&tab);
+        let first = Arc::clone(&bar.job.borrow().as_ref().unwrap().cancel);
+        bar.query.pattern = "needl".to_string();
+        bar.matches(&tab);
+        assert!(
+            first.load(Ordering::Relaxed),
+            "the old worker is told to stop"
+        );
+        assert_eq!(
+            wait_for_search(&bar, &tab).len(),
+            tab.buffer.rope().len_lines() - 1
+        );
     }
 
     #[test]
