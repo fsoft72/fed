@@ -17,6 +17,8 @@ use crate::spell::{SpellCache, SpellChecker, SpellDecorator, SpellMode};
 use crate::view::{self, KeyHandler, ViewOptions, ViewOutput, ViewState};
 use crate::vim::VimState;
 
+/// Most chars of the first line read to detect a syntax from it (a shebang or `<?php`).
+const FIRST_LINE_PROBE_CHARS: usize = 256;
 /// A pause in typing at least this long starts a new undo step.
 const TYPING_PAUSE: Duration = Duration::from_secs(1);
 
@@ -119,14 +121,17 @@ impl Tab {
         editing::apply_command(&mut self.editor, &mut self.buffer, cmd, settings)
     }
 
-    /// Picks the highlighting syntax from the buffer path. Cheap when nothing changed: the
-    /// lookup only runs the first time (assets just loaded) and after the path changed.
+    /// Picks the highlighting syntax from the buffer path, or from the first line (a shebang)
+    /// when the path tells nothing. Cheap when nothing changed: the lookup only runs the
+    /// first time (assets just loaded) and after the path changed.
     pub fn refresh_syntax(&mut self, assets: &HighlightAssets) {
         let path = self.buffer.path();
         if self.syntax.is_some() && self.syntax_path.as_deref() == path {
             return;
         }
-        self.syntax = Some(highlight::syntax_for_path(assets, path).into());
+        let rope = self.buffer.rope();
+        let first: String = rope.line(0).chars().take(FIRST_LINE_PROBE_CHARS).collect();
+        self.syntax = Some(highlight::syntax_for_file(assets, path, &first).into());
         self.syntax_path = path.map(PathBuf::from);
     }
 
@@ -279,6 +284,11 @@ mod tests {
         tab.buffer.set_path(PathBuf::from("notes.md"));
         tab.refresh_syntax(&assets);
         assert_eq!(tab.syntax.as_deref(), Some("Markdown"));
+        // A script without extension is recognized by its shebang.
+        let mut script = Tab::new(Buffer::from_text("#!/usr/bin/env python3\nprint(1)\n"));
+        script.buffer.set_path(PathBuf::from("bin/tool"));
+        script.refresh_syntax(&assets);
+        assert_eq!(script.syntax.as_deref(), Some("Python"));
     }
 
     #[test]

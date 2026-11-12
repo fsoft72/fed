@@ -50,7 +50,7 @@
 - [x] **`preview_open` and `preview` duplicate one state** - `Tab::preview_open` is true exactly when `preview` is (or is about to be) `Some`, and both are kept in sync by `toggle_preview` and `preview_panel`; keep only `preview: Option<Preview>` (created by the toggle) to remove the invariant.
   - File(s): `src/tab.rs`, `src/app.rs`
 
-- [ ] **Syntax detection ignores file names and shebangs** - `syntax_for_path` looks only at the extension, so `Makefile`, `Dockerfile`, `.bashrc` or an extensionless `#!/usr/bin/env python` script are shown as plain text (and spell checked as prose). Fall back to `find_syntax_by_name` on the file name and `find_syntax_by_first_line` on the first line.
+- [x] **Syntax detection ignores file names and shebangs** - `syntax_for_path` looks only at the extension, so `Makefile`, `Dockerfile`, `.bashrc` or an extensionless `#!/usr/bin/env python` script are shown as plain text (and spell checked as prose). Fall back to `find_syntax_by_name` on the file name and `find_syntax_by_first_line` on the first line.
   - File(s): `src/highlight.rs` (`syntax_for_path`), `src/tab.rs` (`refresh_syntax`)
 
 - [ ] **Find bar match index is a linear scan every frame** - `count_label` runs `matches.iter().position(|m| *m == sel)` each frame the bar is open; the matches are sorted, so use `partition_point` like `next_match`.

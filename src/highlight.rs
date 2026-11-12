@@ -211,10 +211,17 @@ pub struct StyledSpan {
     pub kind: SpanKind,
 }
 
-/// Returns the name of the syntax for `path` by extension, or `"Plain Text"`.
-pub fn syntax_for_path(assets: &HighlightAssets, path: Option<&Path>) -> String {
-    let ext = path.and_then(|p| p.extension()).and_then(|e| e.to_str());
-    ext.and_then(|e| assets.syntaxes.find_syntax_by_extension(e))
+/// Returns the name of the syntax of the file at `path` whose text starts with `first_line`:
+/// by whole file name (`Makefile`, `Dockerfile`, `.bashrc`, `CMakeLists.txt`), then by
+/// extension, then by the first line (`#!/usr/bin/env python3`, `<?php`), else
+/// `"Plain Text"`.
+pub fn syntax_for_file(assets: &HighlightAssets, path: Option<&Path>, first_line: &str) -> String {
+    let syntaxes = &assets.syntaxes;
+    let name = path.and_then(Path::file_name).and_then(|n| n.to_str());
+    let ext = path.and_then(Path::extension).and_then(|e| e.to_str());
+    name.and_then(|n| syntaxes.find_syntax_by_extension(n))
+        .or_else(|| ext.and_then(|e| syntaxes.find_syntax_by_extension(e)))
+        .or_else(|| syntaxes.find_syntax_by_first_line(first_line))
         .map_or_else(|| PLAIN_TEXT.to_string(), |s| s.name.clone())
 }
 
@@ -927,10 +934,36 @@ mod tests {
     #[test]
     fn syntax_for_path_extension() {
         let a = assets();
-        assert_eq!(syntax_for_path(&a, Some(Path::new("x.rs"))), "Rust");
-        assert_eq!(syntax_for_path(&a, Some(Path::new("x.md"))), "Markdown");
-        assert_eq!(syntax_for_path(&a, Some(Path::new("x.zzzz"))), "Plain Text");
-        assert_eq!(syntax_for_path(&a, None), "Plain Text");
+        let by_path = |p: Option<&str>| syntax_for_file(&a, p.map(Path::new), "");
+        assert_eq!(by_path(Some("x.rs")), "Rust");
+        assert_eq!(by_path(Some("x.md")), "Markdown");
+        assert_eq!(by_path(Some("x.zzzz")), "Plain Text");
+        assert_eq!(by_path(None), "Plain Text");
+        assert_eq!(by_path(Some("src/Makefile")), "Makefile");
+        assert_eq!(by_path(Some("Dockerfile")), "Dockerfile");
+        assert_eq!(
+            by_path(Some("/home/me/.bashrc")),
+            "Bourne Again Shell (bash)"
+        );
+        assert_eq!(
+            by_path(Some("CMakeLists.txt")),
+            "CMake",
+            "file name before extension"
+        );
+        let script = Some(Path::new("bin/run"));
+        assert_eq!(
+            syntax_for_file(&a, script, "#!/usr/bin/env python3\n"),
+            "Python"
+        );
+        assert_eq!(
+            syntax_for_file(&a, None, "#!/bin/bash"),
+            "Bourne Again Shell (bash)"
+        );
+        assert_eq!(
+            syntax_for_file(&a, Some(Path::new("x.rs")), "#!/bin/bash"),
+            "Rust",
+            "the extension wins over the first line"
+        );
     }
 
     #[test]
