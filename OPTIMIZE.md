@@ -41,7 +41,7 @@
 - [x] **Vim key translation lives in the editor widget** - `egui_event_to_vim_keys`, `egui_event_to_vim_key` and `key_to_vim_key` are in `view.rs`, so the generic widget depends on `vim::VimKey` and `app/vim.rs` reaches into `view` for vim logic; move them to a `vim::keys` module next to `VimKey`.
   - File(s): `src/view.rs`, `src/app/vim.rs`, `src/vim/mod.rs`
 
-- [ ] **Vim Insert-mode paste is replayed one key at a time** - `route_event` turns a pasted string into one `VimKey::Char` per character, so pasting a large text runs `handle_key` and a rope insert per char; add a text-insert path (e.g. `VimKey::Text(String)` or a `VimState::insert_text`) that applies the paste as one edit.
+- [x] **Vim Insert-mode paste is replayed one key at a time** - `route_event` turns a pasted string into one `VimKey::Char` per character, so pasting a large text runs `handle_key` and a rope insert per char; add a text-insert path (e.g. `VimKey::Text(String)` or a `VimState::insert_text`) that applies the paste as one edit.
   - File(s): `src/app/vim.rs`, `src/vim/insert.rs`
 
 - [ ] **`FedApp::ui` central-panel closure does too much** - besides drawing it polls the syntax assets (`self.loaded_assets = self.assets.get()`), picks the code theme, builds the `EditorEnv`, routes vim keys and records the context click; extract an `editor_panel` method returning a small result struct and poll the assets at the top of the frame with the other background jobs (fonts, loads, links).

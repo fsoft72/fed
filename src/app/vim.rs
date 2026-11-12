@@ -98,11 +98,10 @@ pub(super) fn route_event(
     }
     let keys: Vec<VimKey> = match ev {
         // Pasting types the text in Insert mode only (p/P use the register).
-        egui::Event::Paste(text) if tab.vim.mode() == Mode::Insert => text
-            .chars()
-            .filter(|&c| c != '\r')
-            .map(VimKey::Char)
-            .collect(),
+        // One key for the whole text: a big paste is a single edit, not one per char.
+        egui::Event::Paste(text) if tab.vim.mode() == Mode::Insert && !text.is_empty() => {
+            vec![VimKey::Text(text.clone())]
+        }
         _ => keys::egui_event_to_vim_keys(ev),
     };
     for key in keys {
@@ -273,6 +272,26 @@ mod tests {
         tab_width: 4,
         insert_spaces: true,
     };
+
+    #[test]
+    fn insert_mode_paste_is_routed_as_one_text_key() {
+        let mut tab = Tab::new(Buffer::from_text("\n"));
+        let (mut fx, mut ended) = (Vec::new(), false);
+        let paste = egui::Event::Paste("one\ntwo".into());
+        route_event(&paste, &mut tab, &SET, &mut fx, &mut ended);
+        assert_eq!(tab.buffer.text(), "\n", "Normal mode ignores the paste");
+        route_event(
+            &egui::Event::Text("i".into()),
+            &mut tab,
+            &SET,
+            &mut fx,
+            &mut ended,
+        );
+        let before = tab.buffer.revision();
+        route_event(&paste, &mut tab, &SET, &mut fx, &mut ended);
+        assert_eq!(tab.buffer.text(), "one\ntwo\n");
+        assert_eq!(tab.buffer.revision(), before + 1);
+    }
 
     #[test]
     fn vim_status_shows_mode_and_pending_keys() {

@@ -23,6 +23,7 @@ impl VimState {
         let rope = env.buf.rope();
         match key {
             VimKey::Char(c) => insert_at(env, pos, &c.to_string()),
+            VimKey::Text(text) => insert_at(env, pos, &text),
             VimKey::Enter => self.insert_newline(pos, env),
             VimKey::Tab => insert_soft_tab(pos, env),
             VimKey::Backspace if pos > 0 => {
@@ -91,9 +92,10 @@ impl VimState {
     }
 }
 
-/// Inserts `text` at `pos` and puts the caret after it.
+/// Inserts `text` at `pos` and puts the caret after it (line breaks are normalized to LF).
 fn insert_at(env: &mut Env, pos: usize, text: &str) {
-    env.buf.replace(pos..pos, text);
+    let text = crate::buffer::normalize_newlines(text);
+    env.buf.replace(pos..pos, &text);
     env.set_caret(pos + text.chars().count());
 }
 

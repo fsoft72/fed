@@ -656,3 +656,38 @@ fn insert_tab_uses_the_display_column() {
     // After "ab\tx" the display column is 5: three spaces reach column 8.
     assert_eq!(h.buf.text(), "ab\tx   \n");
 }
+
+#[test]
+fn pasted_text_is_one_edit_in_the_insert_step() {
+    let mut h = Harness::new("ab\n", 1);
+    h.feed("i");
+    let before = h.buf.revision();
+    let fx = h.vim.handle_key(
+        VimKey::Text("x\r\ny".repeat(1000)),
+        &mut h.buf,
+        &mut h.ed,
+        &SET,
+    );
+    assert!(fx.is_empty());
+    assert_eq!(h.buf.revision(), before + 1, "a single edit");
+    assert_eq!(h.caret(), 1 + 3 * 1000);
+    h.feed("z<Esc>");
+    let pasted = "x\ny".repeat(1000);
+    assert_eq!(h.buf.text(), format!("a{pasted}zb\n"));
+    // The paste and the typed char are one undo step, and `.` repeats both.
+    h.feed("u");
+    assert_eq!(h.buf.text(), "ab\n");
+    h.feed(".");
+    assert_eq!(h.buf.text(), format!("a{pasted}zb\n"));
+}
+
+#[test]
+fn pasted_text_is_ignored_outside_insert_mode() {
+    let mut h = Harness::new("ab\n", 0);
+    let fx = h
+        .vim
+        .handle_key(VimKey::Text("x".into()), &mut h.buf, &mut h.ed, &SET);
+    assert!(fx.is_empty());
+    assert_eq!(h.buf.text(), "ab\n");
+    assert_eq!(h.vim.mode(), Mode::Normal);
+}

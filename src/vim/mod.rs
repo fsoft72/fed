@@ -71,6 +71,8 @@ pub enum VimKey {
     Up,
     /// Down arrow.
     Down,
+    /// Text pasted in Insert mode, inserted as one edit (ignored in the other modes).
+    Text(String),
 }
 
 /// A side effect the UI must perform after a key.
