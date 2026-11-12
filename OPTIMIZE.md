@@ -18,7 +18,7 @@
 - [ ] **Two parallel dirty-line mechanisms in `Buffer`** - `take_dirty_line` mutates a `Cell` through `&Buffer` and can only have one consumer (the highlight decorator of the frame that happens to run `prepare`), while `dirty_lines_since` already gives every consumer its own revision-based view; `HighlightDecorator::last_dirty` is dead code left over from it. Move `HighlightCache` to `dirty_lines_since` with its own revision and delete `dirty_line`, `take_dirty_line` and `last_dirty`.
   - File(s): `src/buffer.rs`, `src/highlight.rs`
 
-- [ ] **Saving copies the whole text two or three times** - `write_copy` builds `rope.to_string()` and then a second `String` with `replace('\n', "\r\n")` for CRLF files, so saving a 256 MB file allocates over 500 MB; stream `rope.chunks()` through a `BufWriter`, converting line endings on the fly.
+- [x] **Saving copies the whole text two or three times** - `write_copy` builds `rope.to_string()` and then a second `String` with `replace('\n', "\r\n")` for CRLF files, so saving a 256 MB file allocates over 500 MB; stream `rope.chunks()` through a `BufWriter`, converting line endings on the fly.
   - File(s): `src/buffer.rs` (`Buffer::write_copy`)
 
 ## Medium

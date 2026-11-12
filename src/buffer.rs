@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -250,11 +250,8 @@ impl Buffer {
         let mut tmp_name = path.as_os_str().to_os_string();
         tmp_name.push(TMP_SUFFIX);
         let tmp = PathBuf::from(tmp_name);
-        let mut content = self.rope.to_string();
-        if self.line_ending == LineEnding::Crlf {
-            content = content.replace('\n', "\r\n");
-        }
-        write_synced(&tmp, &content).map_err(io_err)?;
+        let crlf = self.line_ending == LineEnding::Crlf;
+        write_synced(&tmp, &self.rope, crlf).map_err(io_err)?;
         // Keep the original file mode (the rename creates a new inode).
         if let Ok(meta) = fs::metadata(path)
             && let Err(e) = fs::set_permissions(&tmp, meta.permissions())
@@ -522,12 +519,33 @@ impl Buffer {
     }
 }
 
-/// Creates (or truncates) the file at `path`, writes `content` and flushes it to the disk,
-/// so a rename over the original never exposes a file whose data is not stored yet.
-fn write_synced(path: &Path, content: &str) -> std::io::Result<()> {
-    let mut file = fs::File::create(path)?;
-    file.write_all(content.as_bytes())?;
+/// Creates (or truncates) the file at `path`, streams the chunks of `rope` into it (LF
+/// written as CRLF when `crlf` is set) and flushes it to the disk, so a rename over the
+/// original never exposes a file whose data is not stored yet. The text is never copied
+/// into one big string.
+fn write_synced(path: &Path, rope: &Rope, crlf: bool) -> std::io::Result<()> {
+    let mut out = BufWriter::new(fs::File::create(path)?);
+    for chunk in rope.chunks() {
+        match crlf {
+            true => write_crlf(&mut out, chunk)?,
+            false => out.write_all(chunk.as_bytes())?,
+        }
+    }
+    let file = out.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()
+}
+
+/// Writes `chunk` to `out` with every `\n` written as `\r\n`.
+fn write_crlf(out: &mut impl Write, chunk: &str) -> std::io::Result<()> {
+    let mut pieces = chunk.split('\n');
+    if let Some(first) = pieces.next() {
+        out.write_all(first.as_bytes())?;
+    }
+    for piece in pieces {
+        out.write_all(b"\r\n")?;
+        out.write_all(piece.as_bytes())?;
+    }
+    Ok(())
 }
 
 /// Directory holding `path`: its parent, or `.` for a bare file name.
@@ -677,11 +695,39 @@ mod tests {
     fn synced_write_stores_content_and_dir_syncs() {
         let dir = temp_dir("synced");
         let path = dir.join("a.txt");
-        write_synced(&path, "one").unwrap();
-        write_synced(&path, "two").unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        write_synced(&path, &Rope::from_str("one"), false).unwrap();
+        write_synced(&path, &Rope::from_str("t\nwo\n"), true).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "t\r\nwo\r\n");
         sync_dir(&dir).unwrap();
         assert!(sync_dir(&dir.join("missing")).is_err());
+    }
+
+    #[test]
+    fn crlf_conversion_handles_chunk_edges() {
+        for (input, want) in [
+            ("", ""),
+            ("\n", "\r\n"),
+            ("a\nb", "a\r\nb"),
+            ("\n\na\n", "\r\n\r\na\r\n"),
+        ] {
+            let mut out = Vec::new();
+            write_crlf(&mut out, input).unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn multi_chunk_crlf_save_matches_text() {
+        let line = "abcdefghij".repeat(10);
+        let text: String = (0..2000).map(|i| format!("{i} {line}\n")).collect();
+        let buf = Buffer::from_text(&text.replace('\n', "\r\n"));
+        assert!(buf.rope().chunks().count() > 1);
+        let path = temp_dir("chunks").join("a.txt");
+        buf.write_copy(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            text.replace('\n', "\r\n")
+        );
     }
 
     #[test]
