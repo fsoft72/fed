@@ -9,7 +9,7 @@ mod tab_bar;
 mod vim;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -101,11 +101,21 @@ fn shortcut_action(keymap: &Keymap, key: egui::Key, mods: egui::Modifiers) -> Op
     if let Some(action) = keymap.lookup(&chord) {
         return Some(action);
     }
-    SHORTCUT_ALIASES.iter().find_map(|(text, action)| {
-        let alias = KeyChord::parse(text).expect("shortcut aliases are valid chords");
-        (alias == chord).then_some(*action)
-    })
+    PARSED_ALIASES
+        .iter()
+        .find_map(|(alias, action)| (*alias == chord).then_some(*action))
 }
+
+/// `SHORTCUT_ALIASES` parsed once.
+static PARSED_ALIASES: LazyLock<Vec<(KeyChord, Action)>> = LazyLock::new(|| {
+    SHORTCUT_ALIASES
+        .iter()
+        .map(|(text, action)| {
+            let chord = KeyChord::parse(text).expect("shortcut aliases are valid chords");
+            (chord, *action)
+        })
+        .collect()
+});
 
 /// True for actions that edit the text and must leave text fields (find bar) alone.
 fn needs_editor_focus(action: Action) -> bool {
@@ -997,6 +1007,16 @@ mod tests {
             shortcut_action(&km, egui::Key::N, egui::Modifiers::NONE),
             None
         );
+    }
+
+    #[test]
+    fn every_shortcut_alias_is_parsed() {
+        assert_eq!(PARSED_ALIASES.len(), SHORTCUT_ALIASES.len());
+        for ((text, action), (chord, parsed)) in SHORTCUT_ALIASES.iter().zip(PARSED_ALIASES.iter())
+        {
+            assert_eq!(KeyChord::parse(text).as_ref(), Ok(chord));
+            assert_eq!(action, parsed);
+        }
     }
 
     #[test]

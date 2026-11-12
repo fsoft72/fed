@@ -52,7 +52,7 @@
 
 ## Low / Nice to have
 
-- [ ] **Shortcut aliases are re-parsed on every key press** - `shortcut_action` runs `KeyChord::parse` for every `SHORTCUT_ALIASES` entry each time a key is not in the keymap; parse them once into a `LazyLock<Vec<(KeyChord, Action)>>`.
+- [x] **Shortcut aliases are re-parsed on every key press** - `shortcut_action` runs `KeyChord::parse` for every `SHORTCUT_ALIASES` entry each time a key is not in the keymap; parse them once into a `LazyLock<Vec<(KeyChord, Action)>>`.
   - File(s): `src/app.rs`
 
 - [ ] **The whole input event list is cloned every frame** - `handle_keyboard` does `ui.input(|i| i.events.clone())` even when no key was pressed; clone only the keyboard events (or return early when there are none).
