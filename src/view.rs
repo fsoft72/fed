@@ -850,7 +850,8 @@ impl Frame<'_> {
                 pos2(caret.min.x - text_x, caret.min.y),
                 pos2(caret.max.x + margin, caret.max.y),
             );
-            ui.scroll_to_rect(target, None);
+            // Caret jumps (`G`, `:N`, find next, ...) land instantly, never with a smooth scroll.
+            ui.scroll_to_rect_animation(target, None, egui::style::ScrollAnimation::none());
         }
         if self.focused {
             self.paint_caret(ui, caret);
