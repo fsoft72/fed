@@ -85,6 +85,12 @@ pub struct FindBar {
     focus_field: bool,
     /// Match list cache.
     cache: RefCell<Option<MatchCache>>,
+    /// Last compiled query and its result (the error message when it does not compile), so
+    /// neither a valid nor an invalid pattern is compiled again every frame.
+    compiled: RefCell<Option<(SearchQuery, Result<Regex, String>)>>,
+    /// Number of regex compilations (tests check the cache with it).
+    #[cfg(test)]
+    compile_count: std::cell::Cell<usize>,
 }
 
 impl Default for FindBar {
@@ -109,7 +115,25 @@ impl FindBar {
             error: None,
             focus_field: false,
             cache: RefCell::new(None),
+            compiled: RefCell::new(None),
+            #[cfg(test)]
+            compile_count: std::cell::Cell::new(0),
         }
+    }
+
+    /// Returns the current query compiled, or its error message, compiling only when the
+    /// query changed since the last call.
+    fn regex(&self) -> Result<Regex, String> {
+        if let Some((query, result)) = &*self.compiled.borrow()
+            && *query == self.query
+        {
+            return result.clone();
+        }
+        #[cfg(test)]
+        self.compile_count.set(self.compile_count.get() + 1);
+        let result = self.query.compile().map_err(|e| e.to_string());
+        *self.compiled.borrow_mut() = Some((self.query.clone(), result.clone()));
+        result
     }
 
     /// Shows the bar in `mode` and focuses its field. Find and Replace pre-fill the query
@@ -151,7 +175,7 @@ impl FindBar {
         {
             return c.matches.clone();
         }
-        let Ok(re) = self.query.compile() else {
+        let Ok(re) = self.regex() else {
             return empty();
         };
         let matches = Rc::new(search::find_all(tab.buffer.rope(), &re));
@@ -279,10 +303,10 @@ impl FindBar {
         if self.query.pattern.is_empty() {
             return None;
         }
-        match self.query.compile() {
+        match self.regex() {
             Ok(re) => Some(re),
             Err(e) => {
-                self.error = Some(short_error(&e.to_string()));
+                self.error = Some(short_error(&e));
                 None
             }
         }
@@ -742,6 +766,27 @@ mod tests {
         assert_eq!(ranges, vec![0..3, 3..8, 8..11]);
         assert_eq!(line1[0].1.background, MATCH_BACKGROUND);
         assert_eq!(line1[2].1.background, MATCH_BACKGROUND);
+    }
+
+    #[test]
+    fn regex_is_compiled_once_per_query_even_when_invalid() {
+        let mut bar = FindBar::new();
+        bar.mode = BarMode::Find;
+        bar.query.regex = true;
+        bar.query.pattern = "(".to_string();
+        let mut tab = Tab::new(Buffer::from_text("a(b"));
+        for _ in 0..5 {
+            assert!(bar.matches(&tab).is_empty());
+        }
+        assert!(bar.compiled().is_none());
+        assert!(bar.error.is_some());
+        assert_eq!(bar.compile_count.get(), 1);
+        bar.query.pattern = "b".to_string();
+        bar.replacement = "b".to_string();
+        bar.step(&mut tab, true);
+        bar.replace_current(&mut tab);
+        assert_eq!(bar.matches(&tab).len(), 1);
+        assert_eq!(bar.compile_count.get(), 2);
     }
 
     #[test]

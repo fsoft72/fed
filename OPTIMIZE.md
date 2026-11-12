@@ -34,7 +34,7 @@
 
 - [x] **Font work duplicated and partly on the UI thread** - startup runs up to three full `fontdb` system scans (`FontLoad::spawn` for editor and preview, then `FontCatalog::spawn`), and `FontCatalog::load_family_font` copies the whole font file on the UI thread from `FedApp::load_font`; share one scanned database and load the chosen face in the background. Also, if the catalog is still scanning, `load_font` reports a false "font not found".
   - File(s): `src/fonts.rs`, `src/app.rs`
-- [ ] **Find bar recompiles regexes every frame** - `FindBar::matches` (called every frame from `FedApp::ui`) only caches on successful compilation, so an invalid pattern is recompiled each frame; `step` and `replace_current` also compile twice on a cache miss. Cache the compile result (including the error) keyed by the query.
+- [x] **Find bar recompiles regexes every frame** - `FindBar::matches` (called every frame from `FedApp::ui`) only caches on successful compilation, so an invalid pattern is recompiled each frame; `step` and `replace_current` also compile twice on a cache miss. Cache the compile result (including the error) keyed by the query.
   - File(s): `src/find_bar.rs`
 - [ ] **Visual `>`/`<` shifts one line too many** - `apply_operator` maps `OpRange::Chars(r)` to lines with `char_to_line(r.end)` on an exclusive end, so a selection ending on `\n` (`v$>`, `v>` on an empty line) also indents the next line.
   - File(s): `src/vim/mod.rs`
