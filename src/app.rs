@@ -738,16 +738,14 @@ impl FedApp {
         );
     }
 
-    /// Applies the configured family of `slot` (a warning goes to the status bar when it does
-    /// not exist).
+    /// Switches `slot` to its configured family (loaded in the background; a family that does
+    /// not exist is reported by the next `FontManager::poll`).
     fn load_font(&mut self, ctx: &egui::Context, slot: FontSlot) {
         let family = match slot {
             FontSlot::Editor => self.settings.font_family.as_deref(),
             FontSlot::Preview => self.settings.preview_font_family.as_deref(),
         };
-        if let Some(warning) = self.fonts.load(ctx, slot, family) {
-            self.set_status(warning, Severity::Warning);
-        }
+        self.fonts.load(ctx, slot, family);
     }
 
     /// Carries out an entry picked in the application menu.

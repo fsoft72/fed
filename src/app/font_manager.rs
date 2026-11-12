@@ -44,22 +44,22 @@ impl FontManager {
     /// on background threads.
     pub(super) fn new(ctx: &egui::Context, settings: &Settings) -> FontManager {
         fonts::apply_fonts(ctx, None, None);
-        let spawn = |family: &Option<String>| {
-            family
-                .as_ref()
-                .map(|f| FontLoad::spawn(ctx.clone(), f.clone()))
-        };
-        FontManager {
-            editor: SlotState {
-                load: spawn(&settings.font_family),
-                loaded: None,
-            },
-            preview: SlotState {
-                load: spawn(&settings.preview_font_family),
-                loaded: None,
-            },
+        let mut manager = FontManager {
+            editor: SlotState::default(),
+            preview: SlotState::default(),
             catalog: None,
+        };
+        // Both configured fonts come from one system scan, started only when needed.
+        for (slot, family) in [
+            (FontSlot::Editor, &settings.font_family),
+            (FontSlot::Preview, &settings.preview_font_family),
+        ] {
+            if let Some(family) = family {
+                let load = manager.catalog(ctx).load(family.clone());
+                manager.slot_mut(slot).load = Some(load);
+            }
         }
+        manager
     }
 
     /// Returns the state of `slot`.
@@ -76,8 +76,8 @@ impl FontManager {
             .get_or_insert_with(|| FontCatalog::spawn(ctx.clone()))
     }
 
-    /// Applies the results of the startup font loads once they are ready. Returns a warning
-    /// for every configured family that was not found.
+    /// Applies the results of the font loads once they are ready. Returns a warning for
+    /// every requested family that was not found.
     pub(super) fn poll(&mut self, ctx: &egui::Context) -> Vec<String> {
         let mut warnings = Vec::new();
         for slot in [FontSlot::Editor, FontSlot::Preview] {
@@ -91,23 +91,17 @@ impl FontManager {
         warnings
     }
 
-    /// Applies `family` (`None`: the default font) to `slot` from the font catalog, cancelling
-    /// a pending startup load. Returns a warning when the family was not found.
-    pub(super) fn load(
-        &mut self,
-        ctx: &egui::Context,
-        slot: FontSlot,
-        family: Option<&str>,
-    ) -> Option<String> {
+    /// Switches `slot` to `family`, replacing any load in progress. `None` installs the
+    /// default font at once; a family is loaded in the background and applied by `poll`
+    /// (which reports a family that does not exist).
+    pub(super) fn load(&mut self, ctx: &egui::Context, slot: FontSlot, family: Option<&str>) {
         self.slot_mut(slot).load = None;
         let Some(family) = family else {
-            return self.apply(ctx, slot, "", None);
+            self.apply(ctx, slot, "", None);
+            return;
         };
-        let font = self
-            .catalog
-            .as_ref()
-            .and_then(|c| c.load_family_font(family));
-        self.apply(ctx, slot, family, font)
+        let load = self.catalog(ctx).load(family.to_string());
+        self.slot_mut(slot).load = Some(load);
     }
 
     /// Installs `font` in `slot`, or the default font when `font` is `None`. Returns a
@@ -135,16 +129,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_font_needs_no_warning_and_unknown_family_warns() {
+    fn default_font_needs_no_scan_and_unknown_family_warns() {
         let ctx = egui::Context::default();
         let mut fonts = FontManager::new(&ctx, &Settings::default());
-        assert_eq!(fonts.load(&ctx, FontSlot::Editor, None), None);
-        // Without a catalog scan nothing can be found.
-        assert_eq!(
-            fonts.load(&ctx, FontSlot::Preview, Some("No Such Font")),
-            Some(not_found_warning("No Such Font"))
-        );
-        assert!(fonts.preview.loaded.is_none());
+        assert!(fonts.catalog.is_none(), "no configured family: no scan");
+        fonts.load(&ctx, FontSlot::Editor, None);
+        assert!(fonts.catalog.is_none());
         assert!(fonts.poll(&ctx).is_empty());
+        let warning = fonts.apply(&ctx, FontSlot::Preview, "No Such Font", None);
+        assert_eq!(warning, Some(not_found_warning("No Such Font")));
+        assert!(fonts.preview.loaded.is_none());
     }
 }

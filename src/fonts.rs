@@ -6,7 +6,7 @@
 //! has the same kind of family, `FontFamily::Name("preview")`, aliasing the proportional fonts.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId};
 
@@ -133,30 +133,36 @@ struct Scan {
 /// Shared, read-only list of font family names with their monospace flag.
 pub type FamilyList = Arc<[(String, bool)]>;
 
-/// The system font families, scanned on a background thread.
+/// Scan result slot shared with the scanner and the face loaders, which wait on the condvar.
+type ScanSlot = Arc<(Mutex<Option<Arc<Scan>>>, Condvar)>;
+
+/// The system font families, scanned once on a background thread. Every font load waits
+/// for this one scan instead of scanning the system again.
 pub struct FontCatalog {
-    /// Filled by the scanner thread when the scan is done.
-    slot: Arc<Mutex<Option<Arc<Scan>>>>,
+    /// Filled (and notified) by the scanner thread when the scan is done.
+    slot: ScanSlot,
+    /// Repainted when a scan or a face load finishes.
+    ctx: egui::Context,
 }
 
 impl FontCatalog {
     /// Starts scanning the system fonts in a thread and requests a repaint when done.
     pub fn spawn(ctx: egui::Context) -> FontCatalog {
-        let slot = Arc::new(Mutex::new(None));
+        let slot: ScanSlot = Arc::new((Mutex::new(None), Condvar::new()));
         let thread_slot = Arc::clone(&slot);
+        let thread_ctx = ctx.clone();
         std::thread::spawn(move || {
             let db = system_database();
             let families = family_list(&db).into();
-            let scan = Arc::new(Scan { db, families });
-            *thread_slot.lock().expect("font catalog poisoned") = Some(scan);
-            ctx.request_repaint();
+            publish_scan(&thread_slot, Scan { db, families });
+            thread_ctx.request_repaint();
         });
-        FontCatalog { slot }
+        FontCatalog { slot, ctx }
     }
 
     /// Returns the finished scan, without blocking on the scanner.
     fn scan(&self) -> Option<Arc<Scan>> {
-        self.slot.lock().expect("font catalog poisoned").clone()
+        self.slot.0.lock().expect("font catalog poisoned").clone()
     }
 
     /// Returns the family names (sorted, monospace flag), or `None` while scanning. The
@@ -165,35 +171,50 @@ impl FontCatalog {
         self.scan().map(|scan| Arc::clone(&scan.families))
     }
 
-    /// Returns the regular face of `family` with its face index, or `None` while scanning or
-    /// when the family is unknown.
-    pub fn load_family_font(&self, family: &str) -> Option<FontData> {
-        family_font(&self.scan()?.db, family)
+    /// Starts loading the regular face of `family` on a background thread, which waits for
+    /// the scan when it is still running and then copies the face data, off the UI thread.
+    pub fn load(&self, family: String) -> FontLoad {
+        let result = Arc::new(Mutex::new(None));
+        let thread_result = Arc::clone(&result);
+        let slot = Arc::clone(&self.slot);
+        let ctx = self.ctx.clone();
+        let wanted = family.clone();
+        std::thread::spawn(move || {
+            let scan = wait_for_scan(&slot);
+            let font = family_font(&scan.db, &wanted);
+            *thread_result.lock().expect("font load poisoned") = Some(font);
+            ctx.request_repaint();
+        });
+        FontLoad { family, result }
     }
 }
 
-/// Loads one family's regular face on a background thread (startup font, no full catalog).
+/// Stores `scan` in `slot` and wakes the loaders waiting for it.
+fn publish_scan(slot: &ScanSlot, scan: Scan) {
+    let (lock, ready) = &**slot;
+    *lock.lock().expect("font catalog poisoned") = Some(Arc::new(scan));
+    ready.notify_all();
+}
+
+/// Blocks until the scan in `slot` is available and returns it.
+fn wait_for_scan(slot: &ScanSlot) -> Arc<Scan> {
+    let (lock, ready) = &**slot;
+    let guard = lock.lock().expect("font catalog poisoned");
+    let guard = ready
+        .wait_while(guard, |scan| scan.is_none())
+        .expect("font catalog poisoned");
+    Arc::clone(guard.as_ref().expect("scan is set"))
+}
+
+/// The regular face of one family, loaded on a background thread from the catalog scan.
 pub struct FontLoad {
     /// Requested family name.
     family: String,
     /// `Some(result)` once the thread finished; `result` is `None` when the family was not found.
-    slot: Arc<Mutex<Option<Option<FontData>>>>,
+    result: Arc<Mutex<Option<Option<FontData>>>>,
 }
 
 impl FontLoad {
-    /// Starts scanning the system fonts for `family` and requests a repaint when done.
-    pub fn spawn(ctx: egui::Context, family: String) -> FontLoad {
-        let slot = Arc::new(Mutex::new(None));
-        let thread_slot = Arc::clone(&slot);
-        let wanted = family.clone();
-        std::thread::spawn(move || {
-            let font = family_font(&system_database(), &wanted);
-            *thread_slot.lock().expect("font load poisoned") = Some(font);
-            ctx.request_repaint();
-        });
-        FontLoad { family, slot }
-    }
-
     /// The requested family name.
     pub fn family(&self) -> &str {
         &self.family
@@ -202,7 +223,7 @@ impl FontLoad {
     /// Takes the result once the thread finished: `Some(Some(font))` when found,
     /// `Some(None)` when the family does not exist, `None` while still loading.
     pub fn take(&self) -> Option<Option<FontData>> {
-        self.slot.lock().expect("font load poisoned").take()
+        self.result.lock().expect("font load poisoned").take()
     }
 }
 
@@ -260,14 +281,54 @@ mod tests {
         assert!(family_font(&db, "No Such Family").is_none());
     }
 
+    /// A catalog whose scan has not finished yet (the test publishes it).
+    fn pending_catalog() -> FontCatalog {
+        FontCatalog {
+            slot: Arc::new((Mutex::new(None), Condvar::new())),
+            ctx: egui::Context::default(),
+        }
+    }
+
+    /// Publishes a scan holding only Hack in `catalog`.
+    fn publish_hack(catalog: &FontCatalog) {
+        let db = hack_database();
+        let families = family_list(&db).into();
+        publish_scan(&catalog.slot, Scan { db, families });
+    }
+
+    /// Waits for `load` to finish and returns its result.
+    fn finish(load: &FontLoad) -> Option<FontData> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(result) = load.take() {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "font load never finished"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn loads_wait_for_the_scan_instead_of_failing() {
+        let catalog = pending_catalog();
+        let hack = catalog.load(HACK.to_string());
+        let missing = catalog.load("No Such Family".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(hack.take().is_none(), "still waiting for the scan");
+        publish_hack(&catalog);
+        assert!(finish(&hack).is_some());
+        assert!(finish(&missing).is_none());
+        assert_eq!(hack.family(), HACK);
+    }
+
     #[test]
     fn catalog_families_are_shared_not_copied() {
-        let db = hack_database();
-        let families: FamilyList = family_list(&db).into();
-        let scan = Arc::new(Scan { db, families });
-        let catalog = FontCatalog {
-            slot: Arc::new(Mutex::new(Some(scan))),
-        };
+        let catalog = pending_catalog();
+        assert!(catalog.families().is_none());
+        publish_hack(&catalog);
         let first = catalog.families().expect("scan finished");
         let second = catalog.families().expect("scan finished");
         assert!(Arc::ptr_eq(&first, &second));
