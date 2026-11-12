@@ -63,7 +63,7 @@
   - File(s): `src/buffer.rs`
 - [x] **Small vim correctness gaps** - `2.` after `d3w` deletes 6 words instead of 2 (`with_count` only swaps a leading count); Insert-mode soft tab uses the char column instead of the display column on lines containing tabs; `enclosing_open` walks back char by char with `rope.char(i)` to the start of the file.
   - File(s): `src/vim/normal.rs`, `src/vim/mod.rs`, `src/vim/textobj.rs`
-- [ ] **Vim module layout and long functions** - Insert, Visual, command-line and operator handling all sit in `vim/mod.rs` while Normal mode is in `normal.rs`; `insert_key` (~70 lines) and `simple` (~65 lines) should be split, and `Operator` / `Target::Object` lack doc comments.
+- [x] **Vim module layout and long functions** - Insert, Visual, command-line and operator handling all sit in `vim/mod.rs` while Normal mode is in `normal.rs`; `insert_key` (~70 lines) and `simple` (~65 lines) should be split, and `Operator` / `Target::Object` lack doc comments.
   - File(s): `src/vim/mod.rs`, `src/vim/normal.rs`
 - [ ] **Magic numbers in UI drawing** - the About dialog painting (`draw_logo`, `draw_version_pill`, `show_about`) and the repeated filter field width `140.0` in the settings sections use bare literals; promote them to named constants like the rest of the code base.
   - File(s): `src/app/menu.rs`, `src/settings_ui.rs`

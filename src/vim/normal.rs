@@ -41,10 +41,15 @@ pub(super) struct Parsed<T> {
 /// An operator that acts on a motion, a text object or lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Operator {
+    /// `d`: delete into the register.
     Delete,
+    /// `c`: delete into the register and enter Insert mode.
     Change,
+    /// `y`: copy into the register.
     Yank,
+    /// `>`: indent the lines by one tab stop.
     Indent,
+    /// `<`: outdent the lines by one tab stop.
     Outdent,
 }
 
@@ -54,7 +59,12 @@ pub(super) enum Target {
     /// Text covered by a motion.
     Motion(Motion),
     /// A text object such as `iw`.
-    Object { kind: char, inner: bool },
+    Object {
+        /// Object char: `w`, a bracket (`( ) b { } B [ ]`) or a quote (`" '`).
+        kind: char,
+        /// `i` (inner, without delimiters or surrounding blanks) rather than `a`.
+        inner: bool,
+    },
     /// Doubled operator (`dd`, `yy`, `>>`): whole lines.
     Lines,
 }
@@ -368,9 +378,9 @@ impl VimState {
     /// Executes a single-key command.
     fn simple(&mut self, c: char, count: Option<usize>, pos: usize, env: &mut Env) {
         let n = count.unwrap_or(1);
-        let rope = env.buf.rope().clone();
-        let start = text_nav::line_start(&rope, pos);
-        let end = text_nav::line_end(&rope, pos);
+        let rope = env.buf.rope();
+        let start = text_nav::line_start(rope, pos);
+        let end = text_nav::line_end(rope, pos);
         let line = rope.char_to_line(pos);
         let chars_right = OpRange::Chars(pos..(pos + n).min(end));
         match c {
@@ -381,54 +391,70 @@ impl VimState {
             }
             's' => self.apply_operator(Operator::Change, chars_right, env),
             'S' => {
-                let range = OpRange::Lines(line, (line + n - 1).min(last_line(&rope)).max(line));
+                let range = OpRange::Lines(line, (line + n - 1).min(last_line(rope)).max(line));
                 self.apply_operator(Operator::Change, range, env);
             }
-            'D' | 'C' => {
-                let op = if c == 'D' {
-                    Operator::Delete
-                } else {
-                    Operator::Change
-                };
-                let target = Target::Motion(Motion::LineEnd);
-                if let Some(range) = self.op_range(op, target, count, pos, env) {
-                    self.apply_operator(op, range, env);
-                }
-            }
+            'D' => self.change_to_line_end(Operator::Delete, count, pos, env),
+            'C' => self.change_to_line_end(Operator::Change, count, pos, env),
             'J' => join_lines(env, pos, n),
             'p' | 'P' => self.put(c == 'p', n, pos, env),
             'u' => self.undo_redo(true, n, env),
             '.' => self.repeat_change(count, env),
             '*' | '#' => self.search_word(c == '*', n, pos, env),
-            'i' => self.enter_insert(pos, env),
-            'a' => self.enter_insert((pos + 1).min(end), env),
-            'I' => self.enter_insert(text_nav::first_non_blank(&rope, pos), env),
-            'A' => self.enter_insert(end, env),
-            'o' | 'O' => {
-                let indent = super::leading_blanks(&rope, start);
-                let (at, text) = match c {
-                    'o' => (end, format!("\n{indent}")),
-                    _ => (start, format!("{indent}\n")),
-                };
-                env.buf.replace(at..at, &text);
-                // The caret goes after the indent of the new line.
-                let caret = at + text.chars().count() - usize::from(c == 'O');
-                self.enter_insert(caret, env);
-                self.auto_indent = true;
-            }
-            'v' | 'V' => {
-                self.mode = if c == 'v' {
-                    Mode::Visual
-                } else {
-                    Mode::VisualLine
-                };
-                env.ed.selection.anchor = pos;
-            }
+            'i' | 'a' | 'I' | 'A' => self.insert_command(c, pos, env),
+            'o' | 'O' => self.open_line(c == 'o', pos, env),
+            'v' => self.enter_visual(Mode::Visual, pos, env),
+            'V' => self.enter_visual(Mode::VisualLine, pos, env),
             _ => {
                 self.mode = Mode::CommandLine;
                 self.cmdline = c.to_string();
             }
         }
+    }
+
+    /// `D` / `C`: applies `op` from the caret to the end of the line (`count` lines).
+    fn change_to_line_end(&mut self, op: Operator, count: Option<usize>, pos: usize, env: &mut Env) {
+        let target = Target::Motion(Motion::LineEnd);
+        if let Some(range) = self.op_range(op, target, count, pos, env) {
+            self.apply_operator(op, range, env);
+        }
+    }
+
+    /// `i a I A`: enters Insert mode before or after the caret, at the first non-blank or at
+    /// the line end.
+    fn insert_command(&mut self, c: char, pos: usize, env: &mut Env) {
+        let rope = env.buf.rope();
+        let end = text_nav::line_end(rope, pos);
+        let at = match c {
+            'i' => pos,
+            'a' => (pos + 1).min(end),
+            'I' => text_nav::first_non_blank(rope, pos),
+            _ => end,
+        };
+        self.enter_insert(at, env);
+    }
+
+    /// `o` / `O`: opens a line below (`below`) or above the caret line with its indent, which
+    /// counts as auto-indent, and enters Insert mode on it.
+    fn open_line(&mut self, below: bool, pos: usize, env: &mut Env) {
+        let rope = env.buf.rope();
+        let start = text_nav::line_start(rope, pos);
+        let indent = super::leading_blanks(rope, start);
+        let (at, text) = match below {
+            true => (text_nav::line_end(rope, pos), format!("\n{indent}")),
+            false => (start, format!("{indent}\n")),
+        };
+        env.buf.replace(at..at, &text);
+        // The caret goes after the indent of the new line.
+        let caret = at + text.chars().count() - usize::from(!below);
+        self.enter_insert(caret, env);
+        self.auto_indent = true;
+    }
+
+    /// `v` / `V`: starts a Visual selection anchored at the caret.
+    fn enter_visual(&mut self, mode: Mode, pos: usize, env: &mut Env) {
+        self.mode = mode;
+        env.ed.selection.anchor = pos;
     }
 
     /// Resolves a motion with error reporting, `{n}gg`/`{n}G` mapping and state updates.
