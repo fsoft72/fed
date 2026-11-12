@@ -1,5 +1,6 @@
 //! Search engine shared by the find bar and the vim `/` and `:s` commands.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use regex::{Regex, RegexBuilder};
@@ -46,43 +47,80 @@ impl SearchQuery {
 
 /// Returns the text of line `index` without its trailing line break.
 fn line_content(rope: &Rope, index: usize) -> String {
-    let mut text = rope.line(index).to_string();
-    if text.ends_with('\n') {
-        text.pop();
+    line_text(rope, index).into_owned()
+}
+
+/// Returns the text of line `index` without its trailing line break, borrowed from the rope
+/// when the line is stored in one chunk (the common case).
+fn line_text(rope: &Rope, index: usize) -> Cow<'_, str> {
+    let mut line = rope.line(index);
+    let len = line.len_chars();
+    if len > 0 && line.char(len - 1) == '\n' {
+        line = line.slice(..len - 1);
     }
-    text
+    match line.as_str() {
+        Some(text) => Cow::Borrowed(text),
+        None => Cow::Owned(line.to_string()),
+    }
+}
+
+/// Returns the non-empty matches of line `index` as document char ranges, in order.
+fn line_matches(rope: &Rope, re: &Regex, index: usize) -> Vec<Range<usize>> {
+    let text = line_text(rope, index);
+    let mut char_pos = rope.line_to_char(index);
+    let mut byte_pos = 0;
+    let mut found = Vec::new();
+    for m in re.find_iter(&text) {
+        if m.is_empty() {
+            continue;
+        }
+        char_pos += text[byte_pos..m.start()].chars().count();
+        let len = m.as_str().chars().count();
+        found.push(char_pos..char_pos + len);
+        char_pos += len;
+        byte_pos = m.end();
+    }
+    found
 }
 
 /// Returns every non-empty match in the rope as a char range, in document order.
 pub fn find_all(rope: &Rope, re: &Regex) -> Vec<Range<usize>> {
-    let mut found = Vec::new();
-    for index in 0..rope.len_lines() {
-        let text = line_content(rope, index);
-        let line_start = rope.line_to_char(index);
-        for m in re.find_iter(&text) {
-            if m.is_empty() {
-                continue;
-            }
-            let start = line_start + text[..m.start()].chars().count();
-            let len = text[m.start()..m.end()].chars().count();
-            found.push(start..start + len);
-        }
-    }
-    found
+    (0..rope.len_lines())
+        .flat_map(|index| line_matches(rope, re, index))
+        .collect()
 }
 
 /// Finds the next match relative to char index `from`, wrapping around the document.
 ///
 /// Forward returns the first match starting after `from`; backward returns the last
-/// match starting before `from`.
+/// match starting before `from`. Lines are scanned outwards from the line of `from` and
+/// the scan stops at the first hit, so a nearby match costs only a few lines.
 pub fn find_next(rope: &Rope, re: &Regex, from: usize, forward: bool) -> Option<Range<usize>> {
-    let all = find_all(rope, re);
+    let lines = rope.len_lines();
+    let from_line = rope.char_to_line(from.min(rope.len_chars()));
     if forward {
-        let next = all.iter().find(|r| r.start > from).or(all.first());
-        return next.cloned();
+        let after = (from_line..lines).find_map(|i| {
+            line_matches(rope, re, i)
+                .into_iter()
+                .find(|r| r.start > from)
+        });
+        // Wrap: the first match of the document (it is at or before `from`).
+        return after.or_else(|| {
+            (0..=from_line).find_map(|i| line_matches(rope, re, i).into_iter().next())
+        });
     }
-    let prev = all.iter().rev().find(|r| r.start < from).or(all.last());
-    prev.cloned()
+    let before = (0..=from_line).rev().find_map(|i| {
+        line_matches(rope, re, i)
+            .into_iter()
+            .rev()
+            .find(|r| r.start < from)
+    });
+    // Wrap: the last match of the document (it is at or after `from`).
+    before.or_else(|| {
+        (from_line..lines)
+            .rev()
+            .find_map(|i| line_matches(rope, re, i).pop())
+    })
 }
 
 /// Rewrites the content of `lines` (end-exclusive, 0-based) and returns the match count.
@@ -196,6 +234,41 @@ mod tests {
         let re = re("ab");
         assert_eq!(find_next(&rope, &re, 6, false), Some(3..5));
         assert_eq!(find_next(&rope, &re, 0, false), Some(6..8));
+    }
+
+    #[test]
+    fn find_next_matches_whole_document_reference() {
+        let rope = Rope::from_str("ab x\n\nxx ab ab\nnone\nab");
+        let ab = re("ab");
+        let all = find_all(&rope, &ab);
+        for from in 0..=rope.len_chars() {
+            let fwd = all.iter().find(|r| r.start > from).or(all.first()).cloned();
+            let back = all
+                .iter()
+                .rev()
+                .find(|r| r.start < from)
+                .or(all.last())
+                .cloned();
+            assert_eq!(
+                find_next(&rope, &ab, from, true),
+                fwd,
+                "forward from {from}"
+            );
+            assert_eq!(
+                find_next(&rope, &ab, from, false),
+                back,
+                "backward from {from}"
+            );
+        }
+        let none = Rope::from_str("abc\ndef");
+        assert_eq!(find_next(&none, &re("z"), 2, true), None);
+        assert_eq!(find_next(&none, &re("z"), 2, false), None);
+    }
+
+    #[test]
+    fn find_all_counts_chars_between_multibyte_matches() {
+        let rope = Rope::from_str("è a è a\nè");
+        assert_eq!(find_all(&rope, &re("è")), vec![0..1, 4..5, 8..9]);
     }
 
     #[test]

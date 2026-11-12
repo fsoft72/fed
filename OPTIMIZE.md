@@ -13,7 +13,7 @@
 
 ## High
 
-- [ ] **Vim `n`/`N`/`*`/`#` scan the whole document per press** - `Motion::SearchNext` recompiles the regex on each press and calls `search::find_next` `count` times, and `find_next` runs `find_all` (one `String` per line, every match collected) just to return one hit; make `find_next` stop at the first match from `from` (wrapping once) and compile the regex once in `last_search`.
+- [x] **Vim `n`/`N`/`*`/`#` scan the whole document per press** - `Motion::SearchNext` recompiles the regex on each press and calls `search::find_next` `count` times, and `find_next` runs `find_all` (one `String` per line, every match collected) just to return one hit; make `find_next` stop at the first match from `from` (wrapping once) and compile the regex once in `last_search`.
   - File(s): `src/vim/motion.rs`, `src/search.rs`, `src/vim/mod.rs`
 - [ ] **Word wrap recomputes every line top on every keystroke** - `WrapCache::update` walks the whole rope and allocates a `String` per line on each revision change, `Frame::run` clones `wrap.tops` (one `f32` per line) every frame, and `heights` grows without bound; update tops incrementally from the buffer's dirty lines, borrow `tops` instead of cloning, and prune the height map.
   - File(s): `src/view.rs`

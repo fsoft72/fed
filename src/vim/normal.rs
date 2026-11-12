@@ -621,7 +621,11 @@ impl VimState {
             regex: true,
             case_sensitive: true,
         };
-        self.ctx.last_search = Some(LastSearch { query, forward });
+        // An escaped word always compiles; report the impossible case instead of panicking.
+        match LastSearch::new(query, forward) {
+            Ok(last) => self.ctx.last_search = Some(last),
+            Err(e) => return env.error(e.to_string()),
+        }
         let next = Motion::SearchNext { reverse: false };
         if let Some(r) = self.motion(&next, Some(count), word.start, env) {
             env.set_caret(r.pos);

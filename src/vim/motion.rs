@@ -1,9 +1,10 @@
 //! Vim motions and their resolution to a target position.
 
+use regex::Regex;
 use ropey::Rope;
 
 use crate::buffer::Buffer;
-use crate::search::{SearchQuery, find_next};
+use crate::search::{SearchError, SearchQuery, find_next};
 use crate::text_nav::{self, CharClass, char_class};
 
 /// A vim cursor motion.
@@ -100,12 +101,26 @@ pub struct LastFind {
 }
 
 /// The last `/ ? * #` search, repeated by `n` and `N`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct LastSearch {
     /// The query (always regex, case sensitive).
     pub query: SearchQuery,
+    /// `query` compiled once, so `n` and `N` do not recompile it on every press.
+    pub regex: Regex,
     /// Direction of the original search.
     pub forward: bool,
+}
+
+impl LastSearch {
+    /// Compiles `query` and remembers it with its direction.
+    pub fn new(query: SearchQuery, forward: bool) -> Result<LastSearch, SearchError> {
+        let regex = query.compile()?;
+        Ok(LastSearch {
+            query,
+            regex,
+            forward,
+        })
+    }
 }
 
 /// State that motions depend on besides the buffer and the cursor.
@@ -197,11 +212,10 @@ pub fn resolve(
         Motion::MarkExact(c) => exclusive(buf.mark(*c)?.min(rope.len_chars())),
         Motion::SearchNext { reverse } => {
             let last = state.last_search.as_ref()?;
-            let re = last.query.compile().ok()?;
             let forward = last.forward != *reverse;
             let mut p = pos;
             for _ in 0..count {
-                p = find_next(rope, &re, p, forward)?.start;
+                p = find_next(rope, &last.regex, p, forward)?.start;
             }
             exclusive(p)
         }

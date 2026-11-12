@@ -646,10 +646,10 @@ impl VimState {
             regex: true,
             case_sensitive: true,
         };
-        if let Err(e) = query.compile() {
-            return env.error(e.to_string());
+        match LastSearch::new(query, forward) {
+            Ok(last) => self.ctx.last_search = Some(last),
+            Err(e) => return env.error(e.to_string()),
         }
-        self.ctx.last_search = Some(LastSearch { query, forward });
         let pos = env.pos();
         if let Some(r) = self.motion(&Motion::SearchNext { reverse: false }, None, pos, env) {
             env.set_caret(r.pos);
