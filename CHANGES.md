@@ -87,3 +87,4 @@
 - OPTIMIZE: `FedApp` can be built in tests: `FedApp::with_deps` takes the egui context, the config paths and a `FileDialogs` implementation (`NativeDialogs` wraps rfd; `FedApp::new` uses it with `ConfigPaths::detect`). New app tests cover opening command-line files once, the open dialog replacing the blank tab, Save on an untitled tab and a cancelled save.
 - OPTIMIZE: the fixed shortcut aliases are parsed once (`PARSED_ALIASES`, a `LazyLock`) instead of on every key press that misses the keymap.
 - OPTIMIZE: `handle_keyboard` copies only the keyboard events of the frame (`keyboard_events`) instead of cloning the whole input event list (pointer moves included) every frame.
+- OPTIMIZE: `SpellChecker::is_correct` takes `&self` (the word cache has its own `Mutex`), so the spell decorator checks words under a read lock of the shared checker instead of a write lock that waited on every other reader.

@@ -41,8 +41,9 @@ pub struct SpellChecker {
     /// Words added by the user.
     personal: HashSet<String>,
     /// Results of `is_correct`, cleared when the personal list changes or it grows past
-    /// `MAX_WORD_CACHE` entries.
-    cache: HashMap<String, bool>,
+    /// `MAX_WORD_CACHE` entries. Behind its own lock so checking needs only `&self` (a read
+    /// lock on the shared checker).
+    cache: Mutex<HashMap<String, bool>>,
     /// Incremented whenever a dictionary or personal word is added, so cached line results
     /// computed with an older word list can be discarded.
     generation: u64,
@@ -54,7 +55,7 @@ impl SpellChecker {
         SpellChecker {
             dicts,
             personal,
-            cache: HashMap::new(),
+            cache: Mutex::new(HashMap::new()),
             generation: 0,
         }
     }
@@ -76,16 +77,31 @@ impl SpellChecker {
     }
 
     /// Like `check`, remembering the result for repeated lookups of the same word.
-    pub fn is_correct(&mut self, word: &str) -> bool {
-        if let Some(&known) = self.cache.get(word) {
+    pub fn is_correct(&self, word: &str) -> bool {
+        if let Some(&known) = self.words().get(word) {
             return known;
         }
         let known = self.check(word);
-        if self.cache.len() >= MAX_WORD_CACHE {
-            self.cache.clear();
+        let mut cache = self.words();
+        if cache.len() >= MAX_WORD_CACHE {
+            cache.clear();
         }
-        self.cache.insert(word.to_string(), known);
+        cache.insert(word.to_string(), known);
         known
+    }
+
+    /// Locks the word cache. It only memoizes `check`, so a cache left poisoned by a panic
+    /// is still valid and is used as is.
+    fn words(&self) -> std::sync::MutexGuard<'_, HashMap<String, bool>> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Empties the word cache (the accepted words changed).
+    fn clear_words(&mut self) {
+        self.cache
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     /// Returns up to `MAX_SUGGESTIONS` distinct suggestions merged from all dictionaries.
@@ -107,14 +123,14 @@ impl SpellChecker {
     /// Adds a dictionary loaded after the checker was created and clears the result cache.
     pub fn add_dictionary(&mut self, dict: spellbook::Dictionary) {
         self.dicts.push(dict);
-        self.cache.clear();
+        self.clear_words();
         self.generation += 1;
     }
 
     /// Adds `word` to the in-memory personal list and clears the result cache.
     pub fn add_personal(&mut self, word: &str) {
         self.personal.insert(word.to_string());
-        self.cache.clear();
+        self.clear_words();
         self.generation += 1;
     }
 }
@@ -452,7 +468,7 @@ impl<'a, 'b> SpellDecorator<'a, 'b> {
         if !tokens.is_empty() {
             let chars: Vec<char> = line.chars().collect();
             let text = |r: &Range<usize>| chars[r.clone()].iter().collect::<String>();
-            let mut checker = checker.write().expect("spell checker poisoned");
+            let checker = checker.read().expect("spell checker poisoned");
             for token in tokens {
                 if let Some(whole) = &token.whole
                     && checker.is_correct(&text(whole))
@@ -687,7 +703,7 @@ mod tests {
         }
         assert_eq!(cache.lines.len(), 1);
         // A cache hit still reports the marks, without touching the word cache.
-        checker.write().unwrap().cache.clear();
+        checker.write().unwrap().clear_words();
         {
             let mut deco = SpellDecorator::new(
                 &mut inner,
@@ -702,7 +718,7 @@ mod tests {
                 vec![5..10]
             );
         }
-        assert!(checker.read().unwrap().cache.is_empty());
+        assert!(checker.read().unwrap().words().is_empty());
         assert_eq!(cache.marks, HashSet::from([5..10]));
         // Adding the word bumps the generation and drops the cached line.
         checker.write().unwrap().add_personal("xyzzy");
@@ -715,6 +731,28 @@ mod tests {
         );
         deco.prepare(&buffer);
         assert!(underlined(deco.decorate(0, "ciao xyzzy", &base)).is_empty());
+    }
+
+    #[test]
+    fn checking_needs_only_a_read_lock() {
+        let checker = Arc::new(RwLock::new(checker()));
+        // Another reader (the settings window, a suggestion lookup) holds the lock.
+        let other = checker.read().unwrap();
+        let mut hl = crate::highlight::HighlightCache::new();
+        let mut inner = HighlightDecorator::new(&mut hl, None, "Plain Text", "x", true);
+        let mut cache = SpellCache::default();
+        let ctx = egui::Context::default();
+        let mut deco = SpellDecorator::new(
+            &mut inner,
+            Some(Arc::clone(&checker)),
+            SpellMode::Plain,
+            &mut cache,
+            &ctx,
+        );
+        deco.prepare(&Buffer::from_text("ciao qwzx"));
+        let spans = deco.decorate(0, "ciao qwzx", &TextFormat::default());
+        assert!(spans.iter().any(|(_, f)| f.underline != Stroke::NONE));
+        assert!(other.words().contains_key("qwzx"));
     }
 
     #[test]
@@ -734,11 +772,11 @@ mod tests {
 
     #[test]
     fn word_cache_is_bounded() {
-        let mut c = checker();
+        let c = checker();
         for i in 0..MAX_WORD_CACHE + 10 {
             c.is_correct(&format!("w{i}"));
         }
-        assert!(c.cache.len() <= MAX_WORD_CACHE);
+        assert!(c.words().len() <= MAX_WORD_CACHE);
     }
 
     #[test]
