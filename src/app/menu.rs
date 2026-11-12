@@ -187,7 +187,7 @@ fn draw_logo(ui: &mut egui::Ui) {
     let size = egui::vec2(ABOUT_LOGO_SIZE, ABOUT_LOGO_SIZE);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, ABOUT_LOGO_RADIUS, super::TAB_ACCENT);
+    painter.rect_filled(rect, ABOUT_LOGO_RADIUS, super::tab_bar::TAB_ACCENT);
     // A lighter top half gives the flat square a little depth.
     let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.center().y));
     let top_radius = egui::CornerRadius {
