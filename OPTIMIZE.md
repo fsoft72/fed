@@ -2,70 +2,62 @@
 
 > Generated on 2026-11-12. Items sorted by importance.
 
-## Critical
-
-- [x] **Saves are not durable (no fsync before rename)** - `write_copy` writes the temp file with `fs::write` and renames it over the original without `File::sync_all` (and without syncing the parent directory), so a crash or power loss right after a save can leave a truncated or empty file on file systems that reorder data and metadata; this is the one place an editor must not lose data.
-  - File(s): `src/buffer.rs` (`Buffer::write_copy`)
-
 ## High
 
-- [x] **Tab rendering disagrees with tab-stop columns** - the view draws every `\t` as a fixed `tab_width` spaces (`expand_tabs`, `display_col`, `buffer_col`, `display_width`), while `text_nav::display_col` (used by `indent` and vim insert) advances to the next tab stop; text like `ab\tx` is drawn at a different column than the editing logic assumes and columns of mixed tabs/spaces never line up. Make the view use tab stops (one shared helper) so layout, hit testing, selection rects and indentation agree.
-  - File(s): `src/view.rs`, `src/text_nav.rs`, `src/editing.rs`, `src/vim/insert.rs`
+- [ ] **Saving silently overwrites changes made on disk by other programs** - `Buffer` keeps no modification time or size of the file it loaded or last saved, so when another program (git checkout, a formatter, a second editor) changes the file, `save` replaces it without warning and the open tab keeps showing stale text. Remember the `mtime`/length at load and save, check them in `Buffer::save` (refuse with a dedicated `BufferError` variant unless forced) and offer a reload / overwrite choice in the save dialog flow and for vim `:w` / `:w!`.
+  - File(s): `src/buffer.rs`, `src/app.rs` (`save_tab_outcome`), `src/app/dialogs.rs`, `src/app/vim.rs`
 
-- [x] **Find matches rescan the whole document on every edit, on the UI thread** - `FindBar::matches` calls `search::find_all` over every line whenever the revision changes, so each keystroke with the find bar open costs a full regex pass (seconds on a large file, which is still searchable); it is also computed in `FedApp::ui` before `show_editor` applies the frame's keys, so the match highlights are one revision stale in the edit frame. Update the cache incrementally with `Buffer::dirty_lines_since` (rescan only the changed lines and shift the rest) and compute it after the keyboard edits (e.g. in `MatchDecorator::prepare`).
-  - File(s): `src/find_bar.rs`, `src/search.rs`, `src/app.rs`
+- [ ] **Replace all and `:s` overflow the edit log and rebuild every cache** - `search::rewrite_lines` applies one `Buffer::replace` per matching line, so replacing on more than `EDIT_LOG_LEN` (1024) lines pushes the older entries out of the log and `dirty_lines_since` reports the whole buffer as replaced: the highlight cache, wrap heights, longest line, find matches and spell caches all restart from scratch, and every line is also stored as a separate `Edit` with its own `removed`/`inserted` copies. Apply the result as one replacement of the span from the first to the last changed line (or log a merged entry for grouped edits).
+  - File(s): `src/search.rs` (`rewrite_lines`), `src/buffer.rs` (`apply`, `edit_log`)
 
-- [x] **Two parallel dirty-line mechanisms in `Buffer`** - `take_dirty_line` mutates a `Cell` through `&Buffer` and can only have one consumer (the highlight decorator of the frame that happens to run `prepare`), while `dirty_lines_since` already gives every consumer its own revision-based view; `HighlightDecorator::last_dirty` is dead code left over from it. Move `HighlightCache` to `dirty_lines_since` with its own revision and delete `dirty_line`, `take_dirty_line` and `last_dirty`.
-  - File(s): `src/buffer.rs`, `src/highlight.rs`
+- [ ] **Replace all reports a count that disagrees with the matches shown** - `rewrite_lines` counts with `re.find_iter(&text).count()`, which includes empty matches, while `line_matches` (used by the find bar and the match highlights) skips them; a pattern such as `a*` reports and replaces far more occurrences than the bar displays. Count and replace with the same rule as `line_matches` (skip empty matches, or refuse patterns that can match the empty string).
+  - File(s): `src/search.rs`
 
-- [x] **Saving copies the whole text two or three times** - `write_copy` builds `rope.to_string()` and then a second `String` with `replace('\n', "\r\n")` for CRLF files, so saving a 256 MB file allocates over 500 MB; stream `rope.chunks()` through a `BufWriter`, converting line endings on the fly.
-  - File(s): `src/buffer.rs` (`Buffer::write_copy`)
+- [ ] **Typing a find query rescans the whole document on the UI thread** - every change of the pattern (or of the case / regex toggles) misses the `MatchCache` and runs `search::find_all` over every line synchronously, so each keystroke in the find field on a 100 MB file stalls the UI for the full regex pass (only edits to the buffer are incremental). Search on a background thread with a rope snapshot (like `ProseRanges`), show the previous count while it runs, and cancel a stale search when the query changes again.
+  - File(s): `src/find_bar.rs` (`matches_in`), `src/search.rs` (`find_all`)
+
+- [ ] **Word wrap re-measures every line on each width change** - `WrapCache::update` drops all heights when the wrap width changes, and `measure_line` builds a full galley for every line of the document; while the window or the preview panel is being resized this runs on every frame (hundreds of thousands of layouts for a file just below `LARGE_FILE_BYTES`). Measure only the lines near the viewport first and fill the rest lazily within a frame budget (estimating unmeasured lines as one row), as `HighlightCache` does with `FRAME_PARSE_BUDGET`.
+  - File(s): `src/view.rs` (`WrapCache`, `measure_line`)
 
 ## Medium
 
-- [x] **`is_large` is never updated after creation** - the flag is computed in `from_text` only, so pasting megabytes or a 50k-char line into a small buffer keeps syntax highlighting, spell check and word wrap on and the UI stalls; re-evaluate it in `Buffer::apply` (byte length threshold plus the length of the edited lines).
-  - File(s): `src/buffer.rs`, `src/app.rs` (`view_options`), `src/tab.rs`
+- [ ] **A crashed syntax warm-up disables highlighting forever, silently** - `HighlightAssets::ensure_warm` marks the syntax `Pending` and only the warm-up thread sets it to `Ready`; if `warm_up` panics (a syntect regex bug) the entry stays `Pending`, `Tab::show_editor` keeps drawing plain text for every file of that syntax, and nothing is reported. Run the warm-up under `catch_unwind` (like `spell::run_guarded`), mark the syntax `Ready` (or a new `Failed` state) in every case and surface failures in the status bar.
+  - File(s): `src/highlight.rs` (`ensure_warm`, `warm_up`)
 
-- [x] **Hit testing re-lays out and re-decorates a line on every drag frame** - `Frame::hit_test` calls `layout_line` (highlight + spell + match decorators and a new galley) for each press, drag, double/triple and right click, and `run` lays out the visible lines again afterwards; since the selection does not change the galley, lay out the visible lines first and hit-test against them (falling back to a plain layout only for off-screen lines).
-  - File(s): `src/view.rs` (`Frame::run`, `Frame::hit_test`, `Frame::handle_mouse`)
+- [ ] **Ad-hoc background job plumbing repeated in six places** - `LoadJob`, `AssetsHandle`, `ProseRanges`, `SpellService`, the font loader and the link opener each spawn a thread with their own channel or `Arc<Mutex<Option<T>>>` slot, their own repaint request and their own (different) panic handling. A small `BackgroundJob<T>` (spawn with a ctx, `poll() -> Option<Result<T, JobError>>`, panic turned into an error) would remove the duplication and give every job the same failure reporting.
+  - File(s): `src/buffer.rs` (`LoadJob`), `src/highlight.rs` (`AssetsHandle`), `src/spell/prose.rs`, `src/spell/mod.rs`, `src/fonts.rs`, `src/app/status.rs`
 
-- [x] **Per-frame allocations in the render path** - each visible line is copied to a `String` by `line_text` up to three times per frame (`layout_line`, `paint`, `caret_rect`), then `build_layout_job` collects a `Vec<char>`, allocates a `String` per span and another one in `expand_tabs`; borrow the line like `search::line_text` (`Cow`), compute it once per line in `Frame::run` and append byte slices to the `LayoutJob`.
+- [ ] **The decorator chain is hard-wired to concrete types** - `SpellDecorator` stores a `&mut HighlightDecorator` and calls its `spans()` to find comments and strings, `MatchDecorator` wraps the spell one, and `Tab::show_editor` has to `mem::take` both caches and `drop` the decorators by hand in the right order. Let the `Decorator` trait expose the token kinds of a line (or pass the highlight spans down through `decorate`) so the chain is built from `&mut dyn Decorator` layers and can be reordered or tested in isolation.
+  - File(s): `src/tab.rs` (`show_editor`), `src/spell/mod.rs` (`SpellDecorator`), `src/highlight.rs`, `src/find_bar.rs` (`MatchDecorator`), `src/view.rs` (`Decorator`)
+
+- [ ] **Two `same_file` functions with different costs** - `app::same_file` canonicalizes both paths on every call (used by vim `:w {file}` and `write_copy_refused`), while `buffer::same_file` compares the canonical path the buffer already keeps. Drop the app version and use `Buffer::is_bound_to` with one `canonicalize` of the target, so there is a single definition of "same file".
+  - File(s): `src/app.rs`, `src/app/vim.rs`, `src/buffer.rs`
+
+- [ ] **Quadratic char offsets when highlighting long lines** - `parse_line` computes `text[..range.start].chars().count()` for every span, so a line with thousands of tokens (minified code below `LONG_LINE_CHARS`) costs O(n^2) per parse; keep a running byte/char cursor across spans instead.
+  - File(s): `src/highlight.rs` (`parse_line`)
+
+- [ ] **`view.rs` mixes five responsibilities in 1100 lines** - it holds the `Decorator` trait, key-to-command mapping, the word-wrap cache, longest-line tracking, mouse handling and painting, and `Frame::run` alone is ~100 lines doing layout, scrolling, page anchoring and IME output. Split it into `view/keys.rs` (`key_to_command`, `page_key`), `view/wrap.rs` (`WrapCache`, `RowMap`, `longest_line`) and keep `Frame` for layout and paint; extract the scroll and IME parts of `run` into their own methods.
   - File(s): `src/view.rs`
 
-- [x] **Syntax highlighting reparses everything after an edit** - `HighlightCache::invalidate_from` drops all spans after the edited line, so editing near the top of a long file reparses up to the viewport on every keystroke (spread over frames, with lines drawn plain meanwhile); stop reparsing when the parser state at the next checkpoint equals the old one and reuse the remaining spans shifted by the line delta from `dirty_lines_since`.
-  - File(s): `src/highlight.rs`
-
-- [x] **Duplicated line and column helpers** - `line_text` exists in `view.rs` (owned `String`) and `search.rs` (borrowed `Cow`) and is inlined again in `find_bar.rs` (`expand_match`); `display_col` exists in both `view.rs` and `text_nav.rs` with different semantics; `vim::motion::is_empty_line` overlaps `text_nav::is_empty_line_at`. Keep one version of each in `text_nav`.
-  - File(s): `src/view.rs`, `src/search.rs`, `src/find_bar.rs`, `src/text_nav.rs`, `src/vim/motion.rs`
-
-- [x] **Vim key translation lives in the editor widget** - `egui_event_to_vim_keys`, `egui_event_to_vim_key` and `key_to_vim_key` are in `view.rs`, so the generic widget depends on `vim::VimKey` and `app/vim.rs` reaches into `view` for vim logic; move them to a `vim::keys` module next to `VimKey`.
-  - File(s): `src/view.rs`, `src/app/vim.rs`, `src/vim/mod.rs`
-
-- [x] **Vim Insert-mode paste is replayed one key at a time** - `route_event` turns a pasted string into one `VimKey::Char` per character, so pasting a large text runs `handle_key` and a rope insert per char; add a text-insert path (e.g. `VimKey::Text(String)` or a `VimState::insert_text`) that applies the paste as one edit.
-  - File(s): `src/app/vim.rs`, `src/vim/insert.rs`
-
-- [x] **`FedApp::ui` central-panel closure does too much** - besides drawing it polls the syntax assets (`self.loaded_assets = self.assets.get()`), picks the code theme, builds the `EditorEnv`, routes vim keys and records the context click; extract an `editor_panel` method returning a small result struct and poll the assets at the top of the frame with the other background jobs (fonts, loads, links).
-  - File(s): `src/app.rs`
-
-- [x] **The application shell is hard to test** - `FedApp::new` calls `ConfigPaths::detect`, spawns the asset and spell threads, and save/open paths call `rfd` dialogs directly (`save_dialog`, `open_dialog`), so the tab/session/save logic in `app.rs` and `app/*.rs` can only be tested through free helper functions; inject the config paths and a small file-dialog trait so `FedApp` can be built in tests.
-  - File(s): `src/app.rs`, `src/app/dialogs.rs`, `src/app/vim.rs`
+- [ ] **The Markdown preview parses the document on the UI thread** - after each debounce `Preview::show` copies the rope to a `String`, parses it with pulldown-cmark in `rewrite_image_paths`, and egui_commonmark parses it again, all on the UI thread, while `ProseRanges` already parses the same text on a worker. Build the rewritten source on a background thread (same pattern as `ProseRanges`) and keep showing the previous render until it arrives.
+  - File(s): `src/markdown.rs` (`Preview::show`), `src/spell/prose.rs`
 
 ## Low / Nice to have
 
-- [x] **Shortcut aliases are re-parsed on every key press** - `shortcut_action` runs `KeyChord::parse` for every `SHORTCUT_ALIASES` entry each time a key is not in the keymap; parse them once into a `LazyLock<Vec<(KeyChord, Action)>>`.
-  - File(s): `src/app.rs`
+- [ ] **Preview scroll position is shared by every tab** - `Preview::show` uses `Id::unique(PREVIEW_ID)` for all tabs, so the egui scroll state of the preview carries over when switching between two Markdown tabs; salt the id with the tab id like the editor's `("fed_scroll", tab.id)`.
+  - File(s): `src/markdown.rs`, `src/app.rs` (`preview_panel`)
 
-- [x] **The whole input event list is cloned every frame** - `handle_keyboard` does `ui.input(|i| i.events.clone())` even when no key was pressed; clone only the keyboard events (or return early when there are none).
-  - File(s): `src/view.rs` (`handle_keyboard`)
+- [ ] **`preview_open` and `preview` duplicate one state** - `Tab::preview_open` is true exactly when `preview` is (or is about to be) `Some`, and both are kept in sync by `toggle_preview` and `preview_panel`; keep only `preview: Option<Preview>` (created by the toggle) to remove the invariant.
+  - File(s): `src/tab.rs`, `src/app.rs`
 
-- [x] **Spell checker lock is always taken for writing on the UI thread** - `SpellChecker::is_correct` needs `&mut self` only for its word cache, so `SpellDecorator::misspelled` takes the `RwLock` write lock and can wait on `add_word`; make the cache interior (`Mutex<HashMap>`) or use a plain `Mutex` and drop the `RwLock`.
-  - File(s): `src/spell/mod.rs`
+- [ ] **Syntax detection ignores file names and shebangs** - `syntax_for_path` looks only at the extension, so `Makefile`, `Dockerfile`, `.bashrc` or an extensionless `#!/usr/bin/env python` script are shown as plain text (and spell checked as prose). Fall back to `find_syntax_by_name` on the file name and `find_syntax_by_first_line` on the first line.
+  - File(s): `src/highlight.rs` (`syntax_for_path`), `src/tab.rs` (`refresh_syntax`)
 
-- [x] **Inconsistent lock poisoning policy** - `SpellService::status` recovers from poisoning with `PoisonError::into_inner`, while `checker()`, `AssetsHandle::get`, `ensure_warm` and the decorators `expect` on the same kind of locks, so a panic in a background thread turns into a UI crash on the next frame; pick one policy (recover and report) for all shared slots.
-  - File(s): `src/spell/mod.rs`, `src/highlight.rs`
+- [ ] **Find bar match index is a linear scan every frame** - `count_label` runs `matches.iter().position(|m| *m == sel)` each frame the bar is open; the matches are sorted, so use `partition_point` like `next_match`.
+  - File(s): `src/find_bar.rs` (`count_label`)
 
-- [x] **`same_file` canonicalizes every open tab on each open** - `try_open` calls `canonicalize` for both paths of every tab and every pending load, so restoring a session of N files makes O(N^2) file system calls; store the canonical path in `Buffer` when it is loaded or saved and compare that.
-  - File(s): `src/app.rs`, `src/app/vim.rs`, `src/buffer.rs`
+- [ ] **Long command dispatch functions** - `editing::apply_command` (~125 lines) and `vim::motion::resolve` (~85 lines) are single large `match` blocks; group the arms by family (movement, deletion, selection) into helpers so each stays readable and testable on its own.
+  - File(s): `src/editing.rs`, `src/vim/motion.rs`
 
-- [x] **Closed previews keep their memory** - `Tab::preview` (a `CommonMarkCache` plus a full copy of the source) stays allocated after the preview is toggled off; set it to `None` when `preview_open` becomes false.
-  - File(s): `src/app.rs` (`toggle_preview`), `src/tab.rs`
+- [ ] **Malformed doc comment on `dirty_lines_since`** - two sentences were merged into one 150-column line ("...Every caller tracks its own revision. When `since` is older..."), and `first_dirty_line_since` has a single caller (`spell::prose::shift_stale`) that could use `dirty_lines_since(..).map(|d| d.start)` directly.
+  - File(s): `src/buffer.rs`, `src/spell/prose.rs`
