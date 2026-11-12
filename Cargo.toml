@@ -16,6 +16,8 @@ path = "src/main.rs"
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "accesskit"] }
 egui_extras = { version = "0.37", features = ["file", "image"] }
 egui_commonmark = { version = "0.26", features = ["load-images"] }
+# Patched in vendor/ (line spacing of the preview text, see vendor/README.md).
+egui_commonmark_backend = { version = "=0.26.0", default-features = false }
 pulldown-cmark = "0.13"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 ropey = { version = "1.6", default-features = false, features = ["simd"] }
@@ -31,6 +33,10 @@ toml = "1"
 thiserror = "2"
 open = "5"
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
+
+# Local copy of egui_commonmark_backend 0.26.0 with the preview line spacing patch.
+[patch.crates-io]
+egui_commonmark_backend = { path = "vendor/egui_commonmark_backend" }
 
 # Optimize dependencies (syntect, egui, ...) in debug builds; the crate itself stays debuggable.
 [profile.dev.package."*"]

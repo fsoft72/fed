@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Event, Key};
 
-use crate::config::{FONT_SIZE_RANGE, Settings, TAB_WIDTH_RANGE, UiTheme};
+use crate::config::{FONT_SIZE_RANGE, LINE_SPACING_RANGE, Settings, TAB_WIDTH_RANGE, UiTheme};
 use crate::fonts::FontCatalog;
 use crate::keymap::{Action, KeyChord, Keymap, chord_has_modifier};
 use crate::spell::SpellStatus;
@@ -20,6 +20,8 @@ const NAV_WIDTH: f32 = 170.0;
 const NAV_MARGIN: i8 = 4;
 /// Width of the font family filter fields.
 const FILTER_FIELD_WIDTH: f32 = 140.0;
+/// Drag speed of the preview line spacing field (factor per pixel).
+const LINE_SPACING_DRAG_SPEED: f32 = 0.01;
 /// Height of the font family list inside its combo box.
 const FONT_LIST_HEIGHT: f32 = 300.0;
 /// Width of the font family and code theme combo boxes.
@@ -585,7 +587,7 @@ impl SettingsWindow {
         }
     }
 
-    /// Font family and size of the Markdown preview.
+    /// Font family, size and line spacing of the Markdown preview.
     fn preview_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -625,6 +627,15 @@ impl SettingsWindow {
                     .range(FONT_SIZE_RANGE)
                     .speed(0.5);
                 drag_changed(ui.add(size), events);
+                ui.end_row();
+
+                ui.label("Line spacing");
+                let spacing = egui::DragValue::new(&mut settings.preview_line_spacing)
+                    .range(LINE_SPACING_RANGE)
+                    .speed(LINE_SPACING_DRAG_SPEED)
+                    .fixed_decimals(2)
+                    .suffix("x");
+                drag_changed(ui.add(spacing), events);
                 ui.end_row();
             });
     }

@@ -637,13 +637,16 @@ impl FedApp {
             return;
         }
         let half = ui.available_width() / 2.0;
-        let font_size = self.settings.preview_font_size;
+        let layout = markdown::PreviewLayout {
+            font_size: self.settings.preview_font_size,
+            line_spacing: self.settings.preview_line_spacing,
+        };
         egui::Panel::right("fed_preview")
             .resizable(true)
             .default_size(half)
             .show(ui, |ui| {
                 let preview = tab.preview.get_or_insert_with(Preview::new);
-                preview.show(ui, &tab.buffer, font_size);
+                preview.show(ui, &tab.buffer, layout);
             });
     }
 

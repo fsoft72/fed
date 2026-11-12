@@ -262,6 +262,17 @@ pub struct Preview {
     source: String,
     /// Throttles source rebuilds while the buffer is being edited.
     debounce: SourceDebounce,
+    /// Font size and line spacing of the last render (the cached block positions use them).
+    layout: Option<PreviewLayout>,
+}
+
+/// Text settings of the Markdown preview that change the height of the rendered blocks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreviewLayout {
+    /// Base font size in points.
+    pub font_size: f32,
+    /// Line spacing, a factor of the font row height.
+    pub line_spacing: f32,
 }
 
 impl Default for Preview {
@@ -280,16 +291,22 @@ impl Preview {
             cache: CommonMarkCache::default(),
             source: String::new(),
             debounce: SourceDebounce::default(),
+            layout: None,
         }
     }
 
     /// Draws the rendered Markdown of `buf` inside a scroll area, laying out only the visible
     /// part of the document. The text is re-read and image paths are rewritten once the
     /// buffer has stopped changing for `PREVIEW_DEBOUNCE`; until then the previous render
-    /// stays on screen.
-    pub fn show(&mut self, ui: &mut egui::Ui, buf: &Buffer, font_size: f32) {
-        apply_preview_fonts(ui.style_mut(), font_size);
+    /// stays on screen. `layout` sets the font size and the line spacing of the text.
+    pub fn show(&mut self, ui: &mut egui::Ui, buf: &Buffer, layout: PreviewLayout) {
+        apply_preview_fonts(ui.style_mut(), layout.font_size);
+        egui_commonmark_backend::misc::set_line_spacing(ui.ctx(), layout.line_spacing);
         let id = egui::Id::unique(PREVIEW_ID);
+        if self.layout.replace(layout) != Some(layout) {
+            // The cached block positions were measured with the old text size.
+            self.cache.clear_viewer(&id);
+        }
         match self.debounce.check(buf.revision(), Instant::now()) {
             Ok(true) => {
                 let base = absolute_base_dir(buf.path());
@@ -422,5 +439,38 @@ mod tests {
     fn non_image_links_untouched() {
         let src = "[a](img/x.png) and [b](https://e.com) and `![c](d.png)`";
         assert_eq!(rewrite_image_paths(src, Path::new("/d")), src);
+    }
+
+    /// Height of `text` rendered by egui_commonmark in a 300 point wide panel with the given
+    /// line spacing.
+    fn rendered_height(text: &str, line_spacing: f32) -> f32 {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(300.0, 2000.0),
+            )),
+            ..Default::default()
+        };
+        let mut height = 0.0;
+        let mut cache = CommonMarkCache::default();
+        let mut output = ctx.run_ui(input, |ui| {
+            egui_commonmark_backend::misc::set_line_spacing(ui.ctx(), line_spacing);
+            height = CommonMarkViewer::new()
+                .show(ui, &mut cache, text)
+                .response
+                .rect
+                .height();
+        });
+        output.textures_delta.clear();
+        height
+    }
+
+    #[test]
+    fn line_spacing_makes_wrapped_text_taller() {
+        let paragraph = "word ".repeat(200);
+        let single = rendered_height(&paragraph, 1.0);
+        let double = rendered_height(&paragraph, 2.0);
+        assert!(double > single * 1.8, "single {single}, double {double}");
     }
 }

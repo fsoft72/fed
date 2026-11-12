@@ -13,6 +13,10 @@ const DEFAULT_FONT_SIZE: f32 = 14.0;
 pub const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 6.0..=72.0;
 /// Default Markdown preview font size in points.
 const DEFAULT_PREVIEW_FONT_SIZE: f32 = 14.0;
+/// Default Markdown preview line spacing (factor of the font row height).
+const DEFAULT_PREVIEW_LINE_SPACING: f32 = 1.0;
+/// Allowed Markdown preview line spacing range.
+pub const LINE_SPACING_RANGE: std::ops::RangeInclusive<f32> = 0.8..=3.0;
 /// Default tab width in columns.
 const DEFAULT_TAB_WIDTH: usize = 4;
 /// Allowed tab width range in columns.
@@ -57,6 +61,8 @@ pub struct Settings {
     pub preview_font_family: Option<String>,
     /// Markdown preview base font size in points (6..=72).
     pub preview_font_size: f32,
+    /// Markdown preview line spacing, a factor of the font row height (0.8..=3.0).
+    pub preview_line_spacing: f32,
     /// Tab width in columns (1..=16).
     pub tab_width: usize,
     /// Insert spaces instead of tab characters.
@@ -89,6 +95,7 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             preview_font_family: None,
             preview_font_size: DEFAULT_PREVIEW_FONT_SIZE,
+            preview_line_spacing: DEFAULT_PREVIEW_LINE_SPACING,
             tab_width: DEFAULT_TAB_WIDTH,
             insert_spaces: true,
             line_numbers: true,
@@ -179,6 +186,9 @@ impl Settings {
             "preview_font_family" => self.preview_font_family = Some(convert(key, value)?),
             "preview_font_size" => {
                 self.preview_font_size = convert_f32(key, value, &FONT_SIZE_RANGE)?
+            }
+            "preview_line_spacing" => {
+                self.preview_line_spacing = convert_f32(key, value, &LINE_SPACING_RANGE)?
             }
             "tab_width" => self.tab_width = convert_usize(key, value, &TAB_WIDTH_RANGE)?,
             "insert_spaces" => self.insert_spaces = convert(key, value)?,
@@ -345,12 +355,16 @@ mod tests {
         let mut s = Settings::default();
         s.preview_font_family = Some("Georgia".into());
         s.preview_font_size = 18.0;
+        s.preview_line_spacing = 1.5;
         let (back, warnings) = Settings::from_toml_str(&s.to_toml_string());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(back, s);
-        let (d, warnings) = Settings::from_toml_str("preview_font_size = 500\n");
+        let (d, warnings) =
+            Settings::from_toml_str("preview_font_size = 500\npreview_line_spacing = 9\n");
         assert_eq!(d.preview_font_size, 14.0);
+        assert_eq!(d.preview_line_spacing, 1.0);
         assert!(warnings.iter().any(|w| w.contains("preview_font_size")));
+        assert!(warnings.iter().any(|w| w.contains("preview_line_spacing")));
     }
 
     #[test]
