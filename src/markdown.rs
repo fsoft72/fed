@@ -9,6 +9,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkScrollOptions, CommonMarkViewer
 use pulldown_cmark::{Event, Options, Parser, Tag};
 
 use crate::buffer::Buffer;
+use crate::job::BackgroundJob;
 
 /// File extensions (lowercase) treated as Markdown.
 const MARKDOWN_EXTENSIONS: [&str; 3] = ["md", "markdown", "mdown"];
@@ -264,6 +265,8 @@ pub struct Preview {
     debounce: SourceDebounce,
     /// Font size and line spacing of the last render (the cached block positions use them).
     layout: Option<PreviewLayout>,
+    /// Source being rebuilt on a background thread (text copy and image rewrite).
+    building: Option<BackgroundJob<String>>,
 }
 
 /// Text settings of the Markdown preview that change the height of the rendered blocks.
@@ -292,13 +295,15 @@ impl Preview {
             source: String::new(),
             debounce: SourceDebounce::default(),
             layout: None,
+            building: None,
         }
     }
 
     /// Draws the rendered Markdown of `buf` inside a scroll area, laying out only the visible
-    /// part of the document. The text is re-read and image paths are rewritten once the
-    /// buffer has stopped changing for `PREVIEW_DEBOUNCE`; until then the previous render
-    /// stays on screen. `layout` sets the font size and the line spacing of the text.
+    /// part of the document. Once the buffer has stopped changing for `PREVIEW_DEBOUNCE`
+    /// the text is copied and its image paths rewritten on a background thread; until the
+    /// new source arrives the previous render stays on screen. `layout` sets the font size
+    /// and the line spacing of the text.
     pub fn show(&mut self, ui: &mut egui::Ui, buf: &Buffer, layout: PreviewLayout) {
         apply_preview_fonts(ui.style_mut(), layout.font_size);
         egui_commonmark_backend::misc::set_line_spacing(ui.ctx(), layout.line_spacing);
@@ -309,18 +314,46 @@ impl Preview {
         }
         match self.debounce.check(buf.revision(), Instant::now()) {
             Ok(true) => {
-                let base = absolute_base_dir(buf.path());
-                self.source = rewrite_image_paths(&buf.rope().to_string(), &base);
+                // A build of an older revision still running is dropped: its text is stale.
+                self.building = Some(spawn_source_build(buf, ui.ctx()));
                 self.debounce.built(buf.revision());
-                // The visible-slice split points belong to the old text.
-                self.cache.clear_viewer(&id);
             }
             Ok(false) => {}
             Err(wait) => ui.ctx().request_repaint_after(wait),
         }
+        if self.take_built_source() {
+            // The visible-slice split points belong to the old text.
+            self.cache.clear_viewer(&id);
+        }
         let scroll = CommonMarkScrollOptions::default().viewport_cache(true);
         CommonMarkViewer::new().show_scrollable(id, ui, &mut self.cache, &scroll, &self.source);
     }
+
+    /// Takes the source of a finished background build. Returns true when the source
+    /// changed; a crashed build keeps the previous source and shows why in the preview.
+    fn take_built_source(&mut self) -> bool {
+        let Some(result) = self.building.as_ref().and_then(BackgroundJob::poll) else {
+            return false;
+        };
+        self.building = None;
+        self.source = result.unwrap_or_else(|e| {
+            format!(
+                "*The preview could not be built: {}*",
+                escape_markdown(&e.to_string())
+            )
+        });
+        true
+    }
+}
+
+/// Starts building the preview source of `buf` (its text with image paths rewritten, see
+/// `rewrite_image_paths`) on a background thread; `ctx` is repainted when it is done.
+fn spawn_source_build(buf: &Buffer, ctx: &egui::Context) -> BackgroundJob<String> {
+    let rope = buf.rope().clone();
+    let base = absolute_base_dir(buf.path());
+    BackgroundJob::spawn(Some(ctx), move || {
+        rewrite_image_paths(&rope.to_string(), &base)
+    })
 }
 
 #[cfg(test)]
@@ -464,6 +497,32 @@ mod tests {
         });
         output.textures_delta.clear();
         height
+    }
+
+    #[test]
+    fn the_preview_source_is_built_in_the_background() {
+        let ctx = egui::Context::default();
+        let mut buf = Buffer::from_text("# Title\n\n![pic](img.png)\n");
+        buf.set_path(PathBuf::from("/notes/a.md"));
+        let mut preview = Preview::new();
+        let layout = PreviewLayout {
+            font_size: 14.0,
+            line_spacing: 1.0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while preview.source.is_empty() {
+            assert!(Instant::now() < deadline, "the source was never built");
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                preview.show(ui, &buf, layout);
+            });
+            output.textures_delta.clear();
+        }
+        assert!(
+            preview.source.contains("file:///notes/img.png"),
+            "{}",
+            preview.source
+        );
+        assert!(preview.building.is_none());
     }
 
     #[test]

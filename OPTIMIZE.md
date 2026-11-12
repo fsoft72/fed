@@ -39,7 +39,7 @@
 - [x] **`view.rs` mixes five responsibilities in 1100 lines** - it holds the `Decorator` trait, key-to-command mapping, the word-wrap cache, longest-line tracking, mouse handling and painting, and `Frame::run` alone is ~100 lines doing layout, scrolling, page anchoring and IME output. Split it into `view/keys.rs` (`key_to_command`, `page_key`), `view/wrap.rs` (`WrapCache`, `RowMap`, `longest_line`) and keep `Frame` for layout and paint; extract the scroll and IME parts of `run` into their own methods.
   - File(s): `src/view.rs`
 
-- [ ] **The Markdown preview parses the document on the UI thread** - after each debounce `Preview::show` copies the rope to a `String`, parses it with pulldown-cmark in `rewrite_image_paths`, and egui_commonmark parses it again, all on the UI thread, while `ProseRanges` already parses the same text on a worker. Build the rewritten source on a background thread (same pattern as `ProseRanges`) and keep showing the previous render until it arrives.
+- [x] **The Markdown preview parses the document on the UI thread** - after each debounce `Preview::show` copies the rope to a `String`, parses it with pulldown-cmark in `rewrite_image_paths`, and egui_commonmark parses it again, all on the UI thread, while `ProseRanges` already parses the same text on a worker. Build the rewritten source on a background thread (same pattern as `ProseRanges`) and keep showing the previous render until it arrives.
   - File(s): `src/markdown.rs` (`Preview::show`), `src/spell/prose.rs`
 
 ## Low / Nice to have
