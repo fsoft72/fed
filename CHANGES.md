@@ -86,3 +86,4 @@
 - OPTIMIZE: `FedApp::ui` delegates the central panel to `editor_panel`, which returns an `EditorFrame` (context click, vim effects, vim key seen); the syntax assets are taken by `poll_assets` at the top of the frame with the other background jobs, and the code theme comes from `code_theme`.
 - OPTIMIZE: `FedApp` can be built in tests: `FedApp::with_deps` takes the egui context, the config paths and a `FileDialogs` implementation (`NativeDialogs` wraps rfd; `FedApp::new` uses it with `ConfigPaths::detect`). New app tests cover opening command-line files once, the open dialog replacing the blank tab, Save on an untitled tab and a cancelled save.
 - OPTIMIZE: the fixed shortcut aliases are parsed once (`PARSED_ALIASES`, a `LazyLock`) instead of on every key press that misses the keymap.
+- OPTIMIZE: `handle_keyboard` copies only the keyboard events of the frame (`keyboard_events`) instead of cloning the whole input event list (pointer moves included) every frame.

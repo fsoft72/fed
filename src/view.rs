@@ -359,11 +359,9 @@ fn handle_keyboard(
     key_handler: &mut Option<&mut KeyHandler<'_>>,
     out: &mut ViewOutput,
 ) {
-    let events = ui.input(|i| i.events.clone());
+    // Only the keyboard events are copied (none at all in most frames).
+    let events = ui.input(|i| keyboard_events(&i.events));
     for ev in &events {
-        if !is_keyboard_event(ev) {
-            continue;
-        }
         if let Some(up) = page_key(ev) {
             tab.view.page_anchor = Some(tab.view.caret_offset.unwrap_or(0.0));
             if let Some(handler) = key_handler.as_mut() {
@@ -421,6 +419,15 @@ fn key_event(key: Key) -> egui::Event {
         repeat: false,
         modifiers: Modifiers::NONE,
     }
+}
+
+/// Copies the events of `events` the editor consumes from the keyboard.
+fn keyboard_events(events: &[egui::Event]) -> Vec<egui::Event> {
+    events
+        .iter()
+        .filter(|e| is_keyboard_event(e))
+        .cloned()
+        .collect()
 }
 
 /// True for events the editor (or its key handler) consumes from the keyboard.
@@ -1320,6 +1327,25 @@ mod tests {
         // Back on the press position after a real drag: the head follows.
         assert!(drag_moves_head(3, 5, true));
         assert!(!drag_moves_head(5, 5, true));
+    }
+
+    #[test]
+    fn only_keyboard_events_are_copied() {
+        let events = vec![
+            egui::Event::PointerMoved(Pos2::ZERO),
+            egui::Event::Text("a".into()),
+            egui::Event::Copy,
+            egui::Event::Key {
+                key: Key::A,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: NONE,
+            },
+        ];
+        let kept = keyboard_events(&events);
+        assert_eq!(kept, vec![egui::Event::Text("a".into()), egui::Event::Copy]);
+        assert!(keyboard_events(&[]).is_empty());
     }
 
     #[test]
