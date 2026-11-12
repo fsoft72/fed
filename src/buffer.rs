@@ -156,8 +156,7 @@ impl Buffer {
     pub fn from_text(text: &str) -> Buffer {
         let crlf = detect_line_ending(text) == LineEnding::Crlf;
         let rope = build_rope(text);
-        let large =
-            text.len() >= LARGE_FILE_BYTES || rope.lines().any(|l| l.len_chars() > LONG_LINE_CHARS);
+        let large = is_large_text(&rope, 0..rope.len_lines());
         Buffer {
             rope,
             path: None,
@@ -285,7 +284,9 @@ impl Buffer {
         self.saved_position != Some(self.position) || !self.group_edits.is_empty()
     }
 
-    /// Returns true when the buffer is big or has very long lines (computed at creation).
+    /// Returns true when the buffer is big or has very long lines: computed at creation and
+    /// turned on by an edit that makes it so (it never turns off again, so the editor does
+    /// not flip highlighting and wrap on and off while such text is edited).
     pub fn is_large(&self) -> bool {
         self.large
     }
@@ -482,6 +483,8 @@ impl Buffer {
         self.rope.remove(range.clone());
         self.rope.insert(range.start, text);
         self.revision += 1;
+        let new_last = self.rope.char_to_line(range.start + new_len);
+        self.large = self.large || is_large_text(&self.rope, line..new_last + 1);
         if self.edit_log.len() == EDIT_LOG_LEN {
             self.edit_log.pop_front();
         }
@@ -489,7 +492,7 @@ impl Buffer {
             revision: self.revision,
             start: line,
             old_last,
-            new_last: self.rope.char_to_line(range.start + new_len),
+            new_last,
         });
         for (_, pos) in &mut self.marks {
             if *pos >= range.end {
@@ -554,6 +557,15 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+/// True when `rope` is at least `LARGE_FILE_BYTES` long or one of `lines` is longer than
+/// `LONG_LINE_CHARS` chars.
+fn is_large_text(rope: &Rope, lines: Range<usize>) -> bool {
+    rope.len_bytes() >= LARGE_FILE_BYTES
+        || lines
+            .into_iter()
+            .any(|l| rope.line(l).len_chars() > LONG_LINE_CHARS)
 }
 
 /// Text size of an undo step: the bytes it removed plus the bytes it inserted.
@@ -669,6 +681,23 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn edits_can_make_a_buffer_large() {
+        let mut buf = Buffer::from_text("short\nlines\n");
+        assert!(!buf.is_large());
+        // "short\n" plus the padding is exactly the limit (the line break counts).
+        buf.replace(0..0, &"x".repeat(LONG_LINE_CHARS - 6));
+        assert!(!buf.is_large(), "exactly the limit is not long");
+        buf.replace(0..0, "x");
+        assert!(buf.is_large(), "an over-long line");
+        buf.undo();
+        assert!(buf.is_large(), "large stays on");
+        let mut buf = Buffer::from_text("a");
+        let block = "y".repeat(LONG_LINE_CHARS - 1) + "\n";
+        buf.replace(1..1, &block.repeat(LARGE_FILE_BYTES / block.len() + 1));
+        assert!(buf.is_large(), "a big paste of short lines");
     }
 
     #[test]

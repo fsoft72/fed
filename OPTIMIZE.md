@@ -23,7 +23,7 @@
 
 ## Medium
 
-- [ ] **`is_large` is never updated after creation** - the flag is computed in `from_text` only, so pasting megabytes or a 50k-char line into a small buffer keeps syntax highlighting, spell check and word wrap on and the UI stalls; re-evaluate it in `Buffer::apply` (byte length threshold plus the length of the edited lines).
+- [x] **`is_large` is never updated after creation** - the flag is computed in `from_text` only, so pasting megabytes or a 50k-char line into a small buffer keeps syntax highlighting, spell check and word wrap on and the UI stalls; re-evaluate it in `Buffer::apply` (byte length threshold plus the length of the edited lines).
   - File(s): `src/buffer.rs`, `src/app.rs` (`view_options`), `src/tab.rs`
 
 - [ ] **Hit testing re-lays out and re-decorates a line on every drag frame** - `Frame::hit_test` calls `layout_line` (highlight + spell + match decorators and a new galley) for each press, drag, double/triple and right click, and `run` lays out the visible lines again afterwards; since the selection does not change the galley, lay out the visible lines first and hit-test against them (falling back to a plain layout only for off-screen lines).
