@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use super::{FedApp, SaveOutcome, Severity, close_requires_confirmation, same_file, tab_path};
+use super::{FedApp, SaveOutcome, Severity, close_requires_confirmation, tab_path};
+use crate::buffer::Buffer;
 use crate::editing::EditSettings;
 use crate::fonts;
 use crate::tab::Tab;
@@ -65,10 +66,11 @@ fn vim_save_message(outcome: &SaveOutcome, path: &str) -> Option<VimMessage> {
     }
 }
 
-/// True when `:w {target}` must refuse without `!`: the file exists and is not the tab's own
-/// file (`own`).
-fn write_copy_refused(target: &Path, own: Option<&Path>) -> bool {
-    target.exists() && !own.is_some_and(|own| same_file(own, target))
+/// True when `target` is the file `buffer` is bound to (compared by the canonical path the
+/// buffer keeps; only `target` is canonicalized), so `:w {target}` is a plain `:w`.
+fn is_own_file(buffer: &Buffer, target: &Path) -> bool {
+    let canonical = target.canonicalize().ok();
+    buffer.is_bound_to(target, canonical.as_deref())
 }
 
 /// True for effects after which the rest of the frame's vim keys and effects are dropped,
@@ -194,11 +196,11 @@ impl FedApp {
     pub(super) fn vim_write_copy(&mut self, path: PathBuf, force: bool) {
         let tab = &mut self.tabs[self.active];
         let path = resolve_vim_path(path, tab.buffer.path());
-        if tab.buffer.path().is_some_and(|own| same_file(own, &path)) {
+        if is_own_file(&tab.buffer, &path) {
             self.vim_write(force);
             return;
         }
-        if !force && write_copy_refused(&path, tab.buffer.path()) {
+        if !force && path.exists() {
             self.set_vim_message(VIM_FILE_EXISTS.to_string(), true);
             return;
         }
@@ -283,7 +285,6 @@ impl FedApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::Buffer;
 
     const SET: EditSettings = EditSettings {
         tab_width: 4,
@@ -353,20 +354,25 @@ mod tests {
     }
 
     #[test]
-    fn write_copy_refuses_existing_other_files() {
+    fn own_file_is_recognized_through_other_paths() {
         let dir = std::env::temp_dir().join(format!("fed-app-{}-wcopy", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
         let own = dir.join("own.txt");
         let other = dir.join("other.txt");
         std::fs::write(&own, "a").unwrap();
         std::fs::write(&other, "b").unwrap();
-        assert!(write_copy_refused(&other, Some(&own)));
-        assert!(write_copy_refused(&other, None));
+        let buffer = Buffer::load(&own).unwrap();
+        assert!(is_own_file(&buffer, &own));
+        assert!(is_own_file(
+            &buffer,
+            &dir.join("sub").join("..").join("own.txt")
+        ));
+        assert!(!is_own_file(&buffer, &other));
+        assert!(!is_own_file(&buffer, &dir.join("new.txt")));
         assert!(
-            !write_copy_refused(&own, Some(&own)),
-            "own file is a plain write"
+            !is_own_file(&Buffer::new(), &own),
+            "untitled has no own file"
         );
-        assert!(!write_copy_refused(&dir.join("new.txt"), Some(&own)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

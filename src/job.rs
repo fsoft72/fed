@@ -89,7 +89,11 @@ mod tests {
     fn a_job_hands_out_its_value_once() {
         let job = BackgroundJob::spawn(None, || 6 * 7);
         assert_eq!(wait(&job), Ok(42));
-        assert_eq!(wait(&job), Err(JobError::Lost), "the value is not handed out again");
+        assert_eq!(
+            wait(&job),
+            Err(JobError::Lost),
+            "the value is not handed out again"
+        );
     }
 
     #[test]

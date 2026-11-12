@@ -83,17 +83,6 @@ fn is_blank(tab: &Tab) -> bool {
     tab.buffer.path().is_none() && !tab.buffer.is_modified() && tab.buffer.rope().len_chars() == 0
 }
 
-/// True when `a` and `b` name the same file (same text, or same canonical path).
-fn same_file(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
-}
-
 /// Returns the action fired by pressing `key` with `mods`: the keymap binding of that exact
 /// chord, or the action of a fixed `SHORTCUT_ALIASES` entry.
 fn shortcut_action(keymap: &Keymap, key: egui::Key, mods: egui::Modifiers) -> Option<Action> {
