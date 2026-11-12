@@ -184,9 +184,10 @@ fn rewrite_lines(
         let start = rope.line_to_char(index);
         edits.push((start..start + text.chars().count(), new_text));
     }
-    for (range, new_text) in edits.into_iter().rev() {
-        buf.replace(range, &new_text);
-    }
+    // From the end backwards, so the earlier ranges stay valid; one batch keeps the edit log
+    // (and every cache following it) incremental however many lines change.
+    edits.reverse();
+    buf.replace_many(edits);
     (count, last_line)
 }
 
@@ -396,6 +397,24 @@ mod tests {
         let result = substitute(&mut buf, &re("z"), "b", 0..1, true);
         assert!(matches!(result, Err(SearchError::NotFound)));
         assert_eq!(buf.text(), "aa");
+    }
+
+    #[test]
+    fn replace_all_on_many_lines_keeps_the_dirty_lines_known() {
+        let text: String = (0..2000).map(|i| format!("a{i}\n")).collect();
+        let mut buf = Buffer::from_text(&text);
+        let rev = buf.revision();
+        let re = Regex::new("a").unwrap();
+        assert_eq!(replace_all(&mut buf, &re, "b"), 2000);
+        let dirty = buf.dirty_lines_since(rev).unwrap();
+        assert_ne!(
+            dirty.old_end,
+            usize::MAX,
+            "edits past the log size stay known"
+        );
+        assert_eq!((dirty.start, dirty.end, dirty.old_end), (0, 2000, 2000));
+        let matches = find_all(buf.rope(), &Regex::new("b").unwrap());
+        assert_eq!(matches.len(), 2000);
     }
 
     #[test]

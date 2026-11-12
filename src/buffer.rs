@@ -22,7 +22,7 @@ pub const LONG_LINE_CHARS: usize = 10_000;
 const MAX_UNDO_STEPS: usize = 1000;
 /// Most text (removed plus inserted bytes) the undo history keeps; older steps are dropped.
 const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
-/// Number of recent edits remembered by `first_dirty_line_since`.
+/// Number of recent revisions (single edits or batches) remembered by `dirty_lines_since`.
 const EDIT_LOG_LEN: usize = 1024;
 /// Suffix of the temporary file used for atomic saves.
 const TMP_SUFFIX: &str = ".fed-tmp";
@@ -114,17 +114,14 @@ struct Edit {
     inserted: String,
 }
 
-/// Lines touched by one primitive edit, remembered for `dirty_lines_since`.
+/// Lines touched by one revision (one edit or one batch), remembered for
+/// `dirty_lines_since`.
 #[derive(Clone, Copy, Debug)]
 struct LoggedEdit {
     /// Buffer revision right after the edit.
     revision: u64,
-    /// First line of the edit.
-    start: usize,
-    /// Last line the replaced text covered, before the edit.
-    old_last: usize,
-    /// Last line the inserted text covers, after the edit.
-    new_last: usize,
+    /// The lines it changed.
+    span: LineSpan,
 }
 
 /// Lines changed since a revision: `start..end` in the current buffer replaced
@@ -407,6 +404,35 @@ impl Buffer {
         self.push_step(edits);
     }
 
+    /// Replaces each char range of `edits` with its text, in the given order (so later
+    /// ranges must not be shifted by earlier edits: pass them from the end of the text
+    /// backwards), as one undo step (or as part of the open undo group). The batch is one
+    /// revision and one `dirty_lines_since` entry, however many edits it has.
+    pub fn replace_many(&mut self, edits: Vec<(Range<usize>, String)>) {
+        let mut applied = Vec::with_capacity(edits.len());
+        let mut spans = Vec::with_capacity(edits.len());
+        for (range, text) in edits {
+            let len = self.rope.len_chars();
+            let range = range.start.min(len)..range.end.min(len).max(range.start.min(len));
+            if range.is_empty() && text.is_empty() {
+                continue;
+            }
+            let text = normalize_newlines(&text);
+            let (edit, span) = self.apply_raw(range, &text);
+            applied.push(edit);
+            spans.push(span);
+        }
+        if applied.is_empty() {
+            return;
+        }
+        self.log_batch(&spans);
+        if self.group_depth > 0 {
+            self.group_edits.extend(applied);
+            return;
+        }
+        self.push_step(applied);
+    }
+
     /// Undoes the last step; returns the char index for the cursor. Callers must close any
     /// open undo group first.
     pub fn undo(&mut self) -> Option<usize> {
@@ -415,14 +441,16 @@ impl Buffer {
             return None;
         }
         self.position -= 1;
-        // Moved out while applying (`apply` needs `&mut self`), never cloned.
+        // Moved out while applying (`apply_raw` needs `&mut self`), never cloned.
         let step = std::mem::take(&mut self.history[self.position]);
         let mut cursor = 0;
+        let mut spans = Vec::with_capacity(step.len());
         for edit in step.iter().rev() {
             let end = edit.pos + edit.inserted.chars().count();
-            self.apply(edit.pos..end, &edit.removed);
+            spans.push(self.apply_raw(edit.pos..end, &edit.removed).1);
             cursor = edit.pos + edit.removed.chars().count();
         }
+        self.log_batch(&spans);
         self.history[self.position] = step;
         Some(cursor)
     }
@@ -436,11 +464,13 @@ impl Buffer {
         }
         let step = std::mem::take(&mut self.history[self.position]);
         let mut cursor = 0;
+        let mut spans = Vec::with_capacity(step.len());
         for edit in &step {
             let end = edit.pos + edit.removed.chars().count();
-            self.apply(edit.pos..end, &edit.inserted);
+            spans.push(self.apply_raw(edit.pos..end, &edit.inserted).1);
             cursor = edit.pos + edit.inserted.chars().count();
         }
+        self.log_batch(&spans);
         self.history[self.position] = step;
         self.position += 1;
         Some(cursor)
@@ -486,33 +516,8 @@ impl Buffer {
             return Some(everything);
         }
         let first = self.edit_log.partition_point(|e| e.revision <= since);
-        let mut dirty: Option<(usize, usize, isize)> = None;
-        for e in self.edit_log.range(first..) {
-            let shift = e.new_last as isize - e.old_last as isize;
-            let (start, end, delta) = match dirty {
-                None => (e.start, e.new_last + 1, shift),
-                Some((start, end, delta)) => {
-                    // Map the window end through this edit (after it: shifted; inside the
-                    // replaced lines: the end of the inserted ones; before it: unchanged),
-                    // then make the window cover the edit.
-                    let end = if end > e.old_last + 1 {
-                        (end as isize + shift) as usize
-                    } else if end > e.start {
-                        e.new_last + 1
-                    } else {
-                        end
-                    };
-                    (start.min(e.start), end.max(e.new_last + 1), delta + shift)
-                }
-            };
-            dirty = Some((start, end, delta));
-        }
-        let (start, end, delta) = dirty?;
-        Some(DirtyLines {
-            start,
-            end,
-            old_end: (end as isize - delta) as usize,
-        })
+        let merged = merge_spans(self.edit_log.range(first..).map(|e| e.span))?;
+        Some(merged)
     }
 
     /// Returns the file name, or `"untitled"` when unnamed.
@@ -549,8 +554,17 @@ impl Buffer {
         }
     }
 
-    /// Applies a raw replacement: updates rope, revision, edit log and marks.
+    /// Applies a raw replacement as its own revision: updates rope, revision, edit log and
+    /// marks.
     fn apply(&mut self, range: Range<usize>, text: &str) -> Edit {
+        let (edit, span) = self.apply_raw(range, text);
+        self.log_batch(&[span]);
+        edit
+    }
+
+    /// Replaces `range` with `text` in the rope and updates the large flag and the marks,
+    /// without a new revision. Returns the undo record and the lines it touched.
+    fn apply_raw(&mut self, range: Range<usize>, text: &str) -> (Edit, LineSpan) {
         let removed = self.rope.slice(range.clone()).to_string();
         let new_len = text.chars().count();
         let old_len = range.len();
@@ -558,18 +572,8 @@ impl Buffer {
         let old_last = self.rope.char_to_line(range.end);
         self.rope.remove(range.clone());
         self.rope.insert(range.start, text);
-        self.revision += 1;
         let new_last = self.rope.char_to_line(range.start + new_len);
         self.large = self.large || is_large_text(&self.rope, line..new_last + 1);
-        if self.edit_log.len() == EDIT_LOG_LEN {
-            self.edit_log.pop_front();
-        }
-        self.edit_log.push_back(LoggedEdit {
-            revision: self.revision,
-            start: line,
-            old_last,
-            new_last,
-        });
         for (_, pos) in &mut self.marks {
             if *pos >= range.end {
                 *pos = *pos + new_len - old_len;
@@ -577,12 +581,82 @@ impl Buffer {
                 *pos = range.start;
             }
         }
-        Edit {
+        let edit = Edit {
             pos: range.start,
             removed,
             inserted: text.to_string(),
-        }
+        };
+        let span = LineSpan {
+            start: line,
+            old_last,
+            new_last,
+        };
+        (edit, span)
     }
+
+    /// Ends a batch of raw edits (`spans`, in the order applied): one new revision and one edit
+    /// log entry covering all of them. Does nothing for an empty batch.
+    fn log_batch(&mut self, spans: &[LineSpan]) {
+        let Some(merged) = merge_spans(spans.iter().copied()) else {
+            return;
+        };
+        self.revision += 1;
+        if self.edit_log.len() == EDIT_LOG_LEN {
+            self.edit_log.pop_front();
+        }
+        self.edit_log.push_back(LoggedEdit {
+            revision: self.revision,
+            span: LineSpan {
+                start: merged.start,
+                old_last: merged.old_end - 1,
+                new_last: merged.end - 1,
+            },
+        });
+    }
+}
+
+/// Lines touched by one primitive edit: `start..=old_last` before it became
+/// `start..=new_last` after it.
+#[derive(Clone, Copy, Debug)]
+struct LineSpan {
+    /// First line of the edit.
+    start: usize,
+    /// Last line the replaced text covered, before the edit.
+    old_last: usize,
+    /// Last line the inserted text covers, after the edit.
+    new_last: usize,
+}
+
+/// Merges consecutive edits (in the order applied) into the one window of lines they changed,
+/// as `dirty_lines_since` reports it; `None` without edits.
+fn merge_spans(spans: impl IntoIterator<Item = LineSpan>) -> Option<DirtyLines> {
+    let mut dirty: Option<(usize, usize, isize)> = None;
+    for e in spans {
+        let shift = e.new_last as isize - e.old_last as isize;
+        let (start, end, delta) = match dirty {
+            None => (e.start, e.new_last + 1, shift),
+            Some((start, end, delta)) => {
+                // Map the window end through this edit (after it: shifted; inside the
+                // replaced lines: the end of the inserted ones; before it: unchanged),
+                // then make the window cover the edit.
+                let end = if end > e.old_last + 1 {
+                    (end as isize + shift) as usize
+                } else if end > e.start {
+                    e.new_last + 1
+                } else {
+                    end
+                };
+                (start.min(e.start), end.max(e.new_last + 1), delta + shift)
+            }
+        };
+        dirty = Some((start, end, delta));
+    }
+    let (start, end, delta) = dirty?;
+    Some(DirtyLines {
+        start,
+        end,
+        old_end: (end as isize - delta) as usize,
+    })
 }
 
 /// Creates (or truncates) the file at `path`, streams the chunks of `rope` into it (LF
@@ -800,6 +874,40 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_batch_of_edits_is_one_revision_and_one_log_entry() {
+        let text: String = (0..3000).map(|i| format!("line {i}\n")).collect();
+        let mut buf = Buffer::from_text(&text);
+        let rev = buf.revision();
+        // Every line of 0..2000 gets a suffix, from the end backwards.
+        let edits: Vec<(Range<usize>, String)> = (0..2000)
+            .rev()
+            .map(|l| {
+                let end = buf.rope().line_to_char(l + 1) - 1;
+                (end..end, "!\nx".to_string())
+            })
+            .collect();
+        buf.replace_many(edits);
+        assert_eq!(buf.revision(), rev + 1);
+        assert_eq!(
+            buf.dirty_lines_since(rev),
+            Some(DirtyLines {
+                start: 0,
+                end: 4000,
+                old_end: 2000,
+            })
+        );
+        assert!(buf.text().starts_with("line 0!\nx\nline 1!\nx\n"));
+        let after = buf.revision();
+        assert!(buf.undo().is_some());
+        assert_eq!(buf.text(), text, "one undo step");
+        assert_eq!(buf.revision(), after + 1);
+        let dirty = buf.dirty_lines_since(after).unwrap();
+        assert_eq!((dirty.start, dirty.end, dirty.old_end), (0, 2000, 4000));
+        buf.redo();
+        assert_eq!(buf.dirty_lines_since(rev).map(|d| d.old_end), Some(2000));
     }
 
     #[test]
