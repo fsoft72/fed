@@ -11,6 +11,39 @@ const IS_MAC: bool = cfg!(target_os = "macos");
 /// Config string meaning "this action has no key binding".
 const UNBOUND: &str = "";
 
+/// True for the function keys F1 to F20, which may be bound without a modifier.
+fn is_function_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::F1
+            | Key::F2
+            | Key::F3
+            | Key::F4
+            | Key::F5
+            | Key::F6
+            | Key::F7
+            | Key::F8
+            | Key::F9
+            | Key::F10
+            | Key::F11
+            | Key::F12
+            | Key::F13
+            | Key::F14
+            | Key::F15
+            | Key::F16
+            | Key::F17
+            | Key::F18
+            | Key::F19
+            | Key::F20
+    )
+}
+
+/// True when `chord` may become a shortcut: it uses Ctrl, Cmd or Alt, or its key is F1-F20.
+/// Shift alone is not enough, since Shift+letter is plain typing.
+pub fn chord_has_modifier(chord: &KeyChord) -> bool {
+    chord.command || chord.ctrl || chord.alt || is_function_key(chord.key)
+}
+
 /// A user-triggerable editor action that can be bound to a key chord.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Action {
@@ -281,6 +314,10 @@ impl Keymap {
                 continue;
             }
             match KeyChord::parse(text) {
+                // A bare key would be dispatched as a shortcut and swallow typing.
+                Ok(chord) if !chord_has_modifier(&chord) => warnings.push(format!(
+                    "keybinding '{name}' ignored: {chord} needs Ctrl, Cmd or Alt (or an F key)"
+                )),
                 Ok(chord) => {
                     keymap.bindings.insert(action, chord);
                 }
@@ -526,6 +563,36 @@ mod tests {
             km.chord(Action::Save),
             Keymap::defaults().chord(Action::Save)
         );
+    }
+
+    #[test]
+    fn chords_need_a_modifier_unless_function_key() {
+        let chord = |s: &str| KeyChord::parse(s).expect("valid chord");
+        assert!(chord_has_modifier(&chord("Ctrl+K")));
+        assert!(chord_has_modifier(&chord("Alt+K")));
+        assert!(chord_has_modifier(&chord("F1")));
+        assert!(chord_has_modifier(&chord("Shift+F20")));
+        assert!(!chord_has_modifier(&chord("K")));
+        assert!(!chord_has_modifier(&chord("Shift+K")));
+        assert!(!chord_has_modifier(&KeyChord::from_egui(
+            Key::F21,
+            Modifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn bare_key_override_warns_and_keeps_default() {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("save".to_string(), "K".to_string());
+        m.insert("find".to_string(), "Shift+K".to_string());
+        m.insert("go_to_line".to_string(), "F7".to_string());
+        let (km, warnings) = Keymap::from_overrides(&m);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().all(|w| w.contains("needs Ctrl")));
+        let defaults = Keymap::defaults();
+        assert_eq!(km.chord(Action::Save), defaults.chord(Action::Save));
+        assert_eq!(km.chord(Action::Find), defaults.chord(Action::Find));
+        assert_eq!(km.chord(Action::GoToLine), KeyChord::parse("F7").ok());
     }
 
     #[test]

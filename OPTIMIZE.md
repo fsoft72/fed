@@ -8,7 +8,7 @@
   - File(s): `src/spell/mod.rs`, `src/spell/words.rs`
 - [x] **Markdown preview copies and re-parses the whole document** - `Preview::show` does `buf.rope().to_string()` + `rewrite_image_paths` on every revision and hands the full source to `CommonMarkViewer::show` every frame (which parses it again); debounce the source refresh while typing and avoid rendering the whole document when only the visible part is needed.
   - File(s): `src/markdown.rs`
-- [ ] **Bare-key shortcuts accepted from `settings.toml`** - `chord_has_modifier` is only enforced by the settings UI capture, not by `Keymap::from_overrides`, so `save = "K"` in the config file gets dispatched by `shortcut_action` on every keystroke and swallows typing; move the rule into `keymap.rs` and apply it at load time with a warning.
+- [x] **Bare-key shortcuts accepted from `settings.toml`** - `chord_has_modifier` is only enforced by the settings UI capture, not by `Keymap::from_overrides`, so `save = "K"` in the config file gets dispatched by `shortcut_action` on every keystroke and swallows typing; move the rule into `keymap.rs` and apply it at load time with a warning.
   - File(s): `src/keymap.rs`, `src/settings_ui.rs`
 
 ## High
