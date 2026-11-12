@@ -33,7 +33,7 @@
 - [x] **Two `same_file` functions with different costs** - `app::same_file` canonicalizes both paths on every call (used by vim `:w {file}` and `write_copy_refused`), while `buffer::same_file` compares the canonical path the buffer already keeps. Drop the app version and use `Buffer::is_bound_to` with one `canonicalize` of the target, so there is a single definition of "same file".
   - File(s): `src/app.rs`, `src/app/vim.rs`, `src/buffer.rs`
 
-- [ ] **Quadratic char offsets when highlighting long lines** - `parse_line` computes `text[..range.start].chars().count()` for every span, so a line with thousands of tokens (minified code below `LONG_LINE_CHARS`) costs O(n^2) per parse; keep a running byte/char cursor across spans instead.
+- [x] **Quadratic char offsets when highlighting long lines** - `parse_line` computes `text[..range.start].chars().count()` for every span, so a line with thousands of tokens (minified code below `LONG_LINE_CHARS`) costs O(n^2) per parse; keep a running byte/char cursor across spans instead.
   - File(s): `src/highlight.rs` (`parse_line`)
 
 - [ ] **`view.rs` mixes five responsibilities in 1100 lines** - it holds the `Decorator` trait, key-to-command mapping, the word-wrap cache, longest-line tracking, mouse handling and painting, and `Frame::run` alone is ~100 lines doing layout, scrolling, page anchoring and IME output. Split it into `view/keys.rs` (`key_to_command`, `page_key`), `view/wrap.rs` (`WrapCache`, `RowMap`, `longest_line`) and keep `Frame` for layout and paint; extract the scroll and IME parts of `run` into their own methods.

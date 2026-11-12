@@ -513,6 +513,8 @@ fn parse_line(
     let mut out = Vec::new();
     let iter = RangedHighlightIterator::new(&mut state.highlight, &ops, text, highlighter);
     let mut next_op = 0;
+    // The ranges come in text order: count chars incrementally, not from the line start.
+    let mut cursor = CharCursor::default();
     for (style, _, range) in iter {
         // The iterator skips empty segments, so sync the stack by position, not by index.
         while next_op < ops.len() && ops[next_op].0 <= range.start {
@@ -522,12 +524,35 @@ fn parse_line(
         }
         let end = range.end.min(content_len);
         if range.start < end {
-            let start_char = text[..range.start].chars().count();
-            let end_char = start_char + text[range.start..end].chars().count();
+            let start_char = cursor.char_at(text, range.start);
+            let end_char = cursor.char_at(text, end);
             out.push(styled_span(start_char..end_char, style, span_kind(&stack)));
         }
     }
     out
+}
+
+/// Converts byte offsets of one text to char offsets, counting only the chars between the
+/// previous offset and the next one (offsets usually grow).
+#[derive(Default)]
+struct CharCursor {
+    /// Last byte offset converted.
+    byte: usize,
+    /// Char offset of `byte`.
+    chars: usize,
+}
+
+impl CharCursor {
+    /// Char offset of byte offset `byte` (a char boundary) of `text`. Moving backwards
+    /// counts again from the start of the text.
+    fn char_at(&mut self, text: &str, byte: usize) -> usize {
+        if byte < self.byte {
+            *self = CharCursor::default();
+        }
+        self.chars += text[self.byte..byte].chars().count();
+        self.byte = byte;
+        self.chars
+    }
 }
 
 /// Builds a `StyledSpan` from a syntect style.
@@ -955,6 +980,24 @@ mod tests {
         assert!(a.take_warm_failures().is_empty());
         a.warm_guarded("Python".to_string(), || {});
         assert!(a.ensure_warm("Python", &rope, &ctx));
+    }
+
+    #[test]
+    fn char_cursor_matches_counting_from_the_start() {
+        let text = "aé€😀b\tc";
+        let mut cursor = CharCursor::default();
+        let offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+        for &b in offsets
+            .iter()
+            .chain([text.len()].iter())
+            .chain(offsets.iter().rev())
+        {
+            assert_eq!(
+                cursor.char_at(text, b),
+                text[..b].chars().count(),
+                "byte {b}"
+            );
+        }
     }
 
     #[test]
