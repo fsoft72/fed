@@ -55,15 +55,21 @@ pub struct HighlightAssets {
     pub themes: ThemeSet,
     /// Warm-up progress by syntax name (see `ensure_warm`).
     warm: Mutex<HashMap<String, Warmth>>,
+    /// Names of `themes`, sorted, computed once.
+    theme_names: Vec<String>,
 }
 
 impl HighlightAssets {
     /// Loads the bundled syntaxes and themes (slow: call off the UI thread).
     pub fn load() -> HighlightAssets {
+        let themes = ThemeSet::load_defaults();
+        // `themes` is a BTreeMap: the keys come out sorted.
+        let theme_names = themes.themes.keys().cloned().collect();
         HighlightAssets {
             syntaxes: two_face::syntax::extra_newlines(),
-            themes: ThemeSet::load_defaults(),
+            themes,
             warm: Mutex::new(HashMap::new()),
+            theme_names,
         }
     }
 
@@ -108,9 +114,9 @@ impl HighlightAssets {
         }
     }
 
-    /// Returns the names of the available themes, sorted.
-    pub fn theme_names(&self) -> Vec<String> {
-        self.themes.themes.keys().cloned().collect()
+    /// Returns the names of the available themes, sorted (computed once at load).
+    pub fn theme_names(&self) -> &[String] {
+        &self.theme_names
     }
 }
 
@@ -485,6 +491,15 @@ impl Decorator for HighlightDecorator<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn theme_names_are_sorted_and_cached() {
+        let assets = HighlightAssets::load();
+        let names = assets.theme_names();
+        assert!(!names.is_empty());
+        assert!(names.windows(2).all(|w| w[0] < w[1]));
+        assert!(std::ptr::eq(names, assets.theme_names()));
+    }
+
     #[test]
     fn typescript_extension_has_a_syntax() {
         let assets = HighlightAssets::load();

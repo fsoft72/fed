@@ -686,16 +686,15 @@ impl FedApp {
         let spell = self.spell_status();
         let theme_names = self
             .loaded_assets
-            .as_ref()
-            .map(|a| a.theme_names())
-            .unwrap_or_default();
+            .as_deref()
+            .map_or(&[][..], HighlightAssets::theme_names);
         let catalog = self.fonts.catalog(ctx);
         let events = self.settings_window.show(
             ctx,
             &mut self.settings,
             &mut self.keymap,
             catalog,
-            &theme_names,
+            theme_names,
             &spell,
         );
         self.apply_settings_events(ctx, events);

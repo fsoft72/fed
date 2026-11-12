@@ -133,13 +133,13 @@ fn family_combo(
                 ui.label("scanning fonts...");
                 return;
             };
-            let visible = families.iter().filter(|(name, mono)| {
-                (*mono || !monospace_only) && name.to_lowercase().contains(filter)
-            });
-            for (name, _) in visible {
-                let is_current = current.as_deref() == Some(name.as_str());
-                if ui.selectable_label(is_current, name).clicked() {
-                    choice = Some(Some(name.clone()));
+            let visible = families
+                .iter()
+                .filter(|f| (f.monospace || !monospace_only) && f.lower.contains(filter));
+            for family in visible {
+                let is_current = current.as_deref() == Some(family.name.as_str());
+                if ui.selectable_label(is_current, &family.name).clicked() {
+                    choice = Some(Some(family.name.clone()));
                 }
             }
         });

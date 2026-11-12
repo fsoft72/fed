@@ -53,7 +53,7 @@
 
 ## Low / Nice to have
 
-- [ ] **Per-frame allocations in settings and dialogs** - `show_settings` rebuilds `theme_names()` (a `Vec<String>`) every frame, `family_combo` lowercases every font name every frame while open, and `close_window_dialog` rebuilds the file name list every frame; compute these once when the window/dialog opens.
+- [x] **Per-frame allocations in settings and dialogs** - `show_settings` rebuilds `theme_names()` (a `Vec<String>`) every frame, `family_combo` lowercases every font name every frame while open, and `close_window_dialog` rebuilds the file name list every frame; compute these once when the window/dialog opens.
   - File(s): `src/app.rs`, `src/highlight.rs`, `src/settings_ui.rs`, `src/app/dialogs.rs`
 - [ ] **Duplicated constants and helpers** - `FONT_SIZE_RANGE` / `TAB_WIDTH_RANGE` are defined in both `config.rs` and `settings_ui.rs`; `confirm_close_tab` / `confirm_close_window` repeat the same modal; the Escape/Enter field handling is copied three times in the find bar; `motion::next_word_start` / `prev_word_start` copy `text_nav`; `editing::insert_text` re-implements `normalize_newlines`; Markdown detection exists both as `is_markdown_path` and `SpellMode::for_syntax`.
   - File(s): `src/config.rs`, `src/settings_ui.rs`, `src/app/dialogs.rs`, `src/find_bar.rs`, `src/vim/motion.rs`, `src/editing.rs`, `src/markdown.rs`, `src/spell/mod.rs`

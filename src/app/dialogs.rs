@@ -11,12 +11,13 @@ const CLOSE_TAB_MODAL_ID: &str = "fed_close_tab_modal";
 const CLOSE_WINDOW_MODAL_ID: &str = "fed_close_window_modal";
 
 /// A confirmation the application is waiting for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Pending {
     /// Closing the tab with this id (ids stay valid when other tabs close).
     CloseTab(u64),
-    /// Closing the window while some tabs have unsaved changes.
-    CloseWindow,
+    /// Closing the window while the tabs listed in `names` (paths, computed once when the
+    /// dialog opens) have unsaved changes.
+    CloseWindow { names: Vec<String> },
 }
 
 /// Answer to the close-tab confirmation.
@@ -152,15 +153,19 @@ impl FedApp {
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        self.pending = Some(Pending::CloseWindow);
+        let names = tabs_needing_confirmation(&self.tabs)
+            .into_iter()
+            .map(|i| tab_path(&self.tabs[i]))
+            .collect();
+        self.pending = Some(Pending::CloseWindow { names });
     }
 
     /// Shows the pending confirmation dialog and carries out the answer.
     pub(super) fn show_dialogs(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.pending else { return };
-        match pending {
-            Pending::CloseTab(id) => self.close_tab_dialog(ctx, id),
-            Pending::CloseWindow => self.close_window_dialog(ctx),
+        match &self.pending {
+            Some(Pending::CloseTab(id)) => self.close_tab_dialog(ctx, *id),
+            Some(Pending::CloseWindow { .. }) => self.close_window_dialog(ctx),
+            None => {}
         }
     }
 
@@ -185,11 +190,10 @@ impl FedApp {
 
     /// Runs the close-window confirmation listing the modified files.
     fn close_window_dialog(&mut self, ctx: &egui::Context) {
-        let names: Vec<String> = tabs_needing_confirmation(&self.tabs)
-            .into_iter()
-            .map(|i| tab_path(&self.tabs[i]))
-            .collect();
-        let Some(choice) = confirm_close_window(ctx, &names) else {
+        let Some(Pending::CloseWindow { names }) = &self.pending else {
+            return;
+        };
+        let Some(choice) = confirm_close_window(ctx, names) else {
             return;
         };
         self.pending = None;

@@ -91,9 +91,31 @@ fn system_database() -> fontdb::Database {
     db
 }
 
+/// One system font family as listed in the settings window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FamilyEntry {
+    /// Family name.
+    pub name: String,
+    /// `name` in lowercase, computed once for the case-insensitive filter.
+    pub lower: String,
+    /// True when any face of the family is monospaced.
+    pub monospace: bool,
+}
+
+impl FamilyEntry {
+    /// Creates an entry for `name`.
+    pub fn new(name: &str, monospace: bool) -> FamilyEntry {
+        FamilyEntry {
+            name: name.to_string(),
+            lower: name.to_lowercase(),
+            monospace,
+        }
+    }
+}
+
 /// Returns every family name in `db` (its first, English, name), sorted case-insensitively
-/// without duplicates, flagged true when any face of the family is monospaced.
-fn family_list(db: &fontdb::Database) -> Vec<(String, bool)> {
+/// without duplicates, flagged monospace when any face of the family is monospaced.
+fn family_list(db: &fontdb::Database) -> Vec<FamilyEntry> {
     let mut map: BTreeMap<String, bool> = BTreeMap::new();
     for face in db.faces() {
         let Some((name, _)) = face.families.first() else {
@@ -101,8 +123,11 @@ fn family_list(db: &fontdb::Database) -> Vec<(String, bool)> {
         };
         *map.entry(name.clone()).or_default() |= face.monospaced;
     }
-    let mut list: Vec<(String, bool)> = map.into_iter().collect();
-    list.sort_by_cached_key(|(name, _)| name.to_lowercase());
+    let mut list: Vec<FamilyEntry> = map
+        .into_iter()
+        .map(|(name, mono)| FamilyEntry::new(&name, mono))
+        .collect();
+    list.sort_by(|a, b| a.lower.cmp(&b.lower));
     list
 }
 
@@ -126,12 +151,12 @@ fn family_font(db: &fontdb::Database, family: &str) -> Option<FontData> {
 struct Scan {
     /// Every system face.
     db: fontdb::Database,
-    /// Family names with their monospace flag (see `family_list`), shared with callers.
+    /// Family entries (see `family_list`), shared with callers.
     families: FamilyList,
 }
 
-/// Shared, read-only list of font family names with their monospace flag.
-pub type FamilyList = Arc<[(String, bool)]>;
+/// Shared, read-only list of font families.
+pub type FamilyList = Arc<[FamilyEntry]>;
 
 /// Scan result slot shared with the scanner and the face loaders, which wait on the condvar.
 type ScanSlot = Arc<(Mutex<Option<Arc<Scan>>>, Condvar)>;
@@ -165,7 +190,7 @@ impl FontCatalog {
         self.slot.0.lock().expect("font catalog poisoned").clone()
     }
 
-    /// Returns the family names (sorted, monospace flag), or `None` while scanning. The
+    /// Returns the font families (sorted), or `None` while scanning. The
     /// list is shared, so calling this every frame does not copy it.
     pub fn families(&self) -> Option<FamilyList> {
         self.scan().map(|scan| Arc::clone(&scan.families))
@@ -274,7 +299,7 @@ mod tests {
     #[test]
     fn family_list_flags_monospace_and_face_lookup_by_name() {
         let db = hack_database();
-        assert_eq!(family_list(&db), vec![(HACK.to_string(), true)]);
+        assert_eq!(family_list(&db), vec![FamilyEntry::new(HACK, true)]);
         let font = family_font(&db, HACK).expect("Hack is in the database");
         assert!(!font.bytes().is_empty());
         assert_eq!(font.index, 0);
@@ -332,7 +357,7 @@ mod tests {
         let first = catalog.families().expect("scan finished");
         let second = catalog.families().expect("scan finished");
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(&first[..], &[(HACK.to_string(), true)]);
+        assert_eq!(&first[..], &[FamilyEntry::new(HACK, true)]);
     }
 
     #[test]
