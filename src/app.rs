@@ -926,7 +926,8 @@ impl FedApp {
             return;
         };
         let Some(range) = tab
-            .spell_marks
+            .spell
+            .marks
             .iter()
             .find(|m| m.start >= clicked.start && m.end <= clicked.end)
             .cloned()
@@ -1444,8 +1445,7 @@ impl eframe::App for FedApp {
             let syntax = tab.syntax.take().unwrap_or_default();
             // Decorator state is moved out of the tab so the decorators do not borrow it.
             let mut cache = std::mem::take(&mut tab.highlight);
-            let mut markdown = std::mem::take(&mut tab.spell_md);
-            let mut marks = std::mem::take(&mut tab.spell_marks);
+            let mut spell_cache = std::mem::take(&mut tab.spell);
             let large = tab.buffer.is_large();
             let edit = opts.edit;
             let mut frame_ended = false;
@@ -1491,14 +1491,8 @@ impl eframe::App for FedApp {
             let out = match spell_checker {
                 Some(c) => {
                     let mode = SpellMode::for_syntax(&syntax);
-                    let mut spell = SpellDecorator::new(
-                        &mut highlighted,
-                        c,
-                        mode,
-                        &mut markdown,
-                        &mut marks,
-                        ui.ctx(),
-                    );
+                    let mut spell =
+                        SpellDecorator::new(&mut highlighted, c, mode, &mut spell_cache, ui.ctx());
                     let mut deco = MatchDecorator::new(&mut spell, &matches);
                     view::show_editor(ui, tab, &opts, &mut deco, key_handler)
                 }
@@ -1509,12 +1503,11 @@ impl eframe::App for FedApp {
             };
             tab.highlight = cache;
             tab.syntax = assets.map(|_| syntax);
-            tab.spell_md = markdown;
             if !spell_active {
                 // Nothing was checked: drop the marks so no stale suggestion popup opens.
-                marks.clear();
+                spell_cache.marks.clear();
             }
-            tab.spell_marks = marks;
+            tab.spell = spell_cache;
             if vim_mode && out.mouse_selected {
                 tab.vim.mouse_selection(&mut tab.buffer, &mut tab.editor);
             }

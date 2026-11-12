@@ -19,7 +19,7 @@
   - File(s): `src/view.rs`
 - [x] **Longest-line scan is O(document) per keystroke without wrap** - `Frame::max_line_cols` rescans every line whenever the revision changes; update it incrementally from the dirty line range (a full rescan is only needed when the longest line shrinks).
   - File(s): `src/view.rs`
-- [ ] **Spell checking re-runs for every visible line every frame** - `SpellDecorator::decorate` re-tokenizes each visible line, takes `checker.write()` and allocates a `String` per word on every frame, with no per-line result cache, and `SpellChecker::cache` grows without limit; cache the misspelled ranges per `(line, revision)` and bound the word cache.
+- [x] **Spell checking re-runs for every visible line every frame** - `SpellDecorator::decorate` re-tokenizes each visible line, takes `checker.write()` and allocates a `String` per word on every frame, with no per-line result cache, and `SpellChecker::cache` grows without limit; cache the misspelled ranges per `(line, revision)` and bound the word cache.
   - File(s): `src/spell/mod.rs`, `src/spell/words.rs`
 - [ ] **Syntax highlighting can stall a frame on big files** - `HighlightCache::line_spans` parses every line from the last cached one up to the requested one inside one frame (jumping to the end of a ~5 MB file parses all of it), and keeps a cloned `ParseState` + `HighlightState` for every line; add a per-frame line budget with `request_repaint` and checkpoint states every N lines instead of every line.
   - File(s): `src/highlight.rs`

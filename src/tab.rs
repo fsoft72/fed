@@ -1,7 +1,5 @@
 //! An open document: buffer, editor state and per-tab view caches.
 
-use std::collections::HashSet;
-use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9,7 +7,7 @@ use crate::buffer::Buffer;
 use crate::editing::{self, EditCommand, EditSettings, EditorState};
 use crate::highlight::{self, HighlightAssets, HighlightCache};
 use crate::markdown::Preview;
-use crate::spell::ProseRanges;
+use crate::spell::SpellCache;
 use crate::view::ViewState;
 use crate::vim::VimState;
 
@@ -34,10 +32,8 @@ pub struct Tab {
     pub syntax: Option<String>,
     /// Buffer path `syntax` was computed for, to recompute it only when the path changes.
     syntax_path: Option<PathBuf>,
-    /// Markdown prose ranges (char ranges of the whole document), parsed in the background.
-    pub spell_md: ProseRanges,
-    /// Buffer char ranges of the misspelled words painted in the last frame.
-    pub spell_marks: HashSet<Range<usize>>,
+    /// Spell check state: Markdown prose ranges, painted marks and per-line results.
+    pub spell: SpellCache,
     /// True while the Markdown preview panel is shown for this tab.
     pub preview_open: bool,
     /// Markdown preview state, created when the preview is first opened.
@@ -60,8 +56,7 @@ impl Tab {
             highlight: HighlightCache::new(),
             syntax: None,
             syntax_path: None,
-            spell_md: ProseRanges::new(),
-            spell_marks: HashSet::new(),
+            spell: SpellCache::default(),
             preview_open: false,
             preview: None,
             vim: VimState::new(),

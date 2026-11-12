@@ -21,6 +21,10 @@ use crate::view::{self, Decorator};
 
 pub use prose::ProseRanges;
 
+/// Word results kept by `SpellChecker::is_correct` before the cache is emptied.
+const MAX_WORD_CACHE: usize = 50_000;
+/// Line results kept by `SpellCache` before it is emptied.
+const MAX_LINE_CACHE: usize = 4_096;
 /// Maximum number of suggestions returned for a word.
 const MAX_SUGGESTIONS: usize = 8;
 /// Name of the Markdown syntax.
@@ -38,8 +42,12 @@ pub struct SpellChecker {
     dicts: Vec<spellbook::Dictionary>,
     /// Words added by the user.
     personal: HashSet<String>,
-    /// Results of `is_correct`, cleared when the personal list changes.
+    /// Results of `is_correct`, cleared when the personal list changes or it grows past
+    /// `MAX_WORD_CACHE` entries.
     cache: HashMap<String, bool>,
+    /// Incremented whenever a dictionary or personal word is added, so cached line results
+    /// computed with an older word list can be discarded.
+    generation: u64,
 }
 
 impl SpellChecker {
@@ -49,7 +57,13 @@ impl SpellChecker {
             dicts,
             personal,
             cache: HashMap::new(),
+            generation: 0,
         }
+    }
+
+    /// Returns a counter that changes whenever the accepted words change.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Returns true if `word` is accepted by a dictionary or the personal list. A capitalized
@@ -69,6 +83,9 @@ impl SpellChecker {
             return known;
         }
         let known = self.check(word);
+        if self.cache.len() >= MAX_WORD_CACHE {
+            self.cache.clear();
+        }
         self.cache.insert(word.to_string(), known);
         known
     }
@@ -93,12 +110,14 @@ impl SpellChecker {
     pub fn add_dictionary(&mut self, dict: spellbook::Dictionary) {
         self.dicts.push(dict);
         self.cache.clear();
+        self.generation += 1;
     }
 
     /// Adds `word` to the in-memory personal list and clears the result cache.
     pub fn add_personal(&mut self, word: &str) {
         self.personal.insert(word.to_string());
         self.cache.clear();
+        self.generation += 1;
     }
 }
 
@@ -332,6 +351,53 @@ impl SpellMode {
     }
 }
 
+/// Per-tab spell checking state kept between frames.
+#[derive(Default)]
+pub struct SpellCache {
+    /// Markdown prose ranges, parsed in the background.
+    pub prose: ProseRanges,
+    /// Buffer char ranges of the misspelled words painted in the last frame.
+    pub marks: HashSet<Range<usize>>,
+    /// Misspelled ranges (line coordinates) keyed by a hash of the line text and of its
+    /// checkable ranges, valid for checker generation `generation`.
+    lines: HashMap<u64, Vec<Range<usize>>>,
+    /// Checker generation the cached line results were computed with.
+    generation: Option<u64>,
+}
+
+impl SpellCache {
+    /// Returns the cached result for `key`, if any.
+    fn line(&self, key: u64) -> Option<&Vec<Range<usize>>> {
+        self.lines.get(&key)
+    }
+
+    /// Stores the result for `key`, emptying the cache first when it is full.
+    fn store_line(&mut self, key: u64, misspelled: Vec<Range<usize>>) {
+        if self.lines.len() >= MAX_LINE_CACHE {
+            self.lines.clear();
+        }
+        self.lines.insert(key, misspelled);
+    }
+
+    /// Drops the line results when the checker word list changed.
+    fn sync_generation(&mut self, generation: u64) {
+        if self.generation == Some(generation) {
+            return;
+        }
+        self.lines.clear();
+        self.generation = Some(generation);
+    }
+}
+
+/// Hash of a line's text and checkable ranges: the inputs of its spell check result.
+fn line_key(line: &str, ranges: &[Range<usize>]) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    line.hash(&mut h);
+    ranges.hash(&mut h);
+    h.finish()
+}
+
 /// Decorator that underlines misspelled words on top of the highlight decorator.
 pub struct SpellDecorator<'a, 'b> {
     /// Highlight decorator providing the base spans and the token kinds for code.
@@ -340,36 +406,63 @@ pub struct SpellDecorator<'a, 'b> {
     checker: Arc<RwLock<SpellChecker>>,
     /// Which text is checked.
     mode: SpellMode,
-    /// Markdown prose ranges of the tab, parsed in the background.
-    markdown: &'a mut ProseRanges,
+    /// Spell state of the tab (Markdown ranges, painted marks, line results).
+    cache: &'a mut SpellCache,
     /// Context repainted when a background Markdown parse completes.
     ctx: egui::Context,
-    /// Receives the buffer ranges of the misspelled words painted this frame.
-    marks: &'a mut HashSet<Range<usize>>,
     /// Snapshot of the buffer text taken in `prepare`.
     rope: Option<Rope>,
 }
 
 impl<'a, 'b> SpellDecorator<'a, 'b> {
-    /// Creates a decorator over `inner`; `markdown` and `marks` are the tab's spell caches and
-    /// `ctx` is repainted when the Markdown ranges are refreshed in the background.
+    /// Creates a decorator over `inner`; `cache` is the tab's spell state and `ctx` is
+    /// repainted when the Markdown ranges are refreshed in the background.
     pub fn new(
         inner: &'a mut HighlightDecorator<'b>,
         checker: Arc<RwLock<SpellChecker>>,
         mode: SpellMode,
-        markdown: &'a mut ProseRanges,
-        marks: &'a mut HashSet<Range<usize>>,
+        cache: &'a mut SpellCache,
         ctx: &egui::Context,
     ) -> SpellDecorator<'a, 'b> {
         SpellDecorator {
             inner,
             checker,
             mode,
-            markdown,
+            cache,
             ctx: ctx.clone(),
-            marks,
             rope: None,
         }
+    }
+
+    /// Returns the misspelled ranges (line coordinates) among `ranges` of `line`, from the
+    /// line cache when the same text and ranges were checked before.
+    fn misspelled(&mut self, line: &str, ranges: &[Range<usize>]) -> Vec<Range<usize>> {
+        let key = line_key(line, ranges);
+        if let Some(hit) = self.cache.line(key) {
+            return hit.clone();
+        }
+        let tokens = words::tokens_in_ranges(line, ranges);
+        let mut bad = Vec::new();
+        if !tokens.is_empty() {
+            let chars: Vec<char> = line.chars().collect();
+            let text = |r: &Range<usize>| chars[r.clone()].iter().collect::<String>();
+            let mut checker = self.checker.write().expect("spell checker poisoned");
+            for token in tokens {
+                if let Some(whole) = &token.whole
+                    && checker.is_correct(&text(whole))
+                {
+                    continue;
+                }
+                bad.extend(
+                    token
+                        .parts
+                        .into_iter()
+                        .filter(|p| !checker.is_correct(&text(p))),
+                );
+            }
+        }
+        self.cache.store_line(key, bad.clone());
+        bad
     }
 
     /// Returns the checkable char ranges of line `line_idx` (line coordinates).
@@ -385,7 +478,7 @@ impl<'a, 'b> SpellDecorator<'a, 'b> {
                 let Some(rope) = &self.rope else {
                     return Vec::new();
                 };
-                let ranges = self.markdown.ranges();
+                let ranges = self.cache.prose.ranges();
                 let start = rope.line_to_char(line_idx);
                 let end = start + len;
                 let first = ranges.partition_point(|r| r.end <= start);
@@ -405,9 +498,15 @@ impl Decorator for SpellDecorator<'_, '_> {
     fn prepare(&mut self, buffer: &Buffer) {
         self.inner.prepare(buffer);
         self.rope = Some(buffer.rope().clone());
-        self.marks.clear();
+        self.cache.marks.clear();
+        let generation = self
+            .checker
+            .read()
+            .expect("spell checker poisoned")
+            .generation();
+        self.cache.sync_generation(generation);
         if self.mode == SpellMode::Markdown {
-            self.markdown.refresh(buffer, &self.ctx);
+            self.cache.prose.refresh(buffer, &self.ctx);
         }
     }
 
@@ -419,37 +518,20 @@ impl Decorator for SpellDecorator<'_, '_> {
         base: &TextFormat,
     ) -> Vec<(Range<usize>, TextFormat)> {
         let spans = self.inner.decorate(line_idx, line, base);
-        let chars: Vec<char> = line.chars().collect();
-        let ranges = self.checkable_ranges(line_idx, chars.len());
-        let tokens = words::tokens_in_ranges(line, &ranges);
-        if tokens.is_empty() {
+        let ranges = self.checkable_ranges(line_idx, line.chars().count());
+        if ranges.is_empty() {
             return spans;
         }
-        let misspelled: Vec<Range<usize>> = {
-            let mut checker = self.checker.write().expect("spell checker poisoned");
-            let text = |r: &Range<usize>| chars[r.clone()].iter().collect::<String>();
-            let mut bad = Vec::new();
-            for token in tokens {
-                if let Some(whole) = &token.whole
-                    && checker.is_correct(&text(whole))
-                {
-                    continue;
-                }
-                bad.extend(
-                    token
-                        .parts
-                        .into_iter()
-                        .filter(|p| !checker.is_correct(&text(p))),
-                );
-            }
-            bad
-        };
+        let misspelled = self.misspelled(line, &ranges);
+        if misspelled.is_empty() {
+            return spans;
+        }
         if let Some(rope) = &self.rope
             && line_idx < rope.len_lines()
         {
             let start = rope.line_to_char(line_idx);
             for w in &misspelled {
-                self.marks.insert(start + w.start..start + w.end);
+                self.cache.marks.insert(start + w.start..start + w.end);
             }
         }
         view::overlay_format(spans, &misspelled, |format| {
@@ -510,18 +592,10 @@ mod tests {
         let checker = Arc::new(RwLock::new(checker()));
         let mut cache = crate::highlight::HighlightCache::new();
         let mut inner = HighlightDecorator::new(&mut cache, None, "Plain Text", "x", true);
-        let mut markdown = ProseRanges::new();
-        let mut marks = HashSet::new();
+        let mut cache = SpellCache::default();
         let buffer = Buffer::from_text("ciao xyzzy\nhello");
         let ctx = egui::Context::default();
-        let mut deco = SpellDecorator::new(
-            &mut inner,
-            checker,
-            SpellMode::Plain,
-            &mut markdown,
-            &mut marks,
-            &ctx,
-        );
+        let mut deco = SpellDecorator::new(&mut inner, checker, SpellMode::Plain, &mut cache, &ctx);
         deco.prepare(&buffer);
         let base = TextFormat::default();
         let spans = deco.decorate(0, "ciao xyzzy", &base);
@@ -537,7 +611,7 @@ mod tests {
                 .all(|(_, f)| f.underline == Stroke::NONE)
         );
         drop(deco);
-        assert_eq!(marks, HashSet::from([5..10]));
+        assert_eq!(cache.marks, HashSet::from([5..10]));
     }
 
     #[test]
@@ -548,23 +622,82 @@ mod tests {
         let checker = Arc::new(RwLock::new(SpellChecker::new(vec![en, it], HashSet::new())));
         let mut cache = crate::highlight::HighlightCache::new();
         let mut inner = HighlightDecorator::new(&mut cache, None, "Plain Text", "x", true);
-        let (mut markdown, mut marks) = (ProseRanges::new(), HashSet::new());
+        let mut cache = SpellCache::default();
         let text = "don't l\u{2019}albero don\u{2019}t doesn't";
         let buffer = Buffer::from_text(text);
         let ctx = egui::Context::default();
-        let mut deco = SpellDecorator::new(
-            &mut inner,
-            checker,
-            SpellMode::Plain,
-            &mut markdown,
-            &mut marks,
-            &ctx,
-        );
+        let mut deco = SpellDecorator::new(&mut inner, checker, SpellMode::Plain, &mut cache, &ctx);
         deco.prepare(&buffer);
         deco.decorate(0, text, &TextFormat::default());
         drop(deco);
         // "doesn't" is unknown: its split part "doesn" is flagged, "t" is too short.
-        assert_eq!(marks, HashSet::from_iter([21..26]));
+        assert_eq!(cache.marks, HashSet::from_iter([21..26]));
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn line_results_are_cached_until_the_word_list_changes() {
+        let checker = Arc::new(RwLock::new(checker()));
+        let mut hl = crate::highlight::HighlightCache::new();
+        let mut inner = HighlightDecorator::new(&mut hl, None, "Plain Text", "x", true);
+        let mut cache = SpellCache::default();
+        let buffer = Buffer::from_text("ciao xyzzy");
+        let ctx = egui::Context::default();
+        let base = TextFormat::default();
+        let underlined = |spans: Vec<(Range<usize>, TextFormat)>| -> Vec<Range<usize>> {
+            spans
+                .into_iter()
+                .filter(|(_, f)| f.underline != Stroke::NONE)
+                .map(|(r, _)| r)
+                .collect()
+        };
+        {
+            let mut deco = SpellDecorator::new(
+                &mut inner,
+                Arc::clone(&checker),
+                SpellMode::Plain,
+                &mut cache,
+                &ctx,
+            );
+            deco.prepare(&buffer);
+            assert_eq!(
+                underlined(deco.decorate(0, "ciao xyzzy", &base)),
+                vec![5..10]
+            );
+        }
+        assert_eq!(cache.lines.len(), 1);
+        // A cache hit still reports the marks, without touching the word cache.
+        checker.write().unwrap().cache.clear();
+        {
+            let mut deco = SpellDecorator::new(
+                &mut inner,
+                Arc::clone(&checker),
+                SpellMode::Plain,
+                &mut cache,
+                &ctx,
+            );
+            deco.prepare(&buffer);
+            assert_eq!(
+                underlined(deco.decorate(0, "ciao xyzzy", &base)),
+                vec![5..10]
+            );
+        }
+        assert!(checker.read().unwrap().cache.is_empty());
+        assert_eq!(cache.marks, HashSet::from([5..10]));
+        // Adding the word bumps the generation and drops the cached line.
+        checker.write().unwrap().add_personal("xyzzy");
+        let mut deco = SpellDecorator::new(&mut inner, checker, SpellMode::Plain, &mut cache, &ctx);
+        deco.prepare(&buffer);
+        assert!(underlined(deco.decorate(0, "ciao xyzzy", &base)).is_empty());
+    }
+
+    #[test]
+    fn word_cache_is_bounded() {
+        let mut c = checker();
+        for i in 0..MAX_WORD_CACHE + 10 {
+            c.is_correct(&format!("w{i}"));
+        }
+        assert!(c.cache.len() <= MAX_WORD_CACHE);
     }
 
     #[test]
