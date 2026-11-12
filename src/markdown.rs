@@ -210,6 +210,23 @@ fn apply_preview_fonts(style: &mut egui::Style, base: f32) {
     }
 }
 
+/// Visuals of the Markdown preview area: dark when `dark` is true, light otherwise,
+/// independent of the UI theme.
+pub fn preview_visuals(dark: bool) -> egui::Visuals {
+    match dark {
+        true => egui::Visuals::dark(),
+        false => egui::Visuals::light(),
+    }
+}
+
+/// Label of the preview light/dark toggle: it names the mode a click switches to.
+pub fn preview_mode_toggle_label(dark: bool) -> &'static str {
+    match dark {
+        true => "\u{2600} Light",
+        false => "\u{1F319} Dark",
+    }
+}
+
 /// How long the buffer must stay unchanged before the preview source is rebuilt.
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(250);
 
@@ -500,6 +517,14 @@ mod tests {
         });
         output.textures_delta.clear();
         height
+    }
+
+    #[test]
+    fn preview_visuals_follow_the_flag() {
+        assert!(preview_visuals(true).dark_mode);
+        assert!(!preview_visuals(false).dark_mode);
+        assert!(preview_mode_toggle_label(true).ends_with("Light"));
+        assert!(preview_mode_toggle_label(false).ends_with("Dark"));
     }
 
     #[test]

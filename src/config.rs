@@ -63,6 +63,8 @@ pub struct Settings {
     pub preview_font_size: f32,
     /// Markdown preview line spacing, a factor of the font row height (0.8..=3.0).
     pub preview_line_spacing: f32,
+    /// Draw the Markdown preview area dark (`true`) or light (`false`), whatever the UI theme.
+    pub preview_dark: bool,
     /// Tab width in columns (1..=16).
     pub tab_width: usize,
     /// Insert spaces instead of tab characters.
@@ -96,6 +98,7 @@ impl Default for Settings {
             preview_font_family: None,
             preview_font_size: DEFAULT_PREVIEW_FONT_SIZE,
             preview_line_spacing: DEFAULT_PREVIEW_LINE_SPACING,
+            preview_dark: false,
             tab_width: DEFAULT_TAB_WIDTH,
             insert_spaces: true,
             line_numbers: true,
@@ -190,6 +193,7 @@ impl Settings {
             "preview_line_spacing" => {
                 self.preview_line_spacing = convert_f32(key, value, &LINE_SPACING_RANGE)?
             }
+            "preview_dark" => self.preview_dark = convert(key, value)?,
             "tab_width" => self.tab_width = convert_usize(key, value, &TAB_WIDTH_RANGE)?,
             "insert_spaces" => self.insert_spaces = convert(key, value)?,
             "line_numbers" => self.line_numbers = convert(key, value)?,
@@ -352,10 +356,13 @@ mod tests {
 
     #[test]
     fn preview_font_settings_roundtrip_and_validate() {
-        let mut s = Settings::default();
-        s.preview_font_family = Some("Georgia".into());
-        s.preview_font_size = 18.0;
-        s.preview_line_spacing = 1.5;
+        let s = Settings {
+            preview_font_family: Some("Georgia".into()),
+            preview_font_size: 18.0,
+            preview_line_spacing: 1.5,
+            preview_dark: true,
+            ..Settings::default()
+        };
         let (back, warnings) = Settings::from_toml_str(&s.to_toml_string());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(back, s);

@@ -587,7 +587,7 @@ impl SettingsWindow {
         }
     }
 
-    /// Font family, size and line spacing of the Markdown preview.
+    /// Font family, size, line spacing and light/dark mode of the Markdown preview.
     fn preview_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -600,7 +600,7 @@ impl SettingsWindow {
             .show(ui, |ui| {
                 ui.label("Font family");
                 let filter = self.preview_font_filter.to_lowercase();
-                let changed = family_combo(
+                let font_changed = family_combo(
                     ui,
                     "fed_settings_preview_font",
                     &mut settings.preview_font_family,
@@ -609,7 +609,7 @@ impl SettingsWindow {
                     &filter,
                     false,
                 );
-                if changed {
+                if font_changed {
                     events.extend([SettingsEvent::PreviewFontChanged, SettingsEvent::Changed]);
                 }
                 ui.end_row();
@@ -636,6 +636,10 @@ impl SettingsWindow {
                     .fixed_decimals(2)
                     .suffix("x");
                 drag_changed(ui.add(spacing), events);
+                ui.end_row();
+
+                ui.label("Dark mode");
+                changed(ui.checkbox(&mut settings.preview_dark, ""), events);
                 ui.end_row();
             });
     }

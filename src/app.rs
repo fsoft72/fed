@@ -745,10 +745,32 @@ impl FedApp {
             font_size: self.settings.preview_font_size,
             line_spacing: self.settings.preview_line_spacing,
         };
+        let dark = self.settings.preview_dark;
+        let visuals = markdown::preview_visuals(dark);
+        let mut style = (**ui.style()).clone();
+        style.visuals = visuals.clone();
+        let mut toggled = false;
         egui::Panel::right("fed_preview")
             .resizable(true)
             .default_size(half)
-            .show(ui, |ui| tab.show_preview(ui, layout));
+            .frame(egui::Frame::side_top_panel(&style))
+            .show(ui, |ui| {
+                ui.style_mut().visuals = visuals;
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = markdown::preview_mode_toggle_label(dark);
+                        toggled = ui
+                            .small_button(label)
+                            .on_hover_text("Switch the preview between light and dark")
+                            .clicked();
+                    });
+                });
+                tab.show_preview(ui, layout);
+            });
+        if toggled {
+            self.settings.preview_dark = !dark;
+            self.save_settings();
+        }
     }
 
     /// Draws the find or go-to-line bar above the status bar and shows its message.
