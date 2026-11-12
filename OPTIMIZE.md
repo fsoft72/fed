@@ -44,7 +44,7 @@
 - [x] **Vim Insert-mode paste is replayed one key at a time** - `route_event` turns a pasted string into one `VimKey::Char` per character, so pasting a large text runs `handle_key` and a rope insert per char; add a text-insert path (e.g. `VimKey::Text(String)` or a `VimState::insert_text`) that applies the paste as one edit.
   - File(s): `src/app/vim.rs`, `src/vim/insert.rs`
 
-- [ ] **`FedApp::ui` central-panel closure does too much** - besides drawing it polls the syntax assets (`self.loaded_assets = self.assets.get()`), picks the code theme, builds the `EditorEnv`, routes vim keys and records the context click; extract an `editor_panel` method returning a small result struct and poll the assets at the top of the frame with the other background jobs (fonts, loads, links).
+- [x] **`FedApp::ui` central-panel closure does too much** - besides drawing it polls the syntax assets (`self.loaded_assets = self.assets.get()`), picks the code theme, builds the `EditorEnv`, routes vim keys and records the context click; extract an `editor_panel` method returning a small result struct and poll the assets at the top of the frame with the other background jobs (fonts, loads, links).
   - File(s): `src/app.rs`
 
 - [ ] **The application shell is hard to test** - `FedApp::new` calls `ConfigPaths::detect`, spawns the asset and spell threads, and save/open paths call `rfd` dialogs directly (`save_dialog`, `open_dialog`), so the tab/session/save logic in `app.rs` and `app/*.rs` can only be tested through free helper functions; inject the config paths and a small file-dialog trait so `FedApp` can be built in tests.

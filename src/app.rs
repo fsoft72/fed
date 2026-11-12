@@ -112,6 +112,14 @@ fn needs_editor_focus(action: Action) -> bool {
     matches!(action, Action::Undo | Action::Redo | Action::SelectAll)
 }
 
+/// Name of the code theme of `settings` for the dark or light UI.
+fn code_theme(settings: &Settings, dark: bool) -> &str {
+    match dark {
+        true => &settings.code_theme_dark,
+        false => &settings.code_theme_light,
+    }
+}
+
 /// Shows the native save dialog, starting from the buffer's current location.
 fn save_dialog(buffer: &Buffer) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new().set_file_name(buffer.display_name());
@@ -142,6 +150,17 @@ impl SaveOutcome {
             Err(e) => SaveOutcome::Failed(e.to_string()),
         }
     }
+}
+
+/// What the editor panel reported during one frame.
+#[derive(Default)]
+struct EditorFrame {
+    /// Screen position and char range of a right-clicked word.
+    context_click: Option<(egui::Pos2, std::ops::Range<usize>)>,
+    /// Effects of the keys handled by vim.
+    vim_effects: Vec<VimEffect>,
+    /// True when vim received at least one key.
+    vim_key_seen: bool,
 }
 
 /// Top-level editor application state.
@@ -780,6 +799,52 @@ impl FedApp {
         }
     }
 
+    /// Takes the syntax assets once their background load is done.
+    fn poll_assets(&mut self) {
+        if self.loaded_assets.is_none() {
+            self.loaded_assets = self.assets.get();
+        }
+    }
+
+    /// Draws the editor of the active tab in the central panel. In vim mode its keys go to
+    /// the tab's vim state; the resulting effects are returned for the caller to carry out.
+    fn editor_panel(&mut self, ui: &mut egui::Ui) -> EditorFrame {
+        let opts = self.view_options();
+        let checker = match self.settings.spell_check {
+            true => self.spell.as_ref().and_then(SpellService::checker),
+            false => None,
+        };
+        let mut frame = EditorFrame::default();
+        egui::CentralPanel::default().show(ui, |ui| {
+            let theme = code_theme(&self.settings, ui.visuals().dark_mode);
+            let Some(tab) = self.tabs.get_mut(self.active) else {
+                return;
+            };
+            let env = EditorEnv {
+                assets: self.loaded_assets.as_ref(),
+                theme,
+                checker,
+                find: &self.find_bar,
+            };
+            let edit = opts.edit;
+            let mut frame_ended = false;
+            let (effects, key_seen) = (&mut frame.vim_effects, &mut frame.vim_key_seen);
+            let mut route_to_vim = |ev: &egui::Event, tab: &mut Tab| {
+                *key_seen = true;
+                vim::route_event(ev, tab, &edit, effects, &mut frame_ended)
+            };
+            let key_handler: Option<&mut KeyHandler<'_>> = match opts.vim {
+                true => Some(&mut route_to_vim),
+                false => None,
+            };
+            let out = tab.show_editor(ui, &opts, env, key_handler);
+            if let Some((range, _)) = out.context_word {
+                frame.context_click = ui.input(|i| i.pointer.latest_pos()).map(|pos| (pos, range));
+            }
+        });
+        frame
+    }
+
     /// Shows the About dialog while it is open.
     fn show_about(&mut self, ctx: &egui::Context) {
         if !self.about_open {
@@ -806,6 +871,7 @@ impl eframe::App for FedApp {
         }
         self.status.poll_link_errors();
         self.poll_loads(&ctx);
+        self.poll_assets();
         match self.settings_window.capture_keys(&ctx, &mut self.keymap) {
             Some(events) => self.apply_settings_events(&ctx, events),
             None => self.handle_shortcuts(&ctx),
@@ -821,52 +887,12 @@ impl eframe::App for FedApp {
         self.vim_command_bar(ui);
         self.find_bar_panel(ui);
         self.preview_panel(ui);
-        let opts = self.view_options();
-        let checker = match self.settings.spell_check {
-            true => self.spell.as_ref().and_then(SpellService::checker),
-            false => None,
-        };
-        let mut context_click = None;
-        let vim_mode = self.settings.vim_mode;
-        let mut vim_effects: Vec<VimEffect> = Vec::new();
-        let mut vim_key_seen = false;
-        egui::CentralPanel::default().show(ui, |ui| {
-            let Some(tab) = self.tabs.get_mut(self.active) else {
-                return;
-            };
-            if self.loaded_assets.is_none() {
-                self.loaded_assets = self.assets.get();
-            }
-            let theme = match ui.visuals().dark_mode {
-                true => &self.settings.code_theme_dark,
-                false => &self.settings.code_theme_light,
-            };
-            let env = EditorEnv {
-                assets: self.loaded_assets.as_ref(),
-                theme,
-                checker,
-                find: &self.find_bar,
-            };
-            let edit = opts.edit;
-            let mut frame_ended = false;
-            let mut route_to_vim = |ev: &egui::Event, tab: &mut Tab| {
-                vim_key_seen = true;
-                vim::route_event(ev, tab, &edit, &mut vim_effects, &mut frame_ended)
-            };
-            let key_handler: Option<&mut KeyHandler<'_>> = match vim_mode {
-                true => Some(&mut route_to_vim),
-                false => None,
-            };
-            let out = tab.show_editor(ui, &opts, env, key_handler);
-            if let Some((range, _)) = out.context_word {
-                context_click = ui.input(|i| i.pointer.latest_pos()).map(|pos| (pos, range));
-            }
-        });
-        if vim_key_seen {
+        let editor = self.editor_panel(ui);
+        if editor.vim_key_seen {
             self.vim_message = None;
         }
-        self.apply_vim_effects(&ctx, vim_effects);
-        if let Some((pos, range)) = context_click {
+        self.apply_vim_effects(&ctx, editor.vim_effects);
+        if let Some((pos, range)) = editor.context_click {
             self.open_spell_menu(pos, range);
         }
         self.show_spell_menu(&ctx);
@@ -960,6 +986,17 @@ mod tests {
             shortcut_action(&km, egui::Key::Tab, shifted),
             Some(Action::PrevTab)
         );
+    }
+
+    #[test]
+    fn code_theme_follows_the_ui_mode() {
+        let settings = Settings {
+            code_theme_dark: "dark".into(),
+            code_theme_light: "light".into(),
+            ..Settings::default()
+        };
+        assert_eq!(code_theme(&settings, true), "dark");
+        assert_eq!(code_theme(&settings, false), "light");
     }
 
     #[test]
