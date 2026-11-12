@@ -895,10 +895,17 @@ impl FedApp {
         }
     }
 
-    /// Takes the syntax assets once their background load is done.
+    /// Takes the syntax assets once their background load is done and reports syntax
+    /// warm-ups that failed.
     fn poll_assets(&mut self) {
         if self.loaded_assets.is_none() {
             self.loaded_assets = self.assets.get();
+        }
+        let Some(assets) = &self.loaded_assets else {
+            return;
+        };
+        for failure in assets.take_warm_failures() {
+            self.set_status(failure, Severity::Warning);
         }
     }
 

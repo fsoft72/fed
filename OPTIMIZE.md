@@ -21,7 +21,7 @@
 
 ## Medium
 
-- [ ] **A crashed syntax warm-up disables highlighting forever, silently** - `HighlightAssets::ensure_warm` marks the syntax `Pending` and only the warm-up thread sets it to `Ready`; if `warm_up` panics (a syntect regex bug) the entry stays `Pending`, `Tab::show_editor` keeps drawing plain text for every file of that syntax, and nothing is reported. Run the warm-up under `catch_unwind` (like `spell::run_guarded`), mark the syntax `Ready` (or a new `Failed` state) in every case and surface failures in the status bar.
+- [x] **A crashed syntax warm-up disables highlighting forever, silently** - `HighlightAssets::ensure_warm` marks the syntax `Pending` and only the warm-up thread sets it to `Ready`; if `warm_up` panics (a syntect regex bug) the entry stays `Pending`, `Tab::show_editor` keeps drawing plain text for every file of that syntax, and nothing is reported. Run the warm-up under `catch_unwind` (like `spell::run_guarded`), mark the syntax `Ready` (or a new `Failed` state) in every case and surface failures in the status bar.
   - File(s): `src/highlight.rs` (`ensure_warm`, `warm_up`)
 
 - [ ] **Ad-hoc background job plumbing repeated in six places** - `LoadJob`, `AssetsHandle`, `ProseRanges`, `SpellService`, the font loader and the link opener each spawn a thread with their own channel or `Arc<Mutex<Option<T>>>` slot, their own repaint request and their own (different) panic handling. A small `BackgroundJob<T>` (spawn with a ctx, `poll() -> Option<Result<T, JobError>>`, panic turned into an error) would remove the duplication and give every job the same failure reporting.

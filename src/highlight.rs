@@ -46,6 +46,9 @@ enum Warmth {
     Pending,
     /// The syntax regexes are compiled: parsing on the UI thread is cheap.
     Ready,
+    /// The warm-up panicked: the syntax stays plain (parsing it on the UI thread could
+    /// panic the same way).
+    Failed,
 }
 
 /// Syntax definitions and themes, loaded once off the UI thread.
@@ -56,6 +59,8 @@ pub struct HighlightAssets {
     pub themes: ThemeSet,
     /// Warm-up progress by syntax name (see `ensure_warm`).
     warm: Mutex<HashMap<String, Warmth>>,
+    /// Messages about failed warm-ups not yet reported (see `take_warm_failures`).
+    warm_failures: Mutex<Vec<String>>,
     /// Names of `themes`, sorted, computed once.
     theme_names: Vec<String>,
 }
@@ -70,6 +75,7 @@ impl HighlightAssets {
             syntaxes: two_face::syntax::extra_newlines(),
             themes,
             warm: Mutex::new(HashMap::new()),
+            warm_failures: Mutex::new(Vec::new()),
             theme_names,
         }
     }
@@ -79,12 +85,14 @@ impl HighlightAssets {
     /// syntect compiles a syntax's regexes lazily, the first time the parser meets them, and
     /// big grammars (TypeScript) take hundreds of milliseconds to compile. The first call for
     /// a syntax returns false and parses `sample` on a background thread instead: the compiled
-    /// regexes are cached in the shared `SyntaxSet`, and `ctx` is repainted when done.
+    /// regexes are cached in the shared `SyntaxSet`, and `ctx` is repainted when done. A
+    /// warm-up that panics leaves the syntax plain for good and is reported once through
+    /// `take_warm_failures`.
     pub fn ensure_warm(self: &Arc<Self>, syntax: &str, sample: &Rope, ctx: &egui::Context) -> bool {
         let mut warm = sync::lock(&self.warm);
         match warm.get(syntax) {
             Some(Warmth::Ready) => return true,
-            Some(Warmth::Pending) => return false,
+            Some(Warmth::Pending | Warmth::Failed) => return false,
             None => {}
         }
         warm.insert(syntax.to_string(), Warmth::Pending);
@@ -94,13 +102,27 @@ impl HighlightAssets {
         let sample = sample.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            assets.warm_up(&syntax, &sample);
-            let mut warm = sync::lock(&assets.warm);
-            warm.insert(syntax, Warmth::Ready);
-            drop(warm);
+            assets.warm_guarded(syntax.clone(), || assets.warm_up(&syntax, &sample));
             ctx.request_repaint();
         });
         false
+    }
+
+    /// Runs the warm-up `work` of `syntax` and records how it ended: `Ready`, or `Failed` with
+    /// a message for `take_warm_failures` when it panicked.
+    fn warm_guarded(&self, syntax: String, work: impl FnOnce()) {
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_ok();
+        if !ok {
+            let message = format!("syntax highlighting of {syntax} failed: it stays plain text");
+            sync::lock(&self.warm_failures).push(message);
+        }
+        let state = if ok { Warmth::Ready } else { Warmth::Failed };
+        sync::lock(&self.warm).insert(syntax, state);
+    }
+
+    /// Takes the messages about warm-ups that failed since the last call (to show them once).
+    pub fn take_warm_failures(&self) -> Vec<String> {
+        std::mem::take(&mut *sync::lock(&self.warm_failures))
     }
 
     /// Parses the first `WARM_UP_LINES` lines of `sample` with `syntax`, so the regexes the
@@ -910,6 +932,24 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(a.ensure_warm("TypeScript", &rope, &ctx));
+    }
+
+    #[test]
+    fn a_panicking_warm_up_leaves_the_syntax_plain_and_is_reported_once() {
+        let a = Arc::new(assets());
+        let ctx = egui::Context::default();
+        let rope = Rope::from_str("x\n");
+        a.warm_guarded("Rust".to_string(), || panic!("regex compiler crashed"));
+        assert!(
+            !a.ensure_warm("Rust", &rope, &ctx),
+            "no new warm-up, stays plain"
+        );
+        let failures = a.take_warm_failures();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("Rust"));
+        assert!(a.take_warm_failures().is_empty());
+        a.warm_guarded("Python".to_string(), || {});
+        assert!(a.ensure_warm("Python", &rope, &ctx));
     }
 
     #[test]
