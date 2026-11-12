@@ -2,9 +2,10 @@
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use egui_commonmark::{CommonMarkCache, CommonMarkScrollOptions, CommonMarkViewer};
 use pulldown_cmark::{Event, Options, Parser, Tag};
 
 use crate::buffer::Buffer;
@@ -208,12 +209,59 @@ fn apply_preview_fonts(style: &mut egui::Style, base: f32) {
     }
 }
 
+/// How long the buffer must stay unchanged before the preview source is rebuilt.
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Decides when the preview source should be rebuilt: at once the first time, then only
+/// after the buffer revision has been stable for `PREVIEW_DEBOUNCE`, so typing does not
+/// copy and re-parse the document on every keystroke.
+#[derive(Debug, Default)]
+struct SourceDebounce {
+    /// Revision of the prepared source, `None` before the first build.
+    built: Option<u64>,
+    /// Latest revision seen and when it was first seen.
+    seen: Option<(u64, Instant)>,
+}
+
+impl SourceDebounce {
+    /// Returns `Ok(true)` when the source must be rebuilt now for `revision`, `Ok(false)` when
+    /// it is current, and `Err(wait)` when a rebuild is due after `wait` (repaint then).
+    fn check(&mut self, revision: u64, now: Instant) -> Result<bool, Duration> {
+        if self.built == Some(revision) {
+            return Ok(false);
+        }
+        if self.built.is_none() {
+            return Ok(true);
+        }
+        let since = match self.seen {
+            Some((rev, at)) if rev == revision => at,
+            _ => {
+                self.seen = Some((revision, now));
+                now
+            }
+        };
+        let elapsed = now.duration_since(since);
+        match elapsed >= PREVIEW_DEBOUNCE {
+            true => Ok(true),
+            false => Err(PREVIEW_DEBOUNCE - elapsed),
+        }
+    }
+
+    /// Records that the source was rebuilt for `revision`.
+    fn built(&mut self, revision: u64) {
+        self.built = Some(revision);
+        self.seen = None;
+    }
+}
+
 /// Rendered-preview state of one tab: the Markdown render cache and the last prepared source.
 pub struct Preview {
-    /// Render cache of egui_commonmark (images, layout).
+    /// Render cache of egui_commonmark (images, layout, visible-slice split points).
     cache: CommonMarkCache,
-    /// Buffer revision and the rewritten text prepared for that revision.
-    source: (u64, String),
+    /// The rewritten Markdown source last prepared.
+    source: String,
+    /// Throttles source rebuilds while the buffer is being edited.
+    debounce: SourceDebounce,
 }
 
 impl Default for Preview {
@@ -222,38 +270,63 @@ impl Default for Preview {
     }
 }
 
+/// Id salt of the preview scroll area and of its viewer cache entry.
+const PREVIEW_ID: &str = "fed_preview_viewer";
+
 impl Preview {
     /// Creates an empty preview that renders on the first `show`.
     pub fn new() -> Preview {
         Preview {
             cache: CommonMarkCache::default(),
-            // `u64::MAX` is never a real revision, so the first `show` always prepares.
-            source: (u64::MAX, String::new()),
+            source: String::new(),
+            debounce: SourceDebounce::default(),
         }
     }
 
-    /// Draws the rendered Markdown of `buf` inside a scroll area. The text is re-read and
-    /// image paths are rewritten only when the buffer revision changed.
+    /// Draws the rendered Markdown of `buf` inside a scroll area, laying out only the visible
+    /// part of the document. The text is re-read and image paths are rewritten once the
+    /// buffer has stopped changing for `PREVIEW_DEBOUNCE`; until then the previous render
+    /// stays on screen.
     pub fn show(&mut self, ui: &mut egui::Ui, buf: &Buffer, font_size: f32) {
         apply_preview_fonts(ui.style_mut(), font_size);
-        if self.source.0 != buf.revision() {
-            let base = absolute_base_dir(buf.path());
-            self.source = (
-                buf.revision(),
-                rewrite_image_paths(&buf.rope().to_string(), &base),
-            );
+        let id = egui::Id::unique(PREVIEW_ID);
+        match self.debounce.check(buf.revision(), Instant::now()) {
+            Ok(true) => {
+                let base = absolute_base_dir(buf.path());
+                self.source = rewrite_image_paths(&buf.rope().to_string(), &base);
+                self.debounce.built(buf.revision());
+                // The visible-slice split points belong to the old text.
+                self.cache.clear_viewer(&id);
+            }
+            Ok(false) => {}
+            Err(wait) => ui.ctx().request_repaint_after(wait),
         }
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                CommonMarkViewer::new().show(ui, &mut self.cache, &self.source.1);
-            });
+        let scroll = CommonMarkScrollOptions::default().viewport_cache(true);
+        CommonMarkViewer::new().show_scrollable(id, ui, &mut self.cache, &scroll, &self.source);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_is_built_at_once_then_debounced() {
+        let t0 = Instant::now();
+        let mut d = SourceDebounce::default();
+        assert_eq!(d.check(0, t0), Ok(true));
+        d.built(0);
+        assert_eq!(d.check(0, t0), Ok(false));
+        // Typing: each new revision restarts the wait.
+        assert_eq!(d.check(1, t0), Err(PREVIEW_DEBOUNCE));
+        let t1 = t0 + PREVIEW_DEBOUNCE / 2;
+        assert_eq!(d.check(2, t1), Err(PREVIEW_DEBOUNCE));
+        assert!(d.check(2, t1 + PREVIEW_DEBOUNCE / 2).is_err());
+        // Stable for the whole delay: rebuild.
+        assert_eq!(d.check(2, t1 + PREVIEW_DEBOUNCE), Ok(true));
+        d.built(2);
+        assert_eq!(d.check(2, t1 + PREVIEW_DEBOUNCE * 3), Ok(false));
+    }
 
     #[test]
     fn openable_urls_are_web_and_mail_only() {

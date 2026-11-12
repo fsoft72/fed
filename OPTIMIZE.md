@@ -6,7 +6,7 @@
 
 - [x] **Markdown spell ranges rebuilt from the whole document on every keystroke** - `SpellDecorator::prepare` calls `words::markdown_checkable(&buffer.text())` whenever the revision changes, so each keystroke copies the whole rope into a `String` and re-parses it with pulldown-cmark on the UI thread; recompute only from the first dirty line (or debounce / move it to the spell service thread).
   - File(s): `src/spell/mod.rs`, `src/spell/words.rs`
-- [ ] **Markdown preview copies and re-parses the whole document** - `Preview::show` does `buf.rope().to_string()` + `rewrite_image_paths` on every revision and hands the full source to `CommonMarkViewer::show` every frame (which parses it again); debounce the source refresh while typing and avoid rendering the whole document when only the visible part is needed.
+- [x] **Markdown preview copies and re-parses the whole document** - `Preview::show` does `buf.rope().to_string()` + `rewrite_image_paths` on every revision and hands the full source to `CommonMarkViewer::show` every frame (which parses it again); debounce the source refresh while typing and avoid rendering the whole document when only the visible part is needed.
   - File(s): `src/markdown.rs`
 - [ ] **Bare-key shortcuts accepted from `settings.toml`** - `chord_has_modifier` is only enforced by the settings UI capture, not by `Keymap::from_overrides`, so `save = "K"` in the config file gets dispatched by `shortcut_action` on every keystroke and swallows typing; move the rule into `keymap.rs` and apply it at load time with a warning.
   - File(s): `src/keymap.rs`, `src/settings_ui.rs`
