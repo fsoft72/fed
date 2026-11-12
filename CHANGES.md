@@ -56,3 +56,4 @@
 - OPTIMIZE: vim `>`/`<` on a charwise range treat its end as exclusive, so `v$>` or `v>` on an empty line no longer shifts the next line too.
 - OPTIMIZE: Visual-mode `d x c > <` are repeatable with `.`: `visual_replay_keys` records keys that reselect the same extent from the caret (same line count; same end column or line break on the last line for charwise) and reapply the operator, a Visual `c` also records the inserted text.
 - OPTIMIZE: `:'<,'>` resolves `'<` / `'>` from the buffer marks set when Visual mode ends, which follow edits; `VimState::last_visual`, `visual_marks` and the `visual_marks` parameters of `cmdline::execute` / `resolve_range` are gone.
+- OPTIMIZE: vim `{count}p` refuses pastes over 16 MB (`MAX_PUT_BYTES`, overflow-checked) with an error instead of trying to allocate them.

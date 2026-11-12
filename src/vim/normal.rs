@@ -9,6 +9,10 @@ use super::{Env, Mode, OpRange, VimKey, VimState, clamp_normal};
 
 /// Upper bound for typed counts, so huge counts cannot stall the editor.
 const MAX_COUNT: usize = 99_999;
+/// Largest text a `{count}p` may insert, in bytes.
+const MAX_PUT_BYTES: usize = 16 * 1024 * 1024;
+/// Error reported when a counted put would exceed `MAX_PUT_BYTES`.
+const PUT_TOO_LARGE: &str = "E340: paste too large (count times register size over 16 MB)";
 /// Normal-mode commands that modify the buffer or enter Insert mode.
 const CHANGE_COMMANDS: &str = "xXDCsSJpPiaIAoO";
 /// Normal-mode single-key commands (besides motions).
@@ -532,10 +536,15 @@ impl VimState {
         Some(OpRange::Chars(start..end))
     }
 
-    /// Pastes the register `count` times after (`p`) or before (`P`) the caret.
+    /// Pastes the register `count` times after (`p`) or before (`P`) the caret. A paste
+    /// bigger than `MAX_PUT_BYTES` is refused with an error instead of allocating it.
     fn put(&mut self, after: bool, count: usize, pos: usize, env: &mut Env) {
         if self.register.text.is_empty() {
             return;
+        }
+        let size = self.register.text.len().checked_mul(count);
+        if size.is_none_or(|n| n > MAX_PUT_BYTES) {
+            return env.error(PUT_TOO_LARGE);
         }
         let text = self.register.text.repeat(count);
         let rope = env.buf.rope().clone();

@@ -622,3 +622,14 @@ fn dd_treats_form_feed_as_text_not_line_break() {
     let h = Harness::new("a\x0cb\nc", 0);
     assert_eq!(h.buf.rope().len_lines(), 2);
 }
+
+#[test]
+fn huge_put_counts_are_refused() {
+    let line = "x".repeat(1000);
+    let mut h = Harness::new(&format!("{line}\n"), 0);
+    h.feed("yy99999p");
+    assert_eq!(h.buf.text(), format!("{line}\n"));
+    assert!(matches!(&h.fx[..], [.., VimEffect::Error(e)] if e.contains("too large")));
+    h.feed("3p");
+    assert_eq!(h.buf.rope().len_lines(), 5);
+}
