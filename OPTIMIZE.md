@@ -44,7 +44,7 @@
 
 ## Low / Nice to have
 
-- [ ] **Preview scroll position is shared by every tab** - `Preview::show` uses `Id::unique(PREVIEW_ID)` for all tabs, so the egui scroll state of the preview carries over when switching between two Markdown tabs; salt the id with the tab id like the editor's `("fed_scroll", tab.id)`.
+- [x] **Preview scroll position is shared by every tab** - `Preview::show` uses `Id::unique(PREVIEW_ID)` for all tabs, so the egui scroll state of the preview carries over when switching between two Markdown tabs; salt the id with the tab id like the editor's `("fed_scroll", tab.id)`.
   - File(s): `src/markdown.rs`, `src/app.rs` (`preview_panel`)
 
 - [ ] **`preview_open` and `preview` duplicate one state** - `Tab::preview_open` is true exactly when `preview` is (or is about to be) `Some`, and both are kept in sync by `toggle_preview` and `preview_panel`; keep only `preview: Option<Preview>` (created by the toggle) to remove the invariant.

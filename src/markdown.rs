@@ -267,6 +267,9 @@ pub struct Preview {
     layout: Option<PreviewLayout>,
     /// Source being rebuilt on a background thread (text copy and image rewrite).
     building: Option<BackgroundJob<String>>,
+    /// Id of the scroll area and viewer cache entry, unique per tab, so every tab keeps its
+    /// own preview scroll position.
+    id: egui::Id,
 }
 
 /// Text settings of the Markdown preview that change the height of the rendered blocks.
@@ -278,24 +281,24 @@ pub struct PreviewLayout {
     pub line_spacing: f32,
 }
 
-impl Default for Preview {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Id salt of the preview scroll area and of its viewer cache entry.
 const PREVIEW_ID: &str = "fed_preview_viewer";
 
+/// Id of the preview scroll area of the tab with id `tab_id`.
+fn preview_id(tab_id: u64) -> egui::Id {
+    egui::Id::unique((PREVIEW_ID, tab_id))
+}
+
 impl Preview {
-    /// Creates an empty preview that renders on the first `show`.
-    pub fn new() -> Preview {
+    /// Creates an empty preview for the tab with id `tab_id`; it renders on the first `show`.
+    pub fn new(tab_id: u64) -> Preview {
         Preview {
             cache: CommonMarkCache::default(),
             source: String::new(),
             debounce: SourceDebounce::default(),
             layout: None,
             building: None,
+            id: preview_id(tab_id),
         }
     }
 
@@ -307,7 +310,7 @@ impl Preview {
     pub fn show(&mut self, ui: &mut egui::Ui, buf: &Buffer, layout: PreviewLayout) {
         apply_preview_fonts(ui.style_mut(), layout.font_size);
         egui_commonmark_backend::misc::set_line_spacing(ui.ctx(), layout.line_spacing);
-        let id = egui::Id::unique(PREVIEW_ID);
+        let id = self.id;
         if self.layout.replace(layout) != Some(layout) {
             // The cached block positions were measured with the old text size.
             self.cache.clear_viewer(&id);
@@ -500,11 +503,17 @@ mod tests {
     }
 
     #[test]
+    fn every_tab_has_its_own_preview_scroll_state() {
+        assert_ne!(Preview::new(1).id, Preview::new(2).id);
+        assert_eq!(Preview::new(3).id, Preview::new(3).id);
+    }
+
+    #[test]
     fn the_preview_source_is_built_in_the_background() {
         let ctx = egui::Context::default();
         let mut buf = Buffer::from_text("# Title\n\n![pic](img.png)\n");
         buf.set_path(PathBuf::from("/notes/a.md"));
-        let mut preview = Preview::new();
+        let mut preview = Preview::new(1);
         let layout = PreviewLayout {
             font_size: 14.0,
             line_spacing: 1.0,

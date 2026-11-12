@@ -749,7 +749,7 @@ impl FedApp {
             .resizable(true)
             .default_size(half)
             .show(ui, |ui| {
-                let preview = tab.preview.get_or_insert_with(Preview::new);
+                let preview = tab.preview.get_or_insert_with(|| Preview::new(tab.id));
                 preview.show(ui, &tab.buffer, layout);
             });
     }

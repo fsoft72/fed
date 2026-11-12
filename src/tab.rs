@@ -276,7 +276,7 @@ mod tests {
         let mut tab = Tab::new(Buffer::from_text("# hi"));
         tab.toggle_preview();
         assert!(tab.preview_open);
-        tab.preview = Some(Preview::new());
+        tab.preview = Some(Preview::new(tab.id));
         tab.toggle_preview();
         assert!(!tab.preview_open);
         assert!(tab.preview.is_none());
