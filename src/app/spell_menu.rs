@@ -57,10 +57,7 @@ impl FedApp {
             return;
         };
         let word = tab.buffer.rope().slice(range.clone()).to_string();
-        let suggestions = checker
-            .read()
-            .expect("spell checker poisoned")
-            .suggest(&word);
+        let suggestions = crate::sync::read(&checker).suggest(&word);
         self.spell_menu = Some(SpellMenu {
             tab_id: tab.id,
             pos,

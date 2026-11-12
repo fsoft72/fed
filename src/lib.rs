@@ -12,6 +12,7 @@ pub mod markdown;
 pub mod search;
 pub mod settings_ui;
 pub mod spell;
+pub mod sync;
 pub mod tab;
 pub mod text_nav;
 pub mod view;

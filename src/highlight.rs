@@ -15,6 +15,7 @@ use syntect::highlighting::{
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
 use crate::buffer::{Buffer, DirtyLines};
+use crate::sync;
 use crate::view::Decorator;
 
 /// Name of the fallback syntax.
@@ -80,7 +81,7 @@ impl HighlightAssets {
     /// a syntax returns false and parses `sample` on a background thread instead: the compiled
     /// regexes are cached in the shared `SyntaxSet`, and `ctx` is repainted when done.
     pub fn ensure_warm(self: &Arc<Self>, syntax: &str, sample: &Rope, ctx: &egui::Context) -> bool {
-        let mut warm = self.warm.lock().expect("warm-up map poisoned");
+        let mut warm = sync::lock(&self.warm);
         match warm.get(syntax) {
             Some(Warmth::Ready) => return true,
             Some(Warmth::Pending) => return false,
@@ -94,7 +95,7 @@ impl HighlightAssets {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             assets.warm_up(&syntax, &sample);
-            let mut warm = assets.warm.lock().expect("warm-up map poisoned");
+            let mut warm = sync::lock(&assets.warm);
             warm.insert(syntax, Warmth::Ready);
             drop(warm);
             ctx.request_repaint();
@@ -133,7 +134,7 @@ impl AssetsHandle {
         let thread_slot = Arc::clone(&slot);
         std::thread::spawn(move || {
             let assets = Arc::new(HighlightAssets::load());
-            *thread_slot.lock().expect("assets slot poisoned") = Some(assets);
+            *sync::lock(&thread_slot) = Some(assets);
             ctx.request_repaint();
         });
         AssetsHandle { slot }
@@ -141,7 +142,7 @@ impl AssetsHandle {
 
     /// Returns the assets once loaded, without blocking on the loader.
     pub fn get(&self) -> Option<Arc<HighlightAssets>> {
-        self.slot.lock().expect("assets slot poisoned").clone()
+        sync::lock(&self.slot).clone()
     }
 }
 

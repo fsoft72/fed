@@ -10,6 +10,8 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontId};
 
+use crate::sync;
+
 /// Name of the egui font family used by the editor and the vim command bar.
 pub const EDITOR_FAMILY: &str = "editor";
 /// Prefix of the `FontDefinitions::font_data` key of a loaded editor font.
@@ -187,7 +189,7 @@ impl FontCatalog {
 
     /// Returns the finished scan, without blocking on the scanner.
     fn scan(&self) -> Option<Arc<Scan>> {
-        self.slot.0.lock().expect("font catalog poisoned").clone()
+        sync::lock(&self.slot.0).clone()
     }
 
     /// Returns the font families (sorted), or `None` while scanning. The
@@ -207,7 +209,7 @@ impl FontCatalog {
         std::thread::spawn(move || {
             let scan = wait_for_scan(&slot);
             let font = family_font(&scan.db, &wanted);
-            *thread_result.lock().expect("font load poisoned") = Some(font);
+            *sync::lock(&thread_result) = Some(font);
             ctx.request_repaint();
         });
         FontLoad { family, result }
@@ -217,17 +219,15 @@ impl FontCatalog {
 /// Stores `scan` in `slot` and wakes the loaders waiting for it.
 fn publish_scan(slot: &ScanSlot, scan: Scan) {
     let (lock, ready) = &**slot;
-    *lock.lock().expect("font catalog poisoned") = Some(Arc::new(scan));
+    *sync::lock(lock) = Some(Arc::new(scan));
     ready.notify_all();
 }
 
 /// Blocks until the scan in `slot` is available and returns it.
 fn wait_for_scan(slot: &ScanSlot) -> Arc<Scan> {
     let (lock, ready) = &**slot;
-    let guard = lock.lock().expect("font catalog poisoned");
-    let guard = ready
-        .wait_while(guard, |scan| scan.is_none())
-        .expect("font catalog poisoned");
+    let guard = sync::lock(lock);
+    let guard = sync::wait_while(ready, guard, |scan| scan.is_none());
     Arc::clone(guard.as_ref().expect("scan is set"))
 }
 
@@ -248,7 +248,7 @@ impl FontLoad {
     /// Takes the result once the thread finished: `Some(Some(font))` when found,
     /// `Some(None)` when the family does not exist, `None` while still loading.
     pub fn take(&self) -> Option<Option<FontData>> {
-        self.result.lock().expect("font load poisoned").take()
+        sync::lock(&self.result).take()
     }
 }
 

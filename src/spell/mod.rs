@@ -17,6 +17,7 @@ use ropey::Rope;
 use crate::buffer::Buffer;
 use crate::config::ConfigPaths;
 use crate::highlight::HighlightDecorator;
+use crate::sync;
 use crate::view::{self, Decorator};
 
 pub use prose::ProseRanges;
@@ -93,7 +94,7 @@ impl SpellChecker {
     /// Locks the word cache. It only memoizes `check`, so a cache left poisoned by a panic
     /// is still valid and is used as is.
     fn words(&self) -> std::sync::MutexGuard<'_, HashMap<String, bool>> {
-        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+        sync::lock(&self.cache)
     }
 
     /// Empties the word cache (the accepted words changed).
@@ -205,7 +206,7 @@ fn parse_dictionary(aff: &Path, dic: &Path) -> Result<spellbook::Dictionary, Str
 /// Updates the shared status and wakes the UI.
 fn set_status(shared: &Shared, ctx: &egui::Context, status: SpellStatus) {
     // Tolerate poisoning: a crashed loader must still be able to report its failure.
-    *shared.status.lock().unwrap_or_else(PoisonError::into_inner) = status;
+    *sync::lock(&shared.status) = status;
     ctx.request_repaint();
 }
 
@@ -218,16 +219,13 @@ fn publish_dictionary(
     personal_path: &Path,
 ) {
     match checker {
-        Some(c) => c
-            .write()
-            .expect("spell checker poisoned")
-            .add_dictionary(dict),
+        Some(c) => sync::write(c).add_dictionary(dict),
         None => {
             let c = Arc::new(RwLock::new(SpellChecker::new(
                 vec![dict],
                 load_personal(personal_path),
             )));
-            *shared.checker.lock().expect("spell checker slot poisoned") = Some(Arc::clone(&c));
+            *sync::lock(&shared.checker) = Some(Arc::clone(&c));
             *checker = Some(c);
         }
     }
@@ -306,29 +304,18 @@ impl SpellService {
 
     /// Returns the current loading status.
     pub fn status(&self) -> SpellStatus {
-        self.shared
-            .status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        sync::lock(&self.shared.status).clone()
     }
 
     /// Returns the checker once at least one dictionary is loaded.
     pub fn checker(&self) -> Option<Arc<RwLock<SpellChecker>>> {
-        self.shared
-            .checker
-            .lock()
-            .expect("spell checker slot poisoned")
-            .clone()
+        sync::lock(&self.shared.checker).clone()
     }
 
     /// Adds `word` to the personal dictionary, in memory and on disk.
     pub fn add_word(&self, word: &str) -> std::io::Result<()> {
         if let Some(checker) = self.checker() {
-            checker
-                .write()
-                .expect("spell checker poisoned")
-                .add_personal(word);
+            sync::write(&checker).add_personal(word);
         }
         append_personal(&self.paths.personal_dictionary(), word)
     }
@@ -468,7 +455,7 @@ impl<'a, 'b> SpellDecorator<'a, 'b> {
         if !tokens.is_empty() {
             let chars: Vec<char> = line.chars().collect();
             let text = |r: &Range<usize>| chars[r.clone()].iter().collect::<String>();
-            let checker = checker.read().expect("spell checker poisoned");
+            let checker = sync::read(checker);
             for token in tokens {
                 if let Some(whole) = &token.whole
                     && checker.is_correct(&text(whole))
@@ -524,7 +511,7 @@ impl Decorator for SpellDecorator<'_, '_> {
         let Some(checker) = &self.checker else {
             return;
         };
-        let generation = checker.read().expect("spell checker poisoned").generation();
+        let generation = sync::read(checker).generation();
         self.cache.sync_generation(generation);
         if self.mode == SpellMode::Markdown {
             self.cache.prose.refresh(buffer, &self.ctx);

@@ -88,3 +88,4 @@
 - OPTIMIZE: the fixed shortcut aliases are parsed once (`PARSED_ALIASES`, a `LazyLock`) instead of on every key press that misses the keymap.
 - OPTIMIZE: `handle_keyboard` copies only the keyboard events of the frame (`keyboard_events`) instead of cloning the whole input event list (pointer moves included) every frame.
 - OPTIMIZE: `SpellChecker::is_correct` takes `&self` (the word cache has its own `Mutex`), so the spell decorator checks words under a read lock of the shared checker instead of a write lock that waited on every other reader.
+- OPTIMIZE: one lock poisoning policy: the new `sync` module (`lock`, `read`, `write`, `wait_while`) recovers the value of a poisoned lock, documented as valid for every shared slot, and replaces the `expect("... poisoned")` calls in the syntax assets, warm-up map, fonts and spell checker, so a background panic no longer crashes the UI on the next frame.

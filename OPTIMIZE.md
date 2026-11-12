@@ -61,7 +61,7 @@
 - [x] **Spell checker lock is always taken for writing on the UI thread** - `SpellChecker::is_correct` needs `&mut self` only for its word cache, so `SpellDecorator::misspelled` takes the `RwLock` write lock and can wait on `add_word`; make the cache interior (`Mutex<HashMap>`) or use a plain `Mutex` and drop the `RwLock`.
   - File(s): `src/spell/mod.rs`
 
-- [ ] **Inconsistent lock poisoning policy** - `SpellService::status` recovers from poisoning with `PoisonError::into_inner`, while `checker()`, `AssetsHandle::get`, `ensure_warm` and the decorators `expect` on the same kind of locks, so a panic in a background thread turns into a UI crash on the next frame; pick one policy (recover and report) for all shared slots.
+- [x] **Inconsistent lock poisoning policy** - `SpellService::status` recovers from poisoning with `PoisonError::into_inner`, while `checker()`, `AssetsHandle::get`, `ensure_warm` and the decorators `expect` on the same kind of locks, so a panic in a background thread turns into a UI crash on the next frame; pick one policy (recover and report) for all shared slots.
   - File(s): `src/spell/mod.rs`, `src/highlight.rs`
 
 - [ ] **`same_file` canonicalizes every open tab on each open** - `try_open` calls `canonicalize` for both paths of every tab and every pending load, so restoring a session of N files makes O(N^2) file system calls; store the canonical path in `Buffer` when it is loaded or saved and compare that.
