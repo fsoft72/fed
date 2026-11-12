@@ -57,7 +57,7 @@
   - File(s): `src/app.rs`, `src/highlight.rs`, `src/settings_ui.rs`, `src/app/dialogs.rs`
 - [x] **Duplicated constants and helpers** - `FONT_SIZE_RANGE` / `TAB_WIDTH_RANGE` are defined in both `config.rs` and `settings_ui.rs`; `confirm_close_tab` / `confirm_close_window` repeat the same modal; the Escape/Enter field handling is copied three times in the find bar; `motion::next_word_start` / `prev_word_start` copy `text_nav`; `editing::insert_text` re-implements `normalize_newlines`; Markdown detection exists both as `is_markdown_path` and `SpellMode::for_syntax`.
   - File(s): `src/config.rs`, `src/settings_ui.rs`, `src/app/dialogs.rs`, `src/find_bar.rs`, `src/vim/motion.rs`, `src/editing.rs`, `src/markdown.rs`, `src/spell/mod.rs`
-- [ ] **Dead code and a dropped style** - `text_nav::matching_bracket` and `words::words` are only used by tests, and `StyledSpan::bold` is computed but never applied in `HighlightDecorator::decorate`, so bold theme styles are lost.
+- [x] **Dead code and a dropped style** - `text_nav::matching_bracket` and `words::words` are only used by tests, and `StyledSpan::bold` is computed but never applied in `HighlightDecorator::decorate`, so bold theme styles are lost.
   - File(s): `src/text_nav.rs`, `src/spell/words.rs`, `src/highlight.rs`
 - [ ] **Undo history clones whole steps and is unbounded** - `Buffer::undo` / `redo` clone `history[position]` instead of borrowing it (a `replace_all` step duplicates the whole text), and the history has no size cap.
   - File(s): `src/buffer.rs`

@@ -139,11 +139,6 @@ pub fn tokens(text: &str) -> Vec<Token> {
     out
 }
 
-/// Returns the char ranges of the words of `text` (the split parts of every token).
-pub fn words(text: &str) -> Vec<Range<usize>> {
-    tokens(text).into_iter().flat_map(|t| t.parts).collect()
-}
-
 /// Returns the tokens inside `ranges` (sorted char ranges of `text`), with ranges relative
 /// to `text`.
 pub fn tokens_in_ranges(text: &str, ranges: &[Range<usize>]) -> Vec<Token> {
@@ -248,6 +243,11 @@ mod tests {
     use super::*;
     use eframe::egui::Color32;
 
+    /// Returns the char ranges of the words of `text` (the split parts of every token).
+    fn words(text: &str) -> Vec<Range<usize>> {
+        tokens(text).into_iter().flat_map(|t| t.parts).collect()
+    }
+
     /// Returns the words of `text` as strings.
     fn word_strings(text: &str) -> Vec<String> {
         let chars: Vec<char> = text.chars().collect();
@@ -263,7 +263,6 @@ mod tests {
             range,
             color: Color32::WHITE,
             italic: false,
-            bold: false,
             underline: false,
             kind,
         }

@@ -179,10 +179,9 @@ pub struct StyledSpan {
     pub range: Range<usize>,
     /// Foreground color.
     pub color: Color32,
-    /// Italic font style.
+    /// Italic font style. (Bold theme styles are not kept: egui's `TextFormat` has no bold
+    /// attribute and the editor fonts have no bold face to switch to.)
     pub italic: bool,
-    /// Bold font style.
-    pub bold: bool,
     /// Underlined font style.
     pub underline: bool,
     /// Token class.
@@ -377,7 +376,6 @@ fn styled_span(range: Range<usize>, style: Style, kind: SpanKind) -> StyledSpan 
         range,
         color: Color32::from_rgb(fg.r, fg.g, fg.b),
         italic: style.font_style.contains(FontStyle::ITALIC),
-        bold: style.font_style.contains(FontStyle::BOLD),
         underline: style.font_style.contains(FontStyle::UNDERLINE),
         kind,
     }
