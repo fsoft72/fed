@@ -1,6 +1,7 @@
 //! Spell checking: dictionaries, checker and background service.
 
 pub mod dict;
+pub mod prose;
 pub mod words;
 
 use std::collections::{HashMap, HashSet};
@@ -17,6 +18,8 @@ use crate::buffer::Buffer;
 use crate::config::ConfigPaths;
 use crate::highlight::HighlightDecorator;
 use crate::view::{self, Decorator};
+
+pub use prose::ProseRanges;
 
 /// Maximum number of suggestions returned for a word.
 const MAX_SUGGESTIONS: usize = 8;
@@ -337,8 +340,10 @@ pub struct SpellDecorator<'a, 'b> {
     checker: Arc<RwLock<SpellChecker>>,
     /// Which text is checked.
     mode: SpellMode,
-    /// Markdown prose ranges cache of the tab (revision, ranges).
-    markdown: &'a mut Option<(u64, Vec<Range<usize>>)>,
+    /// Markdown prose ranges of the tab, parsed in the background.
+    markdown: &'a mut ProseRanges,
+    /// Context repainted when a background Markdown parse completes.
+    ctx: egui::Context,
     /// Receives the buffer ranges of the misspelled words painted this frame.
     marks: &'a mut HashSet<Range<usize>>,
     /// Snapshot of the buffer text taken in `prepare`.
@@ -346,19 +351,22 @@ pub struct SpellDecorator<'a, 'b> {
 }
 
 impl<'a, 'b> SpellDecorator<'a, 'b> {
-    /// Creates a decorator over `inner`; `markdown` and `marks` are the tab's spell caches.
+    /// Creates a decorator over `inner`; `markdown` and `marks` are the tab's spell caches and
+    /// `ctx` is repainted when the Markdown ranges are refreshed in the background.
     pub fn new(
         inner: &'a mut HighlightDecorator<'b>,
         checker: Arc<RwLock<SpellChecker>>,
         mode: SpellMode,
-        markdown: &'a mut Option<(u64, Vec<Range<usize>>)>,
+        markdown: &'a mut ProseRanges,
         marks: &'a mut HashSet<Range<usize>>,
+        ctx: &egui::Context,
     ) -> SpellDecorator<'a, 'b> {
         SpellDecorator {
             inner,
             checker,
             mode,
             markdown,
+            ctx: ctx.clone(),
             marks,
             rope: None,
         }
@@ -374,9 +382,10 @@ impl<'a, 'b> SpellDecorator<'a, 'b> {
                 .map(words::code_checkable)
                 .unwrap_or_default(),
             SpellMode::Markdown => {
-                let (Some(rope), Some((_, ranges))) = (&self.rope, &*self.markdown) else {
+                let Some(rope) = &self.rope else {
                     return Vec::new();
                 };
+                let ranges = self.markdown.ranges();
                 let start = rope.line_to_char(line_idx);
                 let end = start + len;
                 let first = ranges.partition_point(|r| r.end <= start);
@@ -391,18 +400,14 @@ impl<'a, 'b> SpellDecorator<'a, 'b> {
 }
 
 impl Decorator for SpellDecorator<'_, '_> {
-    /// Prepares the inner decorator, clears the marks and refreshes the Markdown ranges.
+    /// Prepares the inner decorator, clears the marks and refreshes the Markdown ranges (the
+    /// parse itself runs on a worker thread, never here).
     fn prepare(&mut self, buffer: &Buffer) {
         self.inner.prepare(buffer);
         self.rope = Some(buffer.rope().clone());
         self.marks.clear();
-        let revision = buffer.revision();
-        let stale = self
-            .markdown
-            .as_ref()
-            .is_none_or(|(rev, _)| *rev != revision);
-        if self.mode == SpellMode::Markdown && stale {
-            *self.markdown = Some((revision, words::markdown_checkable(&buffer.text())));
+        if self.mode == SpellMode::Markdown {
+            self.markdown.refresh(buffer, &self.ctx);
         }
     }
 
@@ -505,15 +510,17 @@ mod tests {
         let checker = Arc::new(RwLock::new(checker()));
         let mut cache = crate::highlight::HighlightCache::new();
         let mut inner = HighlightDecorator::new(&mut cache, None, "Plain Text", "x", true);
-        let mut markdown = None;
+        let mut markdown = ProseRanges::new();
         let mut marks = HashSet::new();
         let buffer = Buffer::from_text("ciao xyzzy\nhello");
+        let ctx = egui::Context::default();
         let mut deco = SpellDecorator::new(
             &mut inner,
             checker,
             SpellMode::Plain,
             &mut markdown,
             &mut marks,
+            &ctx,
         );
         deco.prepare(&buffer);
         let base = TextFormat::default();
@@ -541,15 +548,17 @@ mod tests {
         let checker = Arc::new(RwLock::new(SpellChecker::new(vec![en, it], HashSet::new())));
         let mut cache = crate::highlight::HighlightCache::new();
         let mut inner = HighlightDecorator::new(&mut cache, None, "Plain Text", "x", true);
-        let (mut markdown, mut marks) = (None, HashSet::new());
+        let (mut markdown, mut marks) = (ProseRanges::new(), HashSet::new());
         let text = "don't l\u{2019}albero don\u{2019}t doesn't";
         let buffer = Buffer::from_text(text);
+        let ctx = egui::Context::default();
         let mut deco = SpellDecorator::new(
             &mut inner,
             checker,
             SpellMode::Plain,
             &mut markdown,
             &mut marks,
+            &ctx,
         );
         deco.prepare(&buffer);
         deco.decorate(0, text, &TextFormat::default());

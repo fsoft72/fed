@@ -9,6 +9,7 @@ use crate::buffer::Buffer;
 use crate::editing::{self, EditCommand, EditSettings, EditorState};
 use crate::highlight::{self, HighlightAssets, HighlightCache};
 use crate::markdown::Preview;
+use crate::spell::ProseRanges;
 use crate::view::ViewState;
 use crate::vim::VimState;
 
@@ -33,8 +34,8 @@ pub struct Tab {
     pub syntax: Option<String>,
     /// Buffer path `syntax` was computed for, to recompute it only when the path changes.
     syntax_path: Option<PathBuf>,
-    /// Markdown prose ranges (char ranges of the whole document) for the given buffer revision.
-    pub spell_md: Option<(u64, Vec<Range<usize>>)>,
+    /// Markdown prose ranges (char ranges of the whole document), parsed in the background.
+    pub spell_md: ProseRanges,
     /// Buffer char ranges of the misspelled words painted in the last frame.
     pub spell_marks: HashSet<Range<usize>>,
     /// True while the Markdown preview panel is shown for this tab.
@@ -59,7 +60,7 @@ impl Tab {
             highlight: HighlightCache::new(),
             syntax: None,
             syntax_path: None,
-            spell_md: None,
+            spell_md: ProseRanges::new(),
             spell_marks: HashSet::new(),
             preview_open: false,
             preview: None,

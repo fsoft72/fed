@@ -40,3 +40,4 @@
 ## 2026-11-12
 
 - Added `OPTIMIZE.md`: prioritized list of optimization and quality improvements (3 critical, 8 high, 9 medium, 7 low).
+- OPTIMIZE: Markdown spell ranges are no longer rebuilt on the UI thread. `spell::ProseRanges` (`src/spell/prose.rs`) parses a rope snapshot on a worker thread (one parse in flight per tab, repaint on completion) and, while a parse runs, shows the last ranges shifted past the first edited line. `Buffer::first_dirty_line_since(revision)` reports the lowest edited line since any revision from a bounded edit log, so several caches can track edits independently of `take_dirty_line`.

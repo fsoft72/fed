@@ -1,6 +1,7 @@
 //! Rope-backed text buffer with undo/redo, marks, line endings and atomic saving.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,8 @@ use ropey::Rope;
 pub const LARGE_FILE_BYTES: usize = 5_000_000;
 /// Lines longer than this many chars flag the buffer as large.
 pub const LONG_LINE_CHARS: usize = 10_000;
+/// Number of recent edits remembered by `first_dirty_line_since`.
+const EDIT_LOG_LEN: usize = 1024;
 /// Suffix of the temporary file used for atomic saves.
 const TMP_SUFFIX: &str = ".fed-tmp";
 
@@ -81,6 +84,8 @@ pub struct Buffer {
     marks: Vec<(char, usize)>,
     /// Lowest edited line since the last take (a `Cell` so decorators can take it from `&Buffer`).
     dirty_line: Cell<Option<usize>>,
+    /// Recent edits as `(revision after the edit, first edited line)`, oldest first.
+    edit_log: VecDeque<(u64, usize)>,
 }
 
 impl Default for Buffer {
@@ -120,6 +125,7 @@ impl Buffer {
             group_edits: Vec::new(),
             marks: Vec::new(),
             dirty_line: Cell::new(None),
+            edit_log: VecDeque::new(),
         }
     }
 
@@ -322,6 +328,30 @@ impl Buffer {
         self.dirty_line.take()
     }
 
+    /// Returns the lowest line edited after revision `since`, or `None` when the buffer is
+    /// still at `since`. Every caller tracks its own revision, unlike `take_dirty_line`.
+    /// When `since` is older than the remembered edits (or newer than the buffer, i.e. a
+    /// different buffer), the whole buffer counts as dirty and line 0 is returned.
+    pub fn first_dirty_line_since(&self, since: u64) -> Option<usize> {
+        if since == self.revision {
+            return None;
+        }
+        let covered = since < self.revision
+            && self
+                .edit_log
+                .front()
+                .is_some_and(|&(rev, _)| rev <= since + 1);
+        if !covered {
+            return Some(0);
+        }
+        self.edit_log
+            .iter()
+            .rev()
+            .take_while(|(rev, _)| *rev > since)
+            .map(|(_, line)| *line)
+            .min()
+    }
+
     /// Returns the file name, or `"untitled"` when unnamed.
     pub fn display_name(&self) -> String {
         self.path
@@ -355,6 +385,10 @@ impl Buffer {
         self.rope.remove(range.clone());
         self.rope.insert(range.start, text);
         self.revision += 1;
+        if self.edit_log.len() == EDIT_LOG_LEN {
+            self.edit_log.pop_front();
+        }
+        self.edit_log.push_back((self.revision, line));
         for (_, pos) in &mut self.marks {
             if *pos >= range.end {
                 *pos = *pos + new_len - old_len;
@@ -522,6 +556,33 @@ mod tests {
         buf.replace(4..4, "y");
         assert_eq!(buf.take_dirty_line(), Some(1));
         assert_eq!(buf.take_dirty_line(), None);
+    }
+
+    #[test]
+    fn first_dirty_line_since_is_per_caller() {
+        let mut buf = Buffer::from_text("one\ntwo\nthree");
+        let start = buf.revision();
+        assert_eq!(buf.first_dirty_line_since(start), None);
+        buf.replace(8..8, "x");
+        let mid = buf.revision();
+        buf.replace(4..4, "y");
+        assert_eq!(buf.first_dirty_line_since(start), Some(1));
+        assert_eq!(buf.first_dirty_line_since(mid), Some(1));
+        // The single-consumer dirty line is not consumed by these queries.
+        assert_eq!(buf.take_dirty_line(), Some(1));
+        assert_eq!(buf.first_dirty_line_since(buf.revision()), None);
+        // A revision newer than the buffer means another buffer: everything is dirty.
+        assert_eq!(buf.first_dirty_line_since(buf.revision() + 5), Some(0));
+    }
+
+    #[test]
+    fn first_dirty_line_since_falls_back_to_zero_past_the_log() {
+        let mut buf = Buffer::from_text("a\nb\nc");
+        for _ in 0..EDIT_LOG_LEN + 1 {
+            buf.replace(4..4, "x");
+        }
+        assert_eq!(buf.first_dirty_line_since(0), Some(0));
+        assert_eq!(buf.first_dirty_line_since(buf.revision() - 1), Some(2));
     }
 
     #[test]

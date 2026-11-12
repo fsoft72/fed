@@ -1444,7 +1444,7 @@ impl eframe::App for FedApp {
             let syntax = tab.syntax.take().unwrap_or_default();
             // Decorator state is moved out of the tab so the decorators do not borrow it.
             let mut cache = std::mem::take(&mut tab.highlight);
-            let mut markdown = tab.spell_md.take();
+            let mut markdown = std::mem::take(&mut tab.spell_md);
             let mut marks = std::mem::take(&mut tab.spell_marks);
             let large = tab.buffer.is_large();
             let edit = opts.edit;
@@ -1491,8 +1491,14 @@ impl eframe::App for FedApp {
             let out = match spell_checker {
                 Some(c) => {
                     let mode = SpellMode::for_syntax(&syntax);
-                    let mut spell =
-                        SpellDecorator::new(&mut highlighted, c, mode, &mut markdown, &mut marks);
+                    let mut spell = SpellDecorator::new(
+                        &mut highlighted,
+                        c,
+                        mode,
+                        &mut markdown,
+                        &mut marks,
+                        ui.ctx(),
+                    );
                     let mut deco = MatchDecorator::new(&mut spell, &matches);
                     view::show_editor(ui, tab, &opts, &mut deco, key_handler)
                 }
