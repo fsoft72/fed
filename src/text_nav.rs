@@ -1,5 +1,6 @@
 //! Character classes, word boundaries and line helpers shared by the editor widget and vim.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use ropey::Rope;
@@ -174,6 +175,21 @@ pub fn pos_at(rope: &Rope, line: usize, col: usize) -> usize {
     (start + col).min(line_end(rope, start))
 }
 
+/// Returns the text of line `index` without its trailing line break, borrowed from the rope
+/// when the line is stored in one chunk (the common case), so drawing and searching a line
+/// usually allocate nothing.
+pub fn line_text(rope: &Rope, index: usize) -> Cow<'_, str> {
+    let mut line = rope.line(index);
+    let len = line.len_chars();
+    if len > 0 && line.char(len - 1) == '\n' {
+        line = line.slice(..len - 1);
+    }
+    match line.as_str() {
+        Some(text) => Cow::Borrowed(text),
+        None => Cow::Owned(line.to_string()),
+    }
+}
+
 /// Columns taken by a tab starting at display column `col`: up to the next multiple of
 /// `tab_width` (a width of 0 counts as 1).
 pub fn tab_advance(col: usize, tab_width: usize) -> usize {
@@ -244,6 +260,18 @@ pub fn matching_bracket(rope: &Rope, pos: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_text_strips_the_break_and_borrows() {
+        let rope = Rope::from_str("ab\ncd\n");
+        assert_eq!(line_text(&rope, 0), "ab");
+        assert!(matches!(line_text(&rope, 1), Cow::Borrowed("cd")));
+        assert_eq!(line_text(&rope, 2), "");
+        let long = "x".repeat(5000) + "\n" + &"y".repeat(5000);
+        let rope = Rope::from_str(&long);
+        assert_eq!(line_text(&rope, 0).len(), 5000);
+        assert_eq!(line_text(&rope, 1).len(), 5000);
+    }
     use ropey::Rope;
 
     #[test]

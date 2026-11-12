@@ -1,12 +1,12 @@
 //! Search engine shared by the find bar and the vim `/` and `:s` commands.
 
-use std::borrow::Cow;
 use std::ops::Range;
 
 use regex::{Regex, RegexBuilder};
 use ropey::Rope;
 
 use crate::buffer::{Buffer, DirtyLines};
+use crate::text_nav;
 
 /// A user search request: pattern text plus matching options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,23 +45,9 @@ impl SearchQuery {
     }
 }
 
-/// Returns the text of line `index` without its trailing line break, borrowed from the rope
-/// when the line is stored in one chunk (the common case).
-fn line_text(rope: &Rope, index: usize) -> Cow<'_, str> {
-    let mut line = rope.line(index);
-    let len = line.len_chars();
-    if len > 0 && line.char(len - 1) == '\n' {
-        line = line.slice(..len - 1);
-    }
-    match line.as_str() {
-        Some(text) => Cow::Borrowed(text),
-        None => Cow::Owned(line.to_string()),
-    }
-}
-
 /// Returns the non-empty matches of line `index` as document char ranges, in order.
 fn line_matches(rope: &Rope, re: &Regex, index: usize) -> Vec<Range<usize>> {
-    let text = line_text(rope, index);
+    let text = text_nav::line_text(rope, index);
     let mut char_pos = rope.line_to_char(index);
     let mut byte_pos = 0;
     let mut found = Vec::new();
@@ -183,7 +169,7 @@ fn rewrite_lines(
     let mut last_line = None;
     for index in lines.start..end {
         let rope = buf.rope();
-        let text = line_text(rope, index);
+        let text = text_nav::line_text(rope, index);
         let matches = if global {
             re.find_iter(&text).count()
         } else {

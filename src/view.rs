@@ -666,15 +666,6 @@ fn build_layout_job(
     job
 }
 
-/// Returns the text of `line` without its trailing newline.
-fn line_text(rope: &Rope, line: usize) -> String {
-    let mut text = rope.line(line).to_string();
-    if text.ends_with('\n') {
-        text.pop();
-    }
-    text
-}
-
 /// Measures the wrapped height of `line` laid out `width` points wide.
 fn measure_line(
     fonts: &mut egui::epaint::FontsView<'_>,
@@ -683,7 +674,7 @@ fn measure_line(
     m: &Metrics,
     width: f32,
 ) -> f32 {
-    let text = line_text(rope, line);
+    let text = text_nav::line_text(rope, line);
     if text.is_empty() {
         return m.row_height;
     }
@@ -951,7 +942,7 @@ impl Frame<'_> {
 
     /// Lays out `line` with the decorator formats.
     fn layout_line(&mut self, ui: &Ui, line: usize, wrap_width: Option<f32>) -> Arc<Galley> {
-        let text = line_text(self.tab.buffer.rope(), line);
+        let text = text_nav::line_text(self.tab.buffer.rope(), line);
         let spans = self.deco.decorate(line, &text, &self.m.base);
         let job = build_layout_job(
             &text,
@@ -994,7 +985,11 @@ impl Frame<'_> {
         let x = local.x.max(pl.viewport.min.x + self.m.gutter_width) - self.m.text_x();
         let cursor = galley.cursor_from_pos(vec2(x, local.y - pl.rows.top(line)));
         let rope = self.tab.buffer.rope();
-        let col = buffer_col(&line_text(rope, line), cursor.index.0, self.m.tab_width);
+        let col = buffer_col(
+            &text_nav::line_text(rope, line),
+            cursor.index.0,
+            self.m.tab_width,
+        );
         rope.line_to_char(line) + col
     }
 
@@ -1082,7 +1077,7 @@ impl Frame<'_> {
         for (line, galley) in galleys {
             let pos = origin + vec2(self.m.text_x(), rows.top(*line));
             let ls = rope.line_to_char(*line);
-            let text = line_text(rope, *line);
+            let text = text_nav::line_text(rope, *line);
             let le = ls + text.chars().count();
             if !sel.is_empty() && sel.start <= le && sel.end > ls {
                 let a = display_col(&text, sel.start.max(ls) - ls, self.m.tab_width);
@@ -1141,7 +1136,7 @@ impl Frame<'_> {
     fn caret_rect(&mut self, ui: &Ui, galleys: &[(usize, Arc<Galley>)], pl: &Placement) -> Rect {
         let rope = self.tab.buffer.rope();
         let (line, col) = text_nav::line_col(rope, self.tab.editor.selection.head);
-        let dcol = display_col(&line_text(rope, line), col, self.m.tab_width);
+        let dcol = display_col(&text_nav::line_text(rope, line), col, self.m.tab_width);
         let galley = self.galley_for(ui, galleys, line, pl.wrap_width);
         let offset = pl.origin + vec2(self.m.text_x(), pl.rows.top(line));
         galley
@@ -1527,7 +1522,7 @@ mod tests {
         for pos in [0, 2, 3, 4, 5, 6, 7] {
             let line = rope.char_to_line(pos);
             let col = pos - rope.line_to_char(line);
-            let text = line_text(&rope, line);
+            let text = text_nav::line_text(&rope, line);
             assert_eq!(
                 display_col(&text, col, 4),
                 text_nav::display_col(&rope, pos, 4),
