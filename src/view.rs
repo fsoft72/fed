@@ -155,6 +155,11 @@ pub struct ViewState {
     longest: Option<LongestLine>,
     /// Wrapped line heights (word wrap only).
     wrap: WrapCache,
+    /// Distance of the caret top from the viewport top in the last frame.
+    caret_offset: Option<f32>,
+    /// Set by PageUp/PageDown: the next frame scrolls so the caret sits this far from the
+    /// viewport top, so the view moves by the same page as the caret.
+    page_anchor: Option<f32>,
 }
 
 impl ViewState {
@@ -359,6 +364,17 @@ fn handle_keyboard(
         if !is_keyboard_event(ev) {
             continue;
         }
+        if let Some(up) = page_key(ev) {
+            tab.view.page_anchor = Some(tab.view.caret_offset.unwrap_or(0.0));
+            if let Some(handler) = key_handler.as_mut() {
+                // Vim mode: move the caret one line at a time so every mode clamps it.
+                let arrow = if up { Key::ArrowUp } else { Key::ArrowDown };
+                for _ in 0..page {
+                    handler(&key_event(arrow), tab);
+                }
+                continue;
+            }
+        }
         if let Some(handler) = key_handler.as_mut()
             && handler(ev, tab)
         {
@@ -371,6 +387,39 @@ fn handle_keyboard(
         if let Some(text) = tab.apply(cmd, &opts.edit) {
             out.clipboard = Some(text);
         }
+    }
+}
+
+/// Returns `Some(true)` for a PageUp press and `Some(false)` for a PageDown press (Shift
+/// allowed, to extend the selection), `None` for any other event.
+fn page_key(ev: &egui::Event) -> Option<bool> {
+    let egui::Event::Key {
+        key,
+        pressed: true,
+        modifiers,
+        ..
+    } = ev
+    else {
+        return None;
+    };
+    if modifiers.ctrl || modifiers.alt || modifiers.mac_cmd {
+        return None;
+    }
+    match key {
+        Key::PageUp => Some(true),
+        Key::PageDown => Some(false),
+        _ => None,
+    }
+}
+
+/// A plain press of `key` without modifiers.
+fn key_event(key: Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
     }
 }
 
@@ -843,6 +892,18 @@ impl Frame<'_> {
         self.paint(ui, &galleys, &pl);
 
         let caret = self.caret_rect(ui, &galleys, &pl);
+        let caret_offset = caret.min.y - origin.y - viewport.min.y;
+        self.tab.view.caret_offset = Some(caret_offset);
+        if let Some(anchor) = self.tab.view.page_anchor.take() {
+            // Keep the caret on the same screen row (fully visible): the view follows the page.
+            self.tab.scroll_to_cursor = false;
+            let anchor = anchor.clamp(0.0, (viewport.height() - caret.height()).max(0.0));
+            // A positive scroll delta moves the content down, i.e. scrolls the view up.
+            ui.scroll_with_delta_animation(
+                vec2(0.0, anchor - caret_offset),
+                egui::style::ScrollAnimation::none(),
+            );
+        }
         if self.tab.scroll_to_cursor {
             self.tab.scroll_to_cursor = false;
             let margin = SCROLL_MARGIN_CHARS * self.m.char_width;
@@ -1444,5 +1505,116 @@ mod tests {
     fn layout_job_for_empty_line_has_a_section() {
         let job = build_layout_job("", &[], &TextFormat::default(), 4, None, 10.0);
         assert_eq!(job.sections.len(), 1);
+    }
+
+    /// Decorator that leaves every line plain.
+    struct Plain;
+
+    impl Decorator for Plain {
+        fn decorate(
+            &mut self,
+            _: usize,
+            _: &str,
+            _: &TextFormat,
+        ) -> Vec<(Range<usize>, TextFormat)> {
+            Vec::new()
+        }
+    }
+
+    /// Indentation settings for the headless editor tests.
+    const EDIT: EditSettings = EditSettings {
+        tab_width: 4,
+        insert_spaces: true,
+    };
+
+    /// Runs one frame of the editor for `tab` in a 400x300 window, feeding `events`.
+    fn editor_frame(ctx: &egui::Context, tab: &mut Tab, vim: bool, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))),
+            events,
+            ..Default::default()
+        };
+        let opts = ViewOptions {
+            font: FontId::monospace(14.0),
+            line_numbers: true,
+            word_wrap: false,
+            edit: EDIT,
+            keys_enabled: true,
+            vim,
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            let mut route = |ev: &egui::Event, tab: &mut Tab| {
+                for key in egui_event_to_vim_keys(ev) {
+                    tab.vim
+                        .handle_key(key, &mut tab.buffer, &mut tab.editor, &EDIT);
+                }
+                true
+            };
+            let handler: Option<&mut KeyHandler<'_>> = vim.then_some(&mut route as _);
+            show_editor(ui, tab, &opts, &mut Plain, handler);
+        });
+        output.textures_delta.clear();
+    }
+
+    /// Opens a 500 line buffer, moves the caret a few lines down, presses PageDown then
+    /// PageUp and checks the caret moved by a page while keeping its screen row.
+    fn check_page_keys_scroll_the_view(vim: bool) {
+        let ctx = egui::Context::default();
+        let text: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let mut tab = Tab::new(Buffer::from_text(&text));
+        tab.editor.selection = crate::editing::Selection::caret(tab.buffer.rope().line_to_char(5));
+        for _ in 0..3 {
+            editor_frame(&ctx, &mut tab, vim, Vec::new());
+        }
+        let line = |tab: &Tab| text_nav::line_col(tab.buffer.rope(), tab.editor.selection.head).0;
+        let offset_before = tab.view.caret_offset.expect("caret drawn");
+
+        editor_frame(&ctx, &mut tab, vim, vec![key_event(Key::PageDown)]);
+        for _ in 0..2 {
+            editor_frame(&ctx, &mut tab, vim, Vec::new());
+        }
+        let paged = line(&tab);
+        assert!(paged > 5 + 5, "caret moved by a page, now on line {paged}");
+        let offset = tab.view.caret_offset.expect("caret drawn");
+        assert!(
+            (offset - offset_before).abs() < 1.0,
+            "{offset} vs {offset_before}"
+        );
+
+        editor_frame(&ctx, &mut tab, vim, vec![key_event(Key::PageUp)]);
+        for _ in 0..2 {
+            editor_frame(&ctx, &mut tab, vim, Vec::new());
+        }
+        assert_eq!(line(&tab), 5);
+        let offset = tab.view.caret_offset.expect("caret drawn");
+        assert!(
+            (offset - offset_before).abs() < 1.0,
+            "{offset} vs {offset_before}"
+        );
+    }
+
+    #[test]
+    fn page_keys_scroll_the_view() {
+        check_page_keys_scroll_the_view(false);
+    }
+
+    #[test]
+    fn page_keys_scroll_the_view_in_vim_mode() {
+        check_page_keys_scroll_the_view(true);
+    }
+
+    #[test]
+    fn page_key_ignores_modified_presses() {
+        assert_eq!(page_key(&key_event(Key::PageUp)), Some(true));
+        assert_eq!(page_key(&key_event(Key::PageDown)), Some(false));
+        let ctrl = egui::Event::Key {
+            key: Key::PageDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: CTRL,
+        };
+        assert_eq!(page_key(&ctrl), None);
+        assert_eq!(page_key(&key_event(Key::ArrowDown)), None);
     }
 }
