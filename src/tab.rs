@@ -4,6 +4,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -15,6 +16,9 @@ use crate::markdown::Preview;
 use crate::spell::{SpellCache, SpellChecker, SpellDecorator, SpellMode};
 use crate::view::{self, KeyHandler, ViewOptions, ViewOutput, ViewState};
 use crate::vim::VimState;
+
+/// A pause in typing at least this long starts a new undo step.
+const TYPING_PAUSE: Duration = Duration::from_secs(1);
 
 /// Source of unique tab ids.
 static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
@@ -43,6 +47,8 @@ pub struct Tab {
     pub scroll_to_cursor: bool,
     /// True while consecutive typed text is collected into one open undo group.
     typing: bool,
+    /// When text was last typed into the open typing group.
+    last_typed: Option<Instant>,
     /// Syntax highlighting cache.
     highlight: HighlightCache,
     /// Name of the syntax used for highlighting (`None` until assets are loaded); shared so
@@ -71,6 +77,7 @@ impl Tab {
             editor: EditorState::default(),
             scroll_to_cursor: true,
             typing: false,
+            last_typed: None,
             highlight: HighlightCache::new(),
             syntax: None,
             syntax_path: None,
@@ -83,16 +90,32 @@ impl Tab {
     }
 
     /// Applies an editing command, grouping consecutive `InsertText` commands into one undo
-    /// step. Any other command closes the typing group first. Returns clipboard text for
-    /// `Cut` and `Copy`. Use this instead of `editing::apply_command` for tab edits.
+    /// step. Any other command (including Enter) and a pause of `TYPING_PAUSE` close the
+    /// typing group first. Returns clipboard text for `Cut` and `Copy`. Use this instead of
+    /// `editing::apply_command` for tab edits.
     pub fn apply(&mut self, cmd: EditCommand, settings: &EditSettings) -> Option<String> {
+        self.apply_at(cmd, settings, Instant::now())
+    }
+
+    /// `apply` with an explicit time for the typing pause (testable).
+    fn apply_at(
+        &mut self,
+        cmd: EditCommand,
+        settings: &EditSettings,
+        now: Instant,
+    ) -> Option<String> {
+        let paused = self
+            .last_typed
+            .is_some_and(|t| now.duration_since(t) >= TYPING_PAUSE);
+        if !matches!(cmd, EditCommand::InsertText(_)) || paused {
+            self.end_typing();
+        }
         if matches!(cmd, EditCommand::InsertText(_)) {
             if !self.typing {
                 self.buffer.begin_group();
                 self.typing = true;
             }
-        } else {
-            self.end_typing();
+            self.last_typed = Some(now);
         }
         self.scroll_to_cursor = true;
         editing::apply_command(&mut self.editor, &mut self.buffer, cmd, settings)
@@ -181,6 +204,7 @@ impl Tab {
     /// or running undo/redo outside of `apply`. Vim stays in Insert mode.
     pub fn end_typing(&mut self) {
         self.vim.end_insert_group(&mut self.buffer);
+        self.last_typed = None;
         if !self.typing {
             return;
         }
@@ -242,6 +266,21 @@ mod tests {
         tab.apply(EditCommand::InsertText("c".into()), &SET);
         tab.apply(EditCommand::Undo, &SET);
         assert_eq!(tab.buffer.text(), "ab\n");
+        tab.apply(EditCommand::Undo, &SET);
+        assert_eq!(tab.buffer.text(), "ab");
+        tab.apply(EditCommand::Undo, &SET);
+        assert_eq!(tab.buffer.text(), "");
+    }
+
+    #[test]
+    fn a_typing_pause_starts_a_new_undo_step() {
+        let mut tab = Tab::new(Buffer::from_text(""));
+        let t0 = Instant::now();
+        let typed = |s: &str| EditCommand::InsertText(s.into());
+        tab.apply_at(typed("a"), &SET, t0);
+        tab.apply_at(typed("b"), &SET, t0 + TYPING_PAUSE / 2);
+        tab.apply_at(typed("c"), &SET, t0 + TYPING_PAUSE * 2);
+        tab.end_typing();
         tab.apply(EditCommand::Undo, &SET);
         assert_eq!(tab.buffer.text(), "ab");
         tab.apply(EditCommand::Undo, &SET);

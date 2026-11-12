@@ -57,3 +57,4 @@
 - OPTIMIZE: Visual-mode `d x c > <` are repeatable with `.`: `visual_replay_keys` records keys that reselect the same extent from the caret (same line count; same end column or line break on the last line for charwise) and reapply the operator, a Visual `c` also records the inserted text.
 - OPTIMIZE: `:'<,'>` resolves `'<` / `'>` from the buffer marks set when Visual mode ends, which follow edits; `VimState::last_visual`, `visual_marks` and the `visual_marks` parameters of `cmdline::execute` / `resolve_range` are gone.
 - OPTIMIZE: vim `{count}p` refuses pastes over 16 MB (`MAX_PUT_BYTES`, overflow-checked) with an error instead of trying to allocate them.
+- OPTIMIZE: typing undo groups close after a 1 s pause (`TYPING_PAUSE`, `Tab::apply_at` takes the time for tests) besides on Enter and any other command, so long typing sessions undo in steps; `Buffer::undo` / `redo` / `save` `debug_assert` that no undo group is open.

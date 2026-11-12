@@ -206,8 +206,9 @@ impl Buffer {
         self.path = Some(path);
     }
 
-    /// Saves to the bound path.
+    /// Saves to the bound path. Callers must close any open undo group first.
     pub fn save(&mut self) -> Result<(), BufferError> {
+        debug_assert_eq!(self.group_depth, 0, "save with an open undo group");
         let path = self.path.clone().ok_or(BufferError::NoPath)?;
         self.write_copy(&path)?;
         self.saved_position = Some(self.position);
@@ -326,8 +327,10 @@ impl Buffer {
         self.push_step(edits);
     }
 
-    /// Undoes the last step; returns the char index for the cursor.
+    /// Undoes the last step; returns the char index for the cursor. Callers must close any
+    /// open undo group first.
     pub fn undo(&mut self) -> Option<usize> {
+        debug_assert_eq!(self.group_depth, 0, "undo with an open undo group");
         if self.position == 0 {
             return None;
         }
@@ -342,8 +345,10 @@ impl Buffer {
         Some(cursor)
     }
 
-    /// Redoes the next step; returns the char index for the cursor.
+    /// Redoes the next step; returns the char index for the cursor. Callers must close any
+    /// open undo group first.
     pub fn redo(&mut self) -> Option<usize> {
+        debug_assert_eq!(self.group_depth, 0, "redo with an open undo group");
         if self.position >= self.history.len() {
             return None;
         }
@@ -731,6 +736,16 @@ mod tests {
         assert_eq!(buf.redo(), Some(4));
         assert_eq!(buf.text(), "abcd");
         assert!(buf.is_modified());
+    }
+
+    #[test]
+    #[should_panic(expected = "open undo group")]
+    #[cfg(debug_assertions)]
+    fn undo_inside_an_open_group_is_a_bug() {
+        let mut buf = Buffer::from_text("abc");
+        buf.begin_group();
+        buf.replace(0..0, "x");
+        buf.undo();
     }
 
     #[test]

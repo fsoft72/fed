@@ -44,7 +44,7 @@
   - File(s): `src/vim/mod.rs`, `src/vim/cmdline.rs`
 - [x] **Huge paste counts can abort the process** - `put` builds `register.text.repeat(count)` with counts up to 99,999, which can try to allocate gigabytes for a large register; cap the resulting size and report an error.
   - File(s): `src/vim/normal.rs`
-- [ ] **Typing undo groups never close on their own** - `Tab::apply` keeps one undo group open for all consecutive `InsertText`, so minutes of typing undo in one step; close the group on a pause or a newline. `Buffer::undo` / `redo` / `save` also do not assert that no group is open.
+- [x] **Typing undo groups never close on their own** - `Tab::apply` keeps one undo group open for all consecutive `InsertText`, so minutes of typing undo in one step; close the group on a pause or a newline. `Buffer::undo` / `redo` / `save` also do not assert that no group is open.
   - File(s): `src/tab.rs`, `src/buffer.rs`
 - [ ] **Session errors swallowed** - `config::load_session` turns read and parse errors into an empty session silently, and `FedApp::save_session` only writes failures to stderr; surface both like `load_settings` does.
   - File(s): `src/config.rs`, `src/app.rs`
