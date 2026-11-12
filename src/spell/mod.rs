@@ -398,12 +398,13 @@ fn line_key(line: &str, ranges: &[Range<usize>]) -> u64 {
     h.finish()
 }
 
-/// Decorator that underlines misspelled words on top of the highlight decorator.
+/// Decorator that underlines misspelled words on top of the highlight decorator. Without a
+/// checker it only passes the highlight spans through.
 pub struct SpellDecorator<'a, 'b> {
     /// Highlight decorator providing the base spans and the token kinds for code.
     inner: &'a mut HighlightDecorator<'b>,
-    /// Shared checker.
-    checker: Arc<RwLock<SpellChecker>>,
+    /// Shared checker; `None` when spell checking is off.
+    checker: Option<Arc<RwLock<SpellChecker>>>,
     /// Which text is checked.
     mode: SpellMode,
     /// Spell state of the tab (Markdown ranges, painted marks, line results).
@@ -416,10 +417,11 @@ pub struct SpellDecorator<'a, 'b> {
 
 impl<'a, 'b> SpellDecorator<'a, 'b> {
     /// Creates a decorator over `inner`; `cache` is the tab's spell state and `ctx` is
-    /// repainted when the Markdown ranges are refreshed in the background.
+    /// repainted when the Markdown ranges are refreshed in the background. With no `checker`
+    /// nothing is underlined.
     pub fn new(
         inner: &'a mut HighlightDecorator<'b>,
-        checker: Arc<RwLock<SpellChecker>>,
+        checker: Option<Arc<RwLock<SpellChecker>>>,
         mode: SpellMode,
         cache: &'a mut SpellCache,
         ctx: &egui::Context,
@@ -441,12 +443,15 @@ impl<'a, 'b> SpellDecorator<'a, 'b> {
         if let Some(hit) = self.cache.line(key) {
             return hit.clone();
         }
+        let Some(checker) = &self.checker else {
+            return Vec::new();
+        };
         let tokens = words::tokens_in_ranges(line, ranges);
         let mut bad = Vec::new();
         if !tokens.is_empty() {
             let chars: Vec<char> = line.chars().collect();
             let text = |r: &Range<usize>| chars[r.clone()].iter().collect::<String>();
-            let mut checker = self.checker.write().expect("spell checker poisoned");
+            let mut checker = checker.write().expect("spell checker poisoned");
             for token in tokens {
                 if let Some(whole) = &token.whole
                     && checker.is_correct(&text(whole))
@@ -499,11 +504,10 @@ impl Decorator for SpellDecorator<'_, '_> {
         self.inner.prepare(buffer);
         self.rope = Some(buffer.rope().clone());
         self.cache.marks.clear();
-        let generation = self
-            .checker
-            .read()
-            .expect("spell checker poisoned")
-            .generation();
+        let Some(checker) = &self.checker else {
+            return;
+        };
+        let generation = checker.read().expect("spell checker poisoned").generation();
         self.cache.sync_generation(generation);
         if self.mode == SpellMode::Markdown {
             self.cache.prose.refresh(buffer, &self.ctx);
@@ -518,6 +522,9 @@ impl Decorator for SpellDecorator<'_, '_> {
         base: &TextFormat,
     ) -> Vec<(Range<usize>, TextFormat)> {
         let spans = self.inner.decorate(line_idx, line, base);
+        if self.checker.is_none() {
+            return spans;
+        }
         let ranges = self.checkable_ranges(line_idx, line.chars().count());
         if ranges.is_empty() {
             return spans;
@@ -595,7 +602,13 @@ mod tests {
         let mut cache = SpellCache::default();
         let buffer = Buffer::from_text("ciao xyzzy\nhello");
         let ctx = egui::Context::default();
-        let mut deco = SpellDecorator::new(&mut inner, checker, SpellMode::Plain, &mut cache, &ctx);
+        let mut deco = SpellDecorator::new(
+            &mut inner,
+            Some(checker),
+            SpellMode::Plain,
+            &mut cache,
+            &ctx,
+        );
         deco.prepare(&buffer);
         let base = TextFormat::default();
         let spans = deco.decorate(0, "ciao xyzzy", &base);
@@ -626,7 +639,13 @@ mod tests {
         let text = "don't l\u{2019}albero don\u{2019}t doesn't";
         let buffer = Buffer::from_text(text);
         let ctx = egui::Context::default();
-        let mut deco = SpellDecorator::new(&mut inner, checker, SpellMode::Plain, &mut cache, &ctx);
+        let mut deco = SpellDecorator::new(
+            &mut inner,
+            Some(checker),
+            SpellMode::Plain,
+            &mut cache,
+            &ctx,
+        );
         deco.prepare(&buffer);
         deco.decorate(0, text, &TextFormat::default());
         drop(deco);
@@ -654,7 +673,7 @@ mod tests {
         {
             let mut deco = SpellDecorator::new(
                 &mut inner,
-                Arc::clone(&checker),
+                Some(Arc::clone(&checker)),
                 SpellMode::Plain,
                 &mut cache,
                 &ctx,
@@ -671,7 +690,7 @@ mod tests {
         {
             let mut deco = SpellDecorator::new(
                 &mut inner,
-                Arc::clone(&checker),
+                Some(Arc::clone(&checker)),
                 SpellMode::Plain,
                 &mut cache,
                 &ctx,
@@ -686,9 +705,30 @@ mod tests {
         assert_eq!(cache.marks, HashSet::from([5..10]));
         // Adding the word bumps the generation and drops the cached line.
         checker.write().unwrap().add_personal("xyzzy");
-        let mut deco = SpellDecorator::new(&mut inner, checker, SpellMode::Plain, &mut cache, &ctx);
+        let mut deco = SpellDecorator::new(
+            &mut inner,
+            Some(checker),
+            SpellMode::Plain,
+            &mut cache,
+            &ctx,
+        );
         deco.prepare(&buffer);
         assert!(underlined(deco.decorate(0, "ciao xyzzy", &base)).is_empty());
+    }
+
+    #[test]
+    fn decorator_without_checker_passes_spans_through() {
+        let mut hl = crate::highlight::HighlightCache::new();
+        let mut inner = HighlightDecorator::new(&mut hl, None, "Plain Text", "x", true);
+        let mut cache = SpellCache::default();
+        cache.marks.insert(0..1);
+        let ctx = egui::Context::default();
+        let mut deco = SpellDecorator::new(&mut inner, None, SpellMode::Plain, &mut cache, &ctx);
+        deco.prepare(&Buffer::from_text("xyzzy"));
+        let spans = deco.decorate(0, "xyzzy", &TextFormat::default());
+        assert!(spans.iter().all(|(_, f)| f.underline == Stroke::NONE));
+        drop(deco);
+        assert!(cache.marks.is_empty(), "stale marks are dropped");
     }
 
     #[test]

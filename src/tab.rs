@@ -1,18 +1,35 @@
 //! An open document: buffer, editor state and per-tab view caches.
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+
+use eframe::egui;
 
 use crate::buffer::Buffer;
 use crate::editing::{self, EditCommand, EditSettings, EditorState};
-use crate::highlight::{self, HighlightAssets, HighlightCache};
+use crate::find_bar::MatchDecorator;
+use crate::highlight::{self, HighlightAssets, HighlightCache, HighlightDecorator};
 use crate::markdown::Preview;
-use crate::spell::SpellCache;
-use crate::view::ViewState;
+use crate::spell::{SpellCache, SpellChecker, SpellDecorator, SpellMode};
+use crate::view::{self, KeyHandler, ViewOptions, ViewOutput, ViewState};
 use crate::vim::VimState;
 
 /// Source of unique tab ids.
 static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
+
+/// What the editor of a tab needs from the application for one frame.
+pub struct EditorEnv<'a> {
+    /// Syntax and theme assets, once loaded.
+    pub assets: Option<&'a Arc<HighlightAssets>>,
+    /// Code theme for the current light/dark mode.
+    pub theme: &'a str,
+    /// Spell checker, when spell checking is on and a dictionary is loaded.
+    pub checker: Option<Arc<RwLock<SpellChecker>>>,
+    /// Find bar matches to highlight.
+    pub matches: &'a [Range<usize>],
+}
 
 /// One open document shown in a tab.
 pub struct Tab {
@@ -27,13 +44,14 @@ pub struct Tab {
     /// True while consecutive typed text is collected into one open undo group.
     typing: bool,
     /// Syntax highlighting cache.
-    pub highlight: HighlightCache,
-    /// Name of the syntax used for highlighting (`None` until assets are loaded).
-    pub syntax: Option<String>,
+    highlight: HighlightCache,
+    /// Name of the syntax used for highlighting (`None` until assets are loaded); shared so
+    /// a frame can hold it without cloning the string.
+    syntax: Option<Arc<str>>,
     /// Buffer path `syntax` was computed for, to recompute it only when the path changes.
     syntax_path: Option<PathBuf>,
     /// Spell check state: Markdown prose ranges, painted marks and per-line results.
-    pub spell: SpellCache,
+    spell: SpellCache,
     /// True while the Markdown preview panel is shown for this tab.
     pub preview_open: bool,
     /// Markdown preview state, created when the preview is first opened.
@@ -87,8 +105,69 @@ impl Tab {
         if self.syntax.is_some() && self.syntax_path.as_deref() == path {
             return;
         }
-        self.syntax = Some(highlight::syntax_for_path(assets, path));
+        self.syntax = Some(highlight::syntax_for_path(assets, path).into());
         self.syntax_path = path.map(PathBuf::from);
+    }
+
+    /// Draws the editor of this tab: highlighting (off for large files and until the syntax
+    /// is warm), spell check underlines and find matches, in one decorator chain. With vim
+    /// mode on, a mouse selection is handed to vim, and copied text goes to the clipboard.
+    pub fn show_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        opts: &ViewOptions,
+        env: EditorEnv<'_>,
+        key_handler: Option<&mut KeyHandler<'_>>,
+    ) -> ViewOutput {
+        if let Some(assets) = env.assets {
+            self.refresh_syntax(assets);
+        }
+        let syntax = self.syntax.clone().unwrap_or_else(|| Arc::from(""));
+        let large = self.buffer.is_large();
+        // Plain text until the syntax regexes are compiled off the UI thread.
+        let warm = env
+            .assets
+            .is_some_and(|a| a.ensure_warm(&syntax, self.buffer.rope(), ui.ctx()));
+        let checker = env.checker.filter(|_| !large);
+        // The caches are moved out so the decorators do not borrow the tab the widget edits.
+        let mut highlight = std::mem::take(&mut self.highlight);
+        let mut spell = std::mem::take(&mut self.spell);
+        let mut highlighted = HighlightDecorator::new(
+            &mut highlight,
+            env.assets.map(Arc::as_ref),
+            &syntax,
+            env.theme,
+            !large && warm,
+        );
+        let mode = SpellMode::for_syntax(&syntax);
+        let mut spelled =
+            SpellDecorator::new(&mut highlighted, checker, mode, &mut spell, ui.ctx());
+        let mut deco = MatchDecorator::new(&mut spelled, env.matches);
+        let out = view::show_editor(ui, self, opts, &mut deco, key_handler);
+        drop(deco);
+        drop(spelled);
+        if highlighted.is_incomplete() {
+            // Lines past the parse budget were drawn plain: continue next frame.
+            ui.ctx().request_repaint();
+        }
+        self.highlight = highlight;
+        self.spell = spell;
+        if opts.vim && out.mouse_selected {
+            self.vim.mouse_selection(&mut self.buffer, &mut self.editor);
+        }
+        if let Some(text) = &out.clipboard {
+            ui.ctx().copy_text(text.clone());
+        }
+        out
+    }
+
+    /// Returns the misspelled word painted in the last frame that lies inside `clicked`.
+    pub fn spell_mark_in(&self, clicked: &Range<usize>) -> Option<Range<usize>> {
+        self.spell
+            .marks
+            .iter()
+            .find(|m| m.start >= clicked.start && m.end <= clicked.end)
+            .cloned()
     }
 
     /// Gives the editor widget keyboard focus the next time this tab is shown
@@ -138,7 +217,7 @@ mod tests {
         tab.refresh_syntax(&assets);
         assert_eq!(tab.syntax.as_deref(), Some("Rust"));
         // Same path: the cached name is kept (a sentinel proves no lookup ran).
-        tab.syntax = Some("sentinel".to_string());
+        tab.syntax = Some("sentinel".into());
         tab.refresh_syntax(&assets);
         assert_eq!(tab.syntax.as_deref(), Some("sentinel"));
         tab.buffer.set_path(PathBuf::from("notes.md"));

@@ -13,14 +13,14 @@ use eframe::egui;
 use crate::buffer::{Buffer, LineEnding};
 use crate::config::{self, ConfigPaths, Session, Settings, UiTheme};
 use crate::editing::{EditCommand, EditSettings};
-use crate::find_bar::{BarMode, FindBar, MatchDecorator};
+use crate::find_bar::{BarMode, FindBar};
 use crate::fonts::{self, FontCatalog, FontLoad, LoadedFont};
-use crate::highlight::{AssetsHandle, HighlightAssets, HighlightDecorator};
+use crate::highlight::{AssetsHandle, HighlightAssets};
 use crate::keymap::{Action, KeyChord, Keymap};
 use crate::markdown::{self, Preview};
 use crate::settings_ui::{SaveDebounce, SettingsEvent, SettingsWindow};
-use crate::spell::{SpellDecorator, SpellMode, SpellService, SpellStatus};
-use crate::tab::Tab;
+use crate::spell::{SpellService, SpellStatus};
+use crate::tab::{EditorEnv, Tab};
 use crate::view::{self, KeyHandler, ViewOptions};
 use crate::vim::{Mode, VimEffect, VimKey, VimState};
 use dialogs::Pending;
@@ -925,13 +925,7 @@ impl FedApp {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        let Some(range) = tab
-            .spell
-            .marks
-            .iter()
-            .find(|m| m.start >= clicked.start && m.end <= clicked.end)
-            .cloned()
-        else {
+        let Some(range) = tab.spell_mark_in(&clicked) else {
             return;
         };
         let word = tab.buffer.rope().slice(range.clone()).to_string();
@@ -1433,20 +1427,16 @@ impl eframe::App for FedApp {
             if self.loaded_assets.is_none() {
                 self.loaded_assets = self.assets.get();
             }
-            let assets = self.loaded_assets.as_deref();
-            if let Some(a) = assets {
-                tab.refresh_syntax(a);
-            }
-            let theme = if ui.visuals().dark_mode {
-                &self.settings.code_theme_dark
-            } else {
-                &self.settings.code_theme_light
+            let theme = match ui.visuals().dark_mode {
+                true => &self.settings.code_theme_dark,
+                false => &self.settings.code_theme_light,
             };
-            let syntax = tab.syntax.take().unwrap_or_default();
-            // Decorator state is moved out of the tab so the decorators do not borrow it.
-            let mut cache = std::mem::take(&mut tab.highlight);
-            let mut spell_cache = std::mem::take(&mut tab.spell);
-            let large = tab.buffer.is_large();
+            let env = EditorEnv {
+                assets: self.loaded_assets.as_ref(),
+                theme,
+                checker,
+                matches: &matches,
+            };
             let edit = opts.edit;
             let mut frame_ended = false;
             let mut route_to_vim = |ev: &egui::Event, tab: &mut Tab| {
@@ -1479,45 +1469,7 @@ impl eframe::App for FedApp {
                 true => Some(&mut route_to_vim),
                 false => None,
             };
-            // Plain text until the syntax regexes are compiled off the UI thread.
-            let warm = self
-                .loaded_assets
-                .as_ref()
-                .is_some_and(|a| a.ensure_warm(&syntax, tab.buffer.rope(), ui.ctx()));
-            let mut highlighted =
-                HighlightDecorator::new(&mut cache, assets, &syntax, theme, !large && warm);
-            let spell_checker = checker.filter(|_| !large);
-            let spell_active = spell_checker.is_some();
-            let out = match spell_checker {
-                Some(c) => {
-                    let mode = SpellMode::for_syntax(&syntax);
-                    let mut spell =
-                        SpellDecorator::new(&mut highlighted, c, mode, &mut spell_cache, ui.ctx());
-                    let mut deco = MatchDecorator::new(&mut spell, &matches);
-                    view::show_editor(ui, tab, &opts, &mut deco, key_handler)
-                }
-                None => {
-                    let mut deco = MatchDecorator::new(&mut highlighted, &matches);
-                    view::show_editor(ui, tab, &opts, &mut deco, key_handler)
-                }
-            };
-            if highlighted.is_incomplete() {
-                // Lines past the parse budget were drawn plain: continue next frame.
-                ui.ctx().request_repaint();
-            }
-            tab.highlight = cache;
-            tab.syntax = assets.map(|_| syntax);
-            if !spell_active {
-                // Nothing was checked: drop the marks so no stale suggestion popup opens.
-                spell_cache.marks.clear();
-            }
-            tab.spell = spell_cache;
-            if vim_mode && out.mouse_selected {
-                tab.vim.mouse_selection(&mut tab.buffer, &mut tab.editor);
-            }
-            if let Some(text) = out.clipboard {
-                ui.ctx().copy_text(text);
-            }
+            let out = tab.show_editor(ui, &opts, env, key_handler);
             if let Some((range, _)) = out.context_word {
                 context_click = ui.input(|i| i.pointer.latest_pos()).map(|pos| (pos, range));
             }
