@@ -16,7 +16,7 @@
 - [x] **Typing a find query rescans the whole document on the UI thread** - every change of the pattern (or of the case / regex toggles) misses the `MatchCache` and runs `search::find_all` over every line synchronously, so each keystroke in the find field on a 100 MB file stalls the UI for the full regex pass (only edits to the buffer are incremental). Search on a background thread with a rope snapshot (like `ProseRanges`), show the previous count while it runs, and cancel a stale search when the query changes again.
   - File(s): `src/find_bar.rs` (`matches_in`), `src/search.rs` (`find_all`)
 
-- [ ] **Word wrap re-measures every line on each width change** - `WrapCache::update` drops all heights when the wrap width changes, and `measure_line` builds a full galley for every line of the document; while the window or the preview panel is being resized this runs on every frame (hundreds of thousands of layouts for a file just below `LARGE_FILE_BYTES`). Measure only the lines near the viewport first and fill the rest lazily within a frame budget (estimating unmeasured lines as one row), as `HighlightCache` does with `FRAME_PARSE_BUDGET`.
+- [x] **Word wrap re-measures every line on each width change** - `WrapCache::update` drops all heights when the wrap width changes, and `measure_line` builds a full galley for every line of the document; while the window or the preview panel is being resized this runs on every frame (hundreds of thousands of layouts for a file just below `LARGE_FILE_BYTES`). Measure only the lines near the viewport first and fill the rest lazily within a frame budget (estimating unmeasured lines as one row), as `HighlightCache` does with `FRAME_PARSE_BUDGET`.
   - File(s): `src/view.rs` (`WrapCache`, `measure_line`)
 
 ## Medium

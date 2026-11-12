@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align2, CursorIcon, EventFilter, FontId, Galley, Key, Modifiers, Pos2, Rect, Sense,
@@ -29,6 +30,13 @@ const BLOCK_CARET_ALPHA: f32 = 0.6;
 const MIN_WRAP_WIDTH: f32 = 20.0;
 /// Extra horizontal room (in chars) kept right of the caret and the longest line.
 const SCROLL_MARGIN_CHARS: f32 = 2.0;
+/// Edits touching at most this many lines are measured at once in word wrap mode; bigger
+/// ones (and a new wrap width) start from estimates refined over the next frames.
+const EAGER_WRAP_LINES: usize = 256;
+/// Time a frame may spend measuring off-screen wrapped lines.
+const WRAP_FRAME_BUDGET: Duration = Duration::from_millis(4);
+/// Most passes made to measure the visible lines exactly (each may move the viewport lines).
+const VIEWPORT_SETTLE_PASSES: usize = 3;
 
 /// Options controlling how the editor widget renders and reacts to input.
 #[derive(Clone, Debug)]
@@ -182,15 +190,22 @@ struct LongestLine {
     line: usize,
 }
 
-/// Cached line geometry for word wrap mode.
+/// Cached line geometry for word wrap mode. Lines not measured yet count as one row
+/// (`estimate`) until `settle` and `fill` measure them.
 #[derive(Default)]
 struct WrapCache {
     /// Font, wrap width and tab width the heights were measured with.
     params: Option<(FontId, f32, usize)>,
     /// Buffer revision `heights` and `tops` were computed for.
     revision: Option<u64>,
-    /// Wrapped height of every line (one entry per buffer line).
+    /// Wrapped height of every line (one entry per buffer line), estimated when unmeasured.
     heights: Vec<f32>,
+    /// Whether each entry of `heights` was measured.
+    measured: Vec<bool>,
+    /// Number of `false` entries of `measured`.
+    unmeasured: usize,
+    /// Line where `fill` resumes looking for unmeasured lines.
+    fill_from: usize,
     /// Top of every line, plus the total height as the last element.
     tops: Vec<f32>,
 }
@@ -616,27 +631,42 @@ fn measure_line(
 }
 
 impl WrapCache {
-    /// Brings line heights and tops up to date with the buffer. Only lines edited since the
-    /// last update are measured again (all of them when the font, wrap width or tab width
-    /// changed), and tops are re-summed from the first edited line.
-    fn update(&mut self, ui: &Ui, buffer: &Buffer, m: &Metrics, width: f32) {
+    /// Brings line heights and tops up to date with the buffer and the viewport: lines edited
+    /// since the last update are re-measured (or estimated, for big edits and a changed font,
+    /// wrap width or tab width), the lines in `viewport` (content coordinates) are measured
+    /// exactly, and other unmeasured lines are measured for at most `WRAP_FRAME_BUDGET`.
+    /// Returns the vertical shift of the first visible line caused by lines measured above it
+    /// (scroll by it to keep the view still) and whether unmeasured lines remain.
+    fn update(
+        &mut self,
+        ui: &Ui,
+        buffer: &Buffer,
+        m: &Metrics,
+        width: f32,
+        viewport: Rect,
+    ) -> (f32, bool) {
         let params = (m.base.font_id.clone(), width, m.tab_width);
         if self.params.as_ref() != Some(&params) {
             self.params = Some(params);
             self.revision = None;
         }
-        if self.revision == Some(buffer.revision()) {
-            return;
-        }
         let rope = buffer.rope();
+        let deadline = Instant::now() + WRAP_FRAME_BUDGET;
         ui.ctx().fonts_mut(|fonts| {
-            self.refresh(buffer, |line| measure_line(fonts, rope, line, m, width));
-        });
+            let mut measure = |line| measure_line(fonts, rope, line, m, width);
+            self.refresh(buffer, m.row_height, &mut measure);
+            self.settle(viewport, &mut measure);
+            let first = line_at_y(&self.tops, viewport.min.y);
+            let before = self.tops[first];
+            let pending = self.fill(deadline, &mut measure);
+            (self.tops[first] - before, pending)
+        })
     }
 
     /// Re-measures the lines edited since `revision` with `measure` (every line when there
-    /// is no previous revision) and rebuilds `tops` from the first edited line.
-    fn refresh(&mut self, buffer: &Buffer, mut measure: impl FnMut(usize) -> f32) {
+    /// is no previous revision; more than `EAGER_WRAP_LINES` lines get `estimate` instead,
+    /// to be measured later) and rebuilds `tops` from the first edited line.
+    fn refresh(&mut self, buffer: &Buffer, estimate: f32, mut measure: impl FnMut(usize) -> f32) {
         if self.revision == Some(buffer.revision()) {
             return;
         }
@@ -661,19 +691,111 @@ impl WrapCache {
                 ..everything
             },
         };
-        let fresh: Vec<f32> = (dirty.start..dirty.end).map(&mut measure).collect();
+        let eager = dirty.end - dirty.start <= EAGER_WRAP_LINES;
+        let fresh: Vec<f32> = match eager {
+            true => (dirty.start..dirty.end).map(&mut measure).collect(),
+            false => vec![estimate; dirty.end - dirty.start],
+        };
+        let dropped = self.measured[dirty.start..dirty.old_end]
+            .iter()
+            .filter(|m| !**m)
+            .count();
+        self.unmeasured -= dropped;
+        if !eager {
+            self.unmeasured += fresh.len();
+        }
+        let flags = std::iter::repeat_n(eager, fresh.len());
+        self.measured.splice(dirty.start..dirty.old_end, flags);
         self.heights.splice(dirty.start..dirty.old_end, fresh);
-        self.tops.truncate(dirty.start);
-        let mut y = match dirty.start {
+        self.fill_from = self.fill_from.min(dirty.start);
+        self.retop(dirty.start);
+        self.revision = Some(buffer.revision());
+    }
+
+    /// Measures the unmeasured lines of `lines` and rebuilds `tops` when any height changed.
+    /// Returns true when something changed.
+    fn measure_lines(
+        &mut self,
+        lines: Range<usize>,
+        measure: &mut impl FnMut(usize) -> f32,
+    ) -> bool {
+        let mut first_changed = None;
+        for line in lines {
+            if self.measured[line] {
+                continue;
+            }
+            let height = measure(line);
+            self.measured[line] = true;
+            self.unmeasured -= 1;
+            if height != self.heights[line] {
+                self.heights[line] = height;
+                first_changed.get_or_insert(line);
+            }
+        }
+        let Some(first) = first_changed else {
+            return false;
+        };
+        self.retop(first);
+        true
+    }
+
+    /// Measures the lines shown in `viewport` (content coordinates) exactly. Measuring may
+    /// grow lines and push others out of the viewport, so this repeats a few times.
+    fn settle(&mut self, viewport: Rect, measure: &mut impl FnMut(usize) -> f32) {
+        if self.heights.is_empty() {
+            return;
+        }
+        for _ in 0..VIEWPORT_SETTLE_PASSES {
+            let first = line_at_y(&self.tops, viewport.min.y);
+            let last = line_at_y(&self.tops, viewport.max.y);
+            if !self.measure_lines(first..last + 1, measure) {
+                return;
+            }
+        }
+    }
+
+    /// Measures unmeasured lines, from `fill_from` on and then from the top, until
+    /// `deadline`. Returns true when some are still unmeasured.
+    fn fill(&mut self, deadline: Instant, measure: &mut impl FnMut(usize) -> f32) -> bool {
+        let lines = self.heights.len();
+        let mut first_changed = None;
+        let mut line = self.fill_from.min(lines);
+        let mut scanned = 0;
+        while self.unmeasured > 0 && scanned < lines && Instant::now() < deadline {
+            if line >= lines {
+                line = 0;
+            }
+            if !self.measured[line] {
+                let height = measure(line);
+                self.measured[line] = true;
+                self.unmeasured -= 1;
+                if height != self.heights[line] {
+                    self.heights[line] = height;
+                    first_changed = Some(first_changed.map_or(line, |f: usize| f.min(line)));
+                }
+            }
+            line += 1;
+            scanned += 1;
+        }
+        self.fill_from = line;
+        if let Some(first) = first_changed {
+            self.retop(first);
+        }
+        self.unmeasured > 0
+    }
+
+    /// Rebuilds `tops` from line `from` on.
+    fn retop(&mut self, from: usize) {
+        self.tops.truncate(from);
+        let mut y = match from {
             0 => 0.0,
             n => self.tops[n - 1] + self.heights[n - 1],
         };
-        for h in &self.heights[dirty.start..] {
+        for h in &self.heights[from..] {
             self.tops.push(y);
             y += h;
         }
         self.tops.push(y);
-        self.revision = Some(buffer.revision());
     }
 }
 
@@ -768,10 +890,18 @@ impl Frame<'_> {
             .then(|| (viewport.width() - text_x - TEXT_PAD).max(MIN_WRAP_WIDTH));
         let rows = match wrap_width {
             Some(width) => {
-                self.tab
-                    .view
-                    .wrap
-                    .update(ui, &self.tab.buffer, self.m, width);
+                let wrap = &mut self.tab.view.wrap;
+                let (shift, pending) = wrap.update(ui, &self.tab.buffer, self.m, width, viewport);
+                if shift != 0.0 {
+                    // Lines measured above the view grew it: keep the visible text still.
+                    ui.scroll_with_delta_animation(
+                        vec2(0.0, -shift),
+                        egui::style::ScrollAnimation::none(),
+                    );
+                }
+                if pending {
+                    ui.ctx().request_repaint();
+                }
                 // Borrowed for the frame (moved back at the end), never cloned.
                 RowMap::Wrapped(std::mem::take(&mut self.tab.view.wrap.tops))
             }
@@ -1149,10 +1279,13 @@ mod tests {
     const SHIFT: Modifiers = Modifiers::SHIFT;
     const CTRL: Modifiers = Modifiers::CTRL;
 
-    /// Builds a wrap cache for `buffer` where a line is as tall as its char count (min 1).
+    /// Builds a fully measured wrap cache for `buffer` where a line is as tall as its char
+    /// count (min 1).
     fn wrap_for(buffer: &Buffer) -> WrapCache {
         let mut wrap = WrapCache::default();
-        wrap.refresh(buffer, |i| height_of(buffer, i));
+        wrap.refresh(buffer, 1.0, |i| height_of(buffer, i));
+        let far = Instant::now() + Duration::from_secs(60);
+        assert!(!wrap.fill(far, &mut |i| height_of(buffer, i)));
         wrap
     }
 
@@ -1167,7 +1300,7 @@ mod tests {
         let mut wrap = wrap_for(&buffer);
         buffer.replace(3..3, "XX\nYYYYYYY\n");
         let mut measured = Vec::new();
-        wrap.refresh(&buffer, |i| {
+        wrap.refresh(&buffer, 1.0, |i| {
             measured.push(i);
             height_of(&buffer, i)
         });
@@ -1177,17 +1310,55 @@ mod tests {
         assert_eq!(wrap.tops, fresh.tops);
         // Deleting lines shrinks the cache too.
         buffer.replace(0..8, "");
-        wrap.refresh(&buffer, |i| height_of(&buffer, i));
+        wrap.refresh(&buffer, 1.0, |i| height_of(&buffer, i));
         let fresh = wrap_for(&buffer);
         assert_eq!(wrap.heights, fresh.heights);
         assert_eq!(wrap.tops, fresh.tops);
         // Unchanged revision: nothing is measured.
         let mut calls = 0;
-        wrap.refresh(&buffer, |_| {
+        wrap.refresh(&buffer, 1.0, |_| {
             calls += 1;
             1.0
         });
         assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn big_wrap_updates_measure_the_viewport_first_then_fill() {
+        let text: String = (0..1000)
+            .map(|i| format!("{}\n", "x".repeat(i % 7)))
+            .collect();
+        let buffer = Buffer::from_text(&text);
+        let lines = buffer.rope().len_lines();
+        let mut wrap = WrapCache::default();
+        let mut calls = 0;
+        wrap.refresh(&buffer, 1.0, |_| {
+            calls += 1;
+            1.0
+        });
+        assert_eq!(calls, 0, "a whole-buffer refresh only estimates");
+        assert_eq!(wrap.unmeasured, lines);
+        // Rows 10..20 of the content are visible.
+        let viewport = Rect::from_min_max(pos2(0.0, 10.0), pos2(100.0, 20.0));
+        let mut measured = Vec::new();
+        wrap.settle(viewport, &mut |i| {
+            measured.push(i);
+            height_of(&buffer, i)
+        });
+        assert!(
+            measured.contains(&10) && measured.len() < 40,
+            "{measured:?}"
+        );
+        let far = Instant::now() + Duration::from_secs(60);
+        assert!(!wrap.fill(far, &mut |i| height_of(&buffer, i)));
+        assert_eq!(wrap.unmeasured, 0);
+        let exact = wrap_for(&buffer);
+        assert_eq!(wrap.heights, exact.heights);
+        assert_eq!(wrap.tops, exact.tops);
+        // An expired budget measures nothing.
+        let mut wrap = WrapCache::default();
+        wrap.refresh(&buffer, 1.0, |_| 1.0);
+        assert!(wrap.fill(Instant::now(), &mut |_| 2.0));
     }
 
     #[test]
