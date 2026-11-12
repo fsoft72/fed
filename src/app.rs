@@ -120,15 +120,46 @@ fn code_theme(settings: &Settings, dark: bool) -> &str {
     }
 }
 
-/// Shows the native save dialog, starting from the buffer's current location.
-fn save_dialog(buffer: &Buffer) -> Option<PathBuf> {
-    let mut dialog = rfd::FileDialog::new().set_file_name(buffer.display_name());
-    if let Some(dir) = buffer.path().and_then(Path::parent)
-        && !dir.as_os_str().is_empty()
-    {
-        dialog = dialog.set_directory(dir);
+/// Directory of the file of `buffer`, where file dialogs start; `None` when untitled or
+/// when the path has no directory part.
+fn dialog_dir(buffer: &Buffer) -> Option<&Path> {
+    buffer
+        .path()
+        .and_then(Path::parent)
+        .filter(|dir| !dir.as_os_str().is_empty())
+}
+
+/// File dialogs used by the application, behind a trait so `FedApp` can be driven in tests
+/// without native windows.
+pub trait FileDialogs {
+    /// Asks for files to open, starting in `dir`; `None` when cancelled.
+    fn pick_files(&self, dir: Option<&Path>) -> Option<Vec<PathBuf>>;
+
+    /// Asks where to save a file named `name`, starting in `dir`; `None` when cancelled.
+    fn save_file(&self, dir: Option<&Path>, name: &str) -> Option<PathBuf>;
+}
+
+/// The native dialogs of the platform (rfd).
+pub struct NativeDialogs;
+
+impl FileDialogs for NativeDialogs {
+    /// Shows the native open dialog with multiple selection.
+    fn pick_files(&self, dir: Option<&Path>) -> Option<Vec<PathBuf>> {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = dir {
+            dialog = dialog.set_directory(dir);
+        }
+        dialog.pick_files()
     }
-    dialog.save_file()
+
+    /// Shows the native save dialog with `name` prefilled.
+    fn save_file(&self, dir: Option<&Path>, name: &str) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new().set_file_name(name);
+        if let Some(dir) = dir {
+            dialog = dialog.set_directory(dir);
+        }
+        dialog.save_file()
+    }
 }
 
 /// Result of a save attempt.
@@ -211,6 +242,8 @@ pub struct FedApp {
     settings_save: SaveDebounce,
     /// Process start time, while the first frame is still to be traced (`FED_TRACE_STARTUP`).
     startup_trace: Option<Instant>,
+    /// Open and save dialogs.
+    dialogs: Box<dyn FileDialogs>,
 }
 
 impl FedApp {
@@ -223,7 +256,21 @@ impl FedApp {
         files: Vec<PathBuf>,
         startup_trace: Option<Instant>,
     ) -> FedApp {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let paths = ConfigPaths::detect();
+        let dialogs = Box::new(NativeDialogs);
+        FedApp::with_deps(&cc.egui_ctx, files, startup_trace, paths, dialogs)
+    }
+
+    /// Creates the application like `new`, with explicit config locations (`None` runs
+    /// without persistence) and file dialogs, for tests and other hosts.
+    pub fn with_deps(
+        ctx: &egui::Context,
+        files: Vec<PathBuf>,
+        startup_trace: Option<Instant>,
+        paths: Option<ConfigPaths>,
+        dialogs: Box<dyn FileDialogs>,
+    ) -> FedApp {
         let (settings, mut problems) = match &paths {
             Some(p) => config::load_settings(p),
             None => (
@@ -233,7 +280,7 @@ impl FedApp {
         };
         let (keymap, key_warnings) = Keymap::from_overrides(&settings.keybindings);
         problems.extend(key_warnings);
-        let fonts = FontManager::new(&cc.egui_ctx, &settings);
+        let fonts = FontManager::new(ctx, &settings);
         let mut app = FedApp {
             tabs: Vec::new(),
             loads: Vec::new(),
@@ -246,7 +293,7 @@ impl FedApp {
             pending: None,
             applied_theme: None,
             find_bar: FindBar::new(),
-            assets: AssetsHandle::spawn(cc.egui_ctx.clone()),
+            assets: AssetsHandle::spawn(ctx.clone()),
             loaded_assets: None,
             spell: None,
             spell_menu: None,
@@ -258,11 +305,11 @@ impl FedApp {
             fonts,
             settings_save: SaveDebounce::default(),
             startup_trace,
+            dialogs,
         };
         app.vim_applied = app.settings.vim_mode;
-        egui_extras::install_image_loaders(&cc.egui_ctx);
-        app.apply_theme(&cc.egui_ctx);
-        app.ensure_spell(&cc.egui_ctx);
+        app.apply_theme(ctx);
+        app.ensure_spell(ctx);
         let files = if files.is_empty() && app.settings.restore_session {
             let (files, warnings) = app.session_files();
             problems.extend(warnings);
@@ -512,13 +559,8 @@ impl FedApp {
 
     /// Shows the native open dialog and opens every picked file.
     fn open_dialog(&mut self) {
-        let mut dialog = rfd::FileDialog::new();
-        if let Some(dir) = self.tabs[self.active].buffer.path().and_then(Path::parent)
-            && !dir.as_os_str().is_empty()
-        {
-            dialog = dialog.set_directory(dir);
-        }
-        let Some(files) = dialog.pick_files() else {
+        let dir = dialog_dir(&self.tabs[self.active].buffer);
+        let Some(files) = self.dialogs.pick_files(dir) else {
             return;
         };
         for path in files {
@@ -556,7 +598,8 @@ impl FedApp {
             return SaveOutcome::Cancelled;
         };
         tab.end_typing();
-        let Some(path) = save_dialog(&tab.buffer) else {
+        let name = tab.buffer.display_name();
+        let Some(path) = self.dialogs.save_file(dialog_dir(&tab.buffer), &name) else {
             return SaveOutcome::Cancelled;
         };
         let outcome = SaveOutcome::from_result(tab.buffer.save_as(path));
@@ -986,6 +1029,105 @@ mod tests {
             shortcut_action(&km, egui::Key::Tab, shifted),
             Some(Action::PrevTab)
         );
+    }
+
+    /// File dialogs answering with fixed results.
+    #[derive(Default)]
+    struct FakeDialogs {
+        /// Files returned by `pick_files`.
+        open: Option<Vec<PathBuf>>,
+        /// Path returned by `save_file`.
+        save: Option<PathBuf>,
+    }
+
+    impl FileDialogs for FakeDialogs {
+        fn pick_files(&self, _dir: Option<&Path>) -> Option<Vec<PathBuf>> {
+            self.open.clone()
+        }
+
+        fn save_file(&self, _dir: Option<&Path>, _name: &str) -> Option<PathBuf> {
+            self.save.clone()
+        }
+    }
+
+    /// Builds an application without config directory, opening `files`.
+    fn test_app(files: Vec<PathBuf>, dialogs: FakeDialogs) -> FedApp {
+        let ctx = egui::Context::default();
+        FedApp::with_deps(&ctx, files, None, None, Box::new(dialogs))
+    }
+
+    /// Creates a fresh temp directory for an app test.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fed-app-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn command_line_files_open_once_each() {
+        let dir = temp_dir("open");
+        let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+        std::fs::write(&a, "alpha").unwrap();
+        let mut app = test_app(vec![a.clone(), b.clone()], FakeDialogs::default());
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[0].buffer.text(), "alpha");
+        assert_eq!(
+            app.tabs[1].buffer.path(),
+            Some(b.as_path()),
+            "a missing file opens empty"
+        );
+        app.open_path(a);
+        assert_eq!(
+            app.tabs.len(),
+            2,
+            "an open file is activated, not opened again"
+        );
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn open_dialog_replaces_the_blank_tab() {
+        let dir = temp_dir("dialog");
+        let files = vec![dir.join("x.txt"), dir.join("y.txt")];
+        let dialogs = FakeDialogs {
+            open: Some(files.clone()),
+            save: None,
+        };
+        let mut app = test_app(Vec::new(), dialogs);
+        assert_eq!(app.tabs.len(), 1);
+        app.dispatch(&egui::Context::default(), Action::OpenFile);
+        let paths: Vec<_> = app.tabs.iter().map(|t| t.buffer.path().unwrap()).collect();
+        assert_eq!(
+            paths,
+            files.iter().map(PathBuf::as_path).collect::<Vec<_>>()
+        );
+        assert_eq!(app.active, 1);
+    }
+
+    #[test]
+    fn saving_an_untitled_tab_asks_for_a_path() {
+        let path = temp_dir("save").join("new.txt");
+        let dialogs = FakeDialogs {
+            open: None,
+            save: Some(path.clone()),
+        };
+        let mut app = test_app(Vec::new(), dialogs);
+        app.apply_to_active(EditCommand::InsertText("hello".into()));
+        app.dispatch(&egui::Context::default(), Action::Save);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        assert_eq!(app.tabs[0].buffer.path(), Some(path.as_path()));
+        assert!(!app.tabs[0].buffer.is_modified());
+        assert!(app.session_dirty, "the open files changed");
+    }
+
+    #[test]
+    fn cancelled_save_keeps_the_changes() {
+        let mut app = test_app(Vec::new(), FakeDialogs::default());
+        app.apply_to_active(EditCommand::InsertText("draft".into()));
+        assert_eq!(app.save_tab_outcome(0), SaveOutcome::Cancelled);
+        assert!(app.tabs[0].buffer.is_modified());
+        assert!(app.tabs[0].buffer.path().is_none());
     }
 
     #[test]
