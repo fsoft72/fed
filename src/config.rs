@@ -268,12 +268,25 @@ pub struct Session {
     pub files: Vec<PathBuf>,
 }
 
-/// Loads the session; any error yields an empty session.
-pub fn load_session(paths: &ConfigPaths) -> Session {
-    let Ok(text) = std::fs::read_to_string(paths.session_file()) else {
-        return Session::default();
+/// Loads the session. A missing file is an empty session; a file that cannot be read or
+/// parsed is an empty session plus a warning, like `load_settings`.
+pub fn load_session(paths: &ConfigPaths) -> (Session, Vec<String>) {
+    let file = paths.session_file();
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return (Session::default(), Vec::new()),
+        Err(e) => {
+            let warning = format!("cannot read session file {}: {e}", file.display());
+            return (Session::default(), vec![warning]);
+        }
     };
-    toml::from_str(&text).unwrap_or_default()
+    match toml::from_str(&text) {
+        Ok(session) => (session, Vec::new()),
+        Err(e) => {
+            let warning = format!("session file {} is invalid, ignored: {e}", file.display());
+            (Session::default(), vec![warning])
+        }
+    }
 }
 
 /// Writes the session to disk, creating the config directory if needed.
@@ -370,12 +383,29 @@ mod tests {
     #[test]
     fn session_roundtrip() {
         let paths = ConfigPaths::new(temp_dir("session"));
-        assert!(load_session(&paths).files.is_empty());
+        assert_eq!(load_session(&paths), (Session::default(), Vec::new()));
         let session = Session {
             files: vec![PathBuf::from("/a/b.txt"), PathBuf::from("c.md")],
         };
         save_session(&paths, &session).unwrap();
-        assert_eq!(load_session(&paths), session);
+        assert_eq!(load_session(&paths), (session, Vec::new()));
+        let _ = std::fs::remove_dir_all(&paths.dir);
+    }
+
+    #[test]
+    fn broken_session_file_warns() {
+        let paths = ConfigPaths::new(temp_dir("session-broken"));
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(paths.session_file(), "files = = [").unwrap();
+        let (session, warnings) = load_session(&paths);
+        assert_eq!(session, Session::default());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("invalid"), "{warnings:?}");
+        // A directory in place of the file cannot be read.
+        std::fs::remove_file(paths.session_file()).unwrap();
+        std::fs::create_dir_all(paths.session_file()).unwrap();
+        let (_, warnings) = load_session(&paths);
+        assert!(warnings[0].contains("cannot read"), "{warnings:?}");
         let _ = std::fs::remove_dir_all(&paths.dir);
     }
 

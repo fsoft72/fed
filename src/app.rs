@@ -150,6 +150,8 @@ pub struct FedApp {
     tabs: Vec<Tab>,
     /// Big files being read on background threads; each becomes a tab when done.
     loads: Vec<LoadJob>,
+    /// The open files changed since the session was last written.
+    session_dirty: bool,
     /// Index of the tab shown in the editor area.
     active: usize,
     /// Editor settings.
@@ -216,6 +218,7 @@ impl FedApp {
         let mut app = FedApp {
             tabs: Vec::new(),
             loads: Vec::new(),
+            session_dirty: false,
             active: 0,
             settings,
             keymap,
@@ -241,14 +244,16 @@ impl FedApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         app.apply_theme(&cc.egui_ctx);
         app.ensure_spell(&cc.egui_ctx);
-        if !problems.is_empty() {
-            app.set_status(problems.join("; "), Severity::Warning);
-        }
         let files = if files.is_empty() && app.settings.restore_session {
-            app.session_files()
+            let (files, warnings) = app.session_files();
+            problems.extend(warnings);
+            files
         } else {
             files
         };
+        if !problems.is_empty() {
+            app.set_status(problems.join("; "), Severity::Warning);
+        }
         let errors: Vec<String> = files
             .into_iter()
             .filter_map(|path| app.try_open(path).err())
@@ -349,6 +354,7 @@ impl FedApp {
     /// Shows `tab` as the active tab, replacing the active tab when it is blank.
     fn insert_tab(&mut self, tab: Tab) {
         self.leave_active();
+        self.session_dirty = true;
         match self.tabs.get(self.active) {
             Some(current) if is_blank(current) => self.tabs[self.active] = tab,
             _ => {
@@ -379,32 +385,43 @@ impl FedApp {
         }
     }
 
-    /// Files of the previous session that still exist.
-    fn session_files(&self) -> Vec<PathBuf> {
+    /// Files of the previous session that still exist, plus warnings about a session file
+    /// that could not be read.
+    fn session_files(&self) -> (Vec<PathBuf>, Vec<String>) {
         let Some(paths) = &self.paths else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        config::load_session(paths)
-            .files
-            .into_iter()
-            .filter(|p| p.exists())
-            .collect()
+        let (session, warnings) = config::load_session(paths);
+        let files = session.files.into_iter().filter(|p| p.exists()).collect();
+        (files, warnings)
     }
 
     /// Writes the open file paths as the session, when session restore is on.
-    fn save_session(&self) {
+    fn save_session(&self) -> Result<(), String> {
         if !self.settings.restore_session {
-            return;
+            return Ok(());
         }
-        let Some(paths) = &self.paths else { return };
+        let Some(paths) = &self.paths else {
+            return Ok(());
+        };
         let files = self
             .tabs
             .iter()
             .filter_map(|t| t.buffer.path())
             .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()))
             .collect();
-        if let Err(e) = config::save_session(paths, &Session { files }) {
-            eprintln!("fed: cannot save session to {}: {e}", paths.dir.display());
+        config::save_session(paths, &Session { files })
+            .map_err(|e| format!("cannot save session to {}: {e}", paths.dir.display()))
+    }
+
+    /// Saves the session when the set of open files changed this frame, so a failure shows
+    /// up in the status bar while the editor runs instead of only at exit.
+    fn sync_session(&mut self) {
+        if !std::mem::take(&mut self.session_dirty) {
+            return;
+        }
+        if let Err(e) = self.save_session() {
+            self.set_status(e, Severity::Error);
         }
     }
 
@@ -523,7 +540,10 @@ impl FedApp {
         let Some(path) = save_dialog(&tab.buffer) else {
             return SaveOutcome::Cancelled;
         };
-        SaveOutcome::from_result(tab.buffer.save_as(path))
+        let outcome = SaveOutcome::from_result(tab.buffer.save_as(path));
+        // The tab may have a new path.
+        self.session_dirty |= outcome == SaveOutcome::Saved;
+        outcome
     }
 
     /// Shows the outcome of saving the tab at `idx` in the status bar; returns true when the
@@ -853,6 +873,7 @@ impl eframe::App for FedApp {
         self.show_about(&ctx);
         self.show_dialogs(&ctx);
         self.flush_settings_save(&ctx);
+        self.sync_session();
         self.open_links(&ctx);
         self.trace_first_frame();
     }
@@ -862,7 +883,10 @@ impl eframe::App for FedApp {
         if self.settings_save.is_pending() {
             self.save_settings();
         }
-        self.save_session();
+        // The window is closing: stderr is the only place left to report to.
+        if let Err(e) = self.save_session() {
+            eprintln!("fed: {e}");
+        }
     }
 }
 

@@ -129,6 +129,7 @@ impl FedApp {
             return;
         }
         self.tabs.remove(idx);
+        self.session_dirty = true;
         if self.active > idx || self.active >= self.tabs.len() {
             self.active -= 1;
         }

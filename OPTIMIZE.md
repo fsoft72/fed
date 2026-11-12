@@ -46,7 +46,7 @@
   - File(s): `src/vim/normal.rs`
 - [x] **Typing undo groups never close on their own** - `Tab::apply` keeps one undo group open for all consecutive `InsertText`, so minutes of typing undo in one step; close the group on a pause or a newline. `Buffer::undo` / `redo` / `save` also do not assert that no group is open.
   - File(s): `src/tab.rs`, `src/buffer.rs`
-- [ ] **Session errors swallowed** - `config::load_session` turns read and parse errors into an empty session silently, and `FedApp::save_session` only writes failures to stderr; surface both like `load_settings` does.
+- [x] **Session errors swallowed** - `config::load_session` turns read and parse errors into an empty session silently, and `FedApp::save_session` only writes failures to stderr; surface both like `load_settings` does.
   - File(s): `src/config.rs`, `src/app.rs`
 - [ ] **`:s` reads every line twice** - `substitute_lines` copies every line of the range into a `String` just to find the last matching one, then `search::substitute` reads and allocates them again; let `substitute` return the last changed line.
   - File(s): `src/vim/cmdline.rs`, `src/search.rs`
