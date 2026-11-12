@@ -153,8 +153,6 @@ pub struct VimState {
     group_open: bool,
     /// The caret line holds only indentation inserted automatically (removed on Esc).
     auto_indent: bool,
-    /// First and last line (0-based) of the last Visual selection, for `'<` and `'>`.
-    last_visual: Option<(usize, usize)>,
 }
 
 impl Default for VimState {
@@ -177,7 +175,6 @@ impl VimState {
             recording: None,
             group_open: false,
             auto_indent: false,
-            last_visual: None,
         }
     }
 
@@ -194,11 +191,6 @@ impl VimState {
     /// Returns the pending normal-mode keys (e.g. `"2d"`).
     pub fn pending(&self) -> &str {
         &self.pending_text
-    }
-
-    /// Returns the first and last line (0-based) of the last Visual selection.
-    pub fn visual_marks(&self) -> Option<(usize, usize)> {
-        self.last_visual
     }
 
     /// Closes the undo group of an Insert session (before saving, switching tabs or editing
@@ -291,7 +283,7 @@ impl VimState {
         ed: &mut EditorState,
     ) -> Vec<VimEffect> {
         match cmdline::parse(line) {
-            Ok(cmd) => cmdline::execute(cmd, buf, ed, self.last_visual),
+            Ok(cmd) => cmdline::execute(cmd, buf, ed),
             Err(e) => vec![VimEffect::Error(e)],
         }
     }
@@ -334,7 +326,11 @@ impl VimState {
             let rope = env.buf.rope();
             let (first, last) = match range {
                 OpRange::Lines(a, b) => (a, b),
-                OpRange::Chars(r) => (rope.char_to_line(r.start), rope.char_to_line(r.end)),
+                // The end is exclusive: a range ending on a line break stays on its line.
+                OpRange::Chars(r) => (
+                    rope.char_to_line(r.start),
+                    rope.char_to_line(r.end.saturating_sub(1).max(r.start)),
+                ),
             };
             shift_lines(env, first, last, op == Operator::Outdent);
             let start = env.buf.rope().line_to_char(first);
@@ -560,6 +556,7 @@ impl VimState {
             }
         };
         let sel_start = env.ed.selection.range().start;
+        let replay = visual_replay_keys(self.mode, env.buf.rope(), env.ed.selection, c);
         self.leave_visual(env);
         if op != Operator::Yank {
             self.begin_change(env.buf);
@@ -570,6 +567,14 @@ impl VimState {
         });
         self.apply_operator(op, range, env);
         env.ed.preferred_col = None;
+        if op != Operator::Yank {
+            // `.` reselects the same extent from the caret and applies the operator again;
+            // a Change records the typed text after it until Esc.
+            match self.mode {
+                Mode::Insert => self.recording = Some(replay),
+                _ => self.last_change = replay,
+            }
+        }
         if self.mode != Mode::Insert {
             self.end_change(env.buf);
             let p = clamp_normal(env.buf.rope(), env.pos());
@@ -577,18 +582,13 @@ impl VimState {
         }
     }
 
-    /// Returns to Normal mode, recording the selection in marks `<` and `>`.
+    /// Returns to Normal mode, recording the selection in marks `<` and `>` (buffer marks,
+    /// so they follow later edits; `:'<,'>` reads them).
     fn leave_visual(&mut self, env: &mut Env) {
         let sel = env.ed.selection;
         let (first, last) = (sel.anchor.min(sel.head), sel.anchor.max(sel.head));
         env.buf.set_mark('<', first);
         env.buf.set_mark('>', last);
-        let rope = env.buf.rope();
-        let len = rope.len_chars();
-        self.last_visual = Some((
-            rope.char_to_line(first.min(len)),
-            rope.char_to_line(last.min(len)),
-        ));
         self.mode = Mode::Normal;
         let p = clamp_normal(env.buf.rope(), sel.head);
         env.set_caret(p);
@@ -655,6 +655,51 @@ impl VimState {
             env.set_caret(r.pos);
         }
     }
+}
+
+/// Returns the keys of `count` typed in front of `key` (just `key` when `count` is 0).
+fn counted(count: usize, key: char) -> Vec<VimKey> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut keys: Vec<VimKey> = match count {
+        1 => Vec::new(),
+        n => n.to_string().chars().map(VimKey::Char).collect(),
+    };
+    keys.push(VimKey::Char(key));
+    keys
+}
+
+/// Returns the keys that repeat the Visual operator `op` on a selection like `sel` (in
+/// `mode`) from the caret, for `.`: the same number of lines, and for a charwise selection
+/// the same end column (or the line break) on its last line, like vim.
+fn visual_replay_keys(mode: Mode, rope: &Rope, sel: Selection, op: char) -> Vec<VimKey> {
+    let len = rope.len_chars();
+    let (start, end) = (
+        sel.anchor.min(sel.head).min(len),
+        sel.anchor.max(sel.head).min(len),
+    );
+    let (first, last) = (rope.char_to_line(start), rope.char_to_line(end));
+    let mut keys = Vec::new();
+    if mode == Mode::VisualLine {
+        keys.push(VimKey::Char('V'));
+        keys.extend(counted(last - first, 'j'));
+    } else {
+        keys.push(VimKey::Char('v'));
+        keys.extend(counted(last - first, 'j'));
+        let on_break = end < len && rope.char(end) == '\n';
+        let end_col = end - rope.line_to_char(last);
+        match (on_break, last == first) {
+            (true, _) => keys.push(VimKey::Char('$')),
+            (false, true) => keys.extend(counted(end - start, 'l')),
+            (false, false) => {
+                keys.push(VimKey::Char('0'));
+                keys.extend(counted(end_col, 'l'));
+            }
+        }
+    }
+    keys.push(VimKey::Char(op));
+    keys
 }
 
 /// Renders pending keys for the status bar.

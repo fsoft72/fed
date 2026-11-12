@@ -248,20 +248,18 @@ fn split_part(input: &str, delim: char) -> (String, Option<&str>) {
     (part, None)
 }
 
-/// Resolves `range` to 0-based, end-exclusive lines. `None` is the caret line; `'<` and `'>`
-/// use `visual_marks` (first and last line of the last Visual selection), other marks use
-/// the buffer marks.
+/// Resolves `range` to 0-based, end-exclusive lines. `None` is the caret line; marks
+/// (including `'<` and `'>`, set when Visual mode ends) are buffer marks, which follow edits.
 pub fn resolve_range(
     range: Option<LineRange>,
     buf: &Buffer,
     cursor_line: usize,
-    visual_marks: Option<(usize, usize)>,
 ) -> Result<Range<usize>, String> {
     let Some(range) = range else {
         return Ok(cursor_line..cursor_line + 1);
     };
-    let start = resolve_address(range.start, buf, cursor_line, visual_marks)?;
-    let end = resolve_address(range.end, buf, cursor_line, visual_marks)?;
+    let start = resolve_address(range.start, buf, cursor_line)?;
+    let end = resolve_address(range.end, buf, cursor_line)?;
     if start > end {
         return Err(BACKWARDS_RANGE.to_string());
     }
@@ -269,12 +267,7 @@ pub fn resolve_range(
 }
 
 /// Resolves one address to a 0-based line.
-fn resolve_address(
-    addr: Address,
-    buf: &Buffer,
-    cursor_line: usize,
-    visual_marks: Option<(usize, usize)>,
-) -> Result<usize, String> {
+fn resolve_address(addr: Address, buf: &Buffer, cursor_line: usize) -> Result<usize, String> {
     let rope = buf.rope();
     let last = last_line(rope);
     match addr {
@@ -282,10 +275,6 @@ fn resolve_address(
         Address::Line(n) => Ok(n.saturating_sub(1)),
         Address::Current => Ok(cursor_line.min(last)),
         Address::Last => Ok(last),
-        Address::Mark(c @ ('<' | '>')) => {
-            let (first, end) = visual_marks.ok_or_else(|| MARK_NOT_SET.to_string())?;
-            Ok(if c == '<' { first } else { end }.min(last))
-        }
         Address::Mark(c) => {
             let pos = buf.mark(c).ok_or_else(|| MARK_NOT_SET.to_string())?;
             Ok(rope.char_to_line(pos.min(rope.len_chars())).min(last))
@@ -294,12 +283,7 @@ fn resolve_address(
 }
 
 /// Executes `cmd` on the buffer; file and tab commands become effects for the UI.
-pub fn execute(
-    cmd: ExCommand,
-    buf: &mut Buffer,
-    ed: &mut EditorState,
-    visual_marks: Option<(usize, usize)>,
-) -> Vec<VimEffect> {
+pub fn execute(cmd: ExCommand, buf: &mut Buffer, ed: &mut EditorState) -> Vec<VimEffect> {
     let head = ed.selection.head.min(buf.rope().len_chars());
     let cursor_line = buf.rope().char_to_line(head);
     match cmd {
@@ -316,7 +300,7 @@ pub fn execute(
                 Address::Line(n) => Address::Line(n.clamp(1, last_line(buf.rope()) + 1)),
                 other => other,
             };
-            match resolve_address(addr, buf, cursor_line, visual_marks) {
+            match resolve_address(addr, buf, cursor_line) {
                 Ok(line) => {
                     caret_to_first_non_blank(buf, ed, line);
                     Vec::new()
@@ -331,7 +315,7 @@ pub fn execute(
             global,
             ignore_case,
         } => {
-            let lines = match resolve_range(range, buf, cursor_line, visual_marks) {
+            let lines = match resolve_range(range, buf, cursor_line) {
                 Ok(lines) => lines,
                 Err(e) => return vec![VimEffect::Error(e)],
             };
@@ -540,17 +524,20 @@ mod tests {
         let buf = Buffer::from_text("a\nb\nc\n");
         let range = lr(Address::Line(3), Address::Line(1));
         assert_eq!(
-            resolve_range(range, &buf, 0, None),
+            resolve_range(range, &buf, 0),
             Err("backwards range".to_string())
         );
-        assert_eq!(resolve_range(None, &buf, 1, None), Ok(1..2));
+        assert_eq!(resolve_range(None, &buf, 1), Ok(1..2));
         let all = lr(Address::Line(1), Address::Last);
-        assert_eq!(resolve_range(all, &buf, 0, None), Ok(0..3));
+        assert_eq!(resolve_range(all, &buf, 0), Ok(0..3));
         let visual = lr(Address::Mark('<'), Address::Mark('>'));
-        assert_eq!(resolve_range(visual, &buf, 0, Some((1, 2))), Ok(1..3));
-        assert!(resolve_range(visual, &buf, 0, None).is_err());
+        assert!(resolve_range(visual, &buf, 0).is_err(), "marks not set yet");
+        let mut buf = buf;
+        buf.set_mark('<', 2);
+        buf.set_mark('>', 4);
+        assert_eq!(resolve_range(visual, &buf, 0), Ok(1..3));
         let too_far = lr(Address::Line(1), Address::Line(9));
-        assert!(resolve_range(too_far, &buf, 0, None).is_err());
+        assert!(resolve_range(too_far, &buf, 0).is_err());
     }
 
     #[test]
@@ -558,9 +545,9 @@ mod tests {
         let mut buf = Buffer::from_text("a\nb\nc\n");
         buf.set_mark('a', 2);
         let range = lr(Address::Mark('a'), Address::Last);
-        assert_eq!(resolve_range(range, &buf, 0, None), Ok(1..3));
+        assert_eq!(resolve_range(range, &buf, 0), Ok(1..3));
         let missing = lr(Address::Mark('b'), Address::Last);
-        assert!(resolve_range(missing, &buf, 0, None).is_err());
+        assert!(resolve_range(missing, &buf, 0).is_err());
     }
 
     #[test]
@@ -568,7 +555,7 @@ mod tests {
         let mut buf = Buffer::from_text("abc\n");
         let mut ed = EditorState::default();
         let cmd = parse("s/(/x/").unwrap();
-        let fx = execute(cmd, &mut buf, &mut ed, None);
+        let fx = execute(cmd, &mut buf, &mut ed);
         assert!(matches!(&fx[..], [VimEffect::Error(e)] if e.contains("invalid pattern")));
         assert_eq!(buf.text(), "abc\n");
     }
@@ -577,7 +564,7 @@ mod tests {
     fn execute_substitute_reports_count() {
         let mut buf = Buffer::from_text("aaa x\nbbb\naaa aaa\n");
         let mut ed = EditorState::default();
-        let fx = execute(parse("1,$s/aaa/bbb/").unwrap(), &mut buf, &mut ed, None);
+        let fx = execute(parse("1,$s/aaa/bbb/").unwrap(), &mut buf, &mut ed);
         assert_eq!(fx, vec![VimEffect::Message("2 substitutions".into())]);
         assert_eq!(buf.text(), "bbb x\nbbb\nbbb aaa\n");
         assert_eq!(
@@ -588,10 +575,10 @@ mod tests {
         assert!(buf.undo().is_some(), "one undo step");
         assert_eq!(buf.text(), "aaa x\nbbb\naaa aaa\n");
 
-        let fx = execute(parse("%s/a/y/g").unwrap(), &mut buf, &mut ed, None);
+        let fx = execute(parse("%s/a/y/g").unwrap(), &mut buf, &mut ed);
         assert_eq!(fx, vec![VimEffect::Message("9 substitutions".into())]);
 
-        let fx = execute(parse("s/zzz/q/").unwrap(), &mut buf, &mut ed, None);
+        let fx = execute(parse("s/zzz/q/").unwrap(), &mut buf, &mut ed);
         assert_eq!(fx, vec![VimEffect::Error("pattern not found: zzz".into())]);
     }
 
@@ -599,11 +586,11 @@ mod tests {
     fn execute_goto_moves_to_first_non_blank() {
         let mut buf = Buffer::from_text("a\n  b\nc\n");
         let mut ed = EditorState::default();
-        assert!(execute(parse("2").unwrap(), &mut buf, &mut ed, None).is_empty());
+        assert!(execute(parse("2").unwrap(), &mut buf, &mut ed).is_empty());
         assert_eq!(ed.selection, Selection::caret(4));
-        execute(parse("99").unwrap(), &mut buf, &mut ed, None);
+        execute(parse("99").unwrap(), &mut buf, &mut ed);
         assert_eq!(ed.selection, Selection::caret(6));
-        execute(parse("0").unwrap(), &mut buf, &mut ed, None);
+        execute(parse("0").unwrap(), &mut buf, &mut ed);
         assert_eq!(ed.selection, Selection::caret(0));
     }
 
@@ -611,10 +598,10 @@ mod tests {
     fn exit_writes_only_when_modified() {
         let mut buf = Buffer::from_text("a\n");
         let mut ed = EditorState::default();
-        let fx = execute(ExCommand::Exit, &mut buf, &mut ed, None);
+        let fx = execute(ExCommand::Exit, &mut buf, &mut ed);
         assert_eq!(fx, vec![VimEffect::Quit { force: false }]);
         buf.replace(0..0, "x");
-        let fx = execute(ExCommand::Exit, &mut buf, &mut ed, None);
+        let fx = execute(ExCommand::Exit, &mut buf, &mut ed);
         assert_eq!(fx, vec![VimEffect::WriteQuit]);
     }
 
@@ -624,7 +611,7 @@ mod tests {
         buf.replace(0..0, "x");
         assert!(buf.is_modified());
         let mut ed = EditorState::default();
-        let fx = execute(parse("q").unwrap(), &mut buf, &mut ed, None);
+        let fx = execute(parse("q").unwrap(), &mut buf, &mut ed);
         assert_eq!(fx, vec![VimEffect::Quit { force: false }]);
     }
 }

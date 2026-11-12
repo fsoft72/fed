@@ -527,7 +527,57 @@ fn ex_visual_range_uses_last_selection() {
     let mut h = Harness::new("a\na\na\na\n", 2);
     h.feed("Vj:s/a/b/<CR>");
     assert_eq!(h.buf.text(), "a\nb\nb\na\n");
-    assert_eq!(h.vim.visual_marks(), Some((1, 2)));
+    assert_eq!((h.buf.mark('<'), h.buf.mark('>')), (Some(2), Some(4)));
+}
+
+#[test]
+fn ex_visual_range_follows_edits_made_after_the_selection() {
+    let mut h = Harness::new("a\na\na\na\n", 2);
+    h.feed("Vj<Esc>ggOx<Esc>");
+    assert_eq!(h.buf.text(), "x\na\na\na\na\n");
+    h.feed(":'<,'>s/a/b/<CR>");
+    assert_eq!(h.buf.text(), "x\na\nb\nb\na\n");
+}
+
+#[test]
+fn visual_shift_ending_on_a_line_break_stays_on_its_line() {
+    let mut h = Harness::new("a\nb\n", 0);
+    h.feed("v$>");
+    assert_eq!(h.buf.text(), "    a\nb\n");
+    let mut h = Harness::new("a\n\nb\n", 2);
+    h.feed("v>");
+    assert_eq!(h.buf.text(), "a\n\nb\n");
+    let mut h = Harness::new("    a\n    b\n", 4);
+    h.feed("v$<");
+    assert_eq!(h.buf.text(), "a\n    b\n");
+}
+
+#[test]
+fn dot_repeats_visual_operators() {
+    let mut h = Harness::new("abc\ndef\nghi\njkl\n", 0);
+    h.feed("vjd");
+    assert_eq!(h.buf.text(), "ef\nghi\njkl\n");
+    h.feed(".");
+    assert_eq!(h.buf.text(), "hi\njkl\n");
+
+    let mut h = Harness::new("1\n2\n3\n4\n5\n", 0);
+    h.feed("Vjd");
+    assert_eq!(h.buf.text(), "3\n4\n5\n");
+    h.feed(".");
+    assert_eq!(h.buf.text(), "5\n");
+
+    let mut h = Harness::new("abcdef", 0);
+    h.feed("vlcX<Esc>");
+    assert_eq!(h.buf.text(), "Xcdef");
+    h.feed("l.");
+    assert_eq!(h.buf.text(), "XXef");
+
+    let mut h = Harness::new("a\nb\nc\n", 0);
+    h.feed("V>j.");
+    assert_eq!(h.buf.text(), "    a\n    b\nc\n");
+    // A yank is not a change: `.` still repeats the last change.
+    h.feed("vy.");
+    assert_eq!(h.buf.text(), "    a\n        b\nc\n");
 }
 
 #[test]

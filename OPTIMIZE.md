@@ -36,11 +36,11 @@
   - File(s): `src/fonts.rs`, `src/app.rs`
 - [x] **Find bar recompiles regexes every frame** - `FindBar::matches` (called every frame from `FedApp::ui`) only caches on successful compilation, so an invalid pattern is recompiled each frame; `step` and `replace_current` also compile twice on a cache miss. Cache the compile result (including the error) keyed by the query.
   - File(s): `src/find_bar.rs`
-- [ ] **Visual `>`/`<` shifts one line too many** - `apply_operator` maps `OpRange::Chars(r)` to lines with `char_to_line(r.end)` on an exclusive end, so a selection ending on `\n` (`v$>`, `v>` on an empty line) also indents the next line.
+- [x] **Visual `>`/`<` shifts one line too many** - `apply_operator` maps `OpRange::Chars(r)` to lines with `char_to_line(r.end)` on an exclusive end, so a selection ending on `\n` (`v$>`, `v>` on an empty line) also indents the next line.
   - File(s): `src/vim/mod.rs`
-- [ ] **Visual-mode changes are not repeatable with `.`** - `visual_operator` never sets `last_change` / `recording`, so `.` after `vjd` replays an older Normal-mode change; add tests for it.
+- [x] **Visual-mode changes are not repeatable with `.`** - `visual_operator` never sets `last_change` / `recording`, so `.` after `vjd` replays an older Normal-mode change; add tests for it.
   - File(s): `src/vim/mod.rs`, `src/vim/tests.rs`
-- [ ] **`:'<,'>` uses stale line numbers** - `leave_visual` stores both buffer marks `<`/`>` (which follow edits) and `last_visual` line numbers (which do not), and only `last_visual` is read by the command line; resolve the range from the marks and drop the duplicate state.
+- [x] **`:'<,'>` uses stale line numbers** - `leave_visual` stores both buffer marks `<`/`>` (which follow edits) and `last_visual` line numbers (which do not), and only `last_visual` is read by the command line; resolve the range from the marks and drop the duplicate state.
   - File(s): `src/vim/mod.rs`, `src/vim/cmdline.rs`
 - [ ] **Huge paste counts can abort the process** - `put` builds `register.text.repeat(count)` with counts up to 99,999, which can try to allocate gigabytes for a large register; cap the resulting size and report an error.
   - File(s): `src/vim/normal.rs`
