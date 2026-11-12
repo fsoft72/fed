@@ -1,21 +1,25 @@
 //! Custom editor widget: renders a `Tab` and translates egui input into `EditCommand`s.
 
+mod keys;
+mod wrap;
+
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align2, CursorIcon, EventFilter, FontId, Galley, Key, Modifiers, Pos2, Rect, Sense,
-    TextFormat, Ui, epaint::text::cursor::CCursor, pos2, text::LayoutJob, vec2,
+    self, Align2, CursorIcon, EventFilter, FontId, Galley, Pos2, Rect, Sense, TextFormat, Ui,
+    epaint::text::cursor::CCursor, pos2, text::LayoutJob, vec2,
 };
-use ropey::Rope;
 
-use crate::buffer::{Buffer, DirtyLines};
+use crate::buffer::Buffer;
 use crate::editing::{EditCommand, EditSettings};
 use crate::highlight::StyledSpan;
 use crate::tab::Tab;
 use crate::text_nav::{self, CharClass};
 use crate::vim::Mode;
+use keys::handle_keyboard;
+pub use keys::key_to_command;
+use wrap::{LongestLine, RowMap, WrapCache, longest_line};
 
 /// Horizontal padding on each side of the line numbers.
 const GUTTER_PAD: f32 = 8.0;
@@ -31,13 +35,6 @@ const BLOCK_CARET_ALPHA: f32 = 0.6;
 const MIN_WRAP_WIDTH: f32 = 20.0;
 /// Extra horizontal room (in chars) kept right of the caret and the longest line.
 const SCROLL_MARGIN_CHARS: f32 = 2.0;
-/// Edits touching at most this many lines are measured at once in word wrap mode; bigger
-/// ones (and a new wrap width) start from estimates refined over the next frames.
-const EAGER_WRAP_LINES: usize = 256;
-/// Time a frame may spend measuring off-screen wrapped lines.
-const WRAP_FRAME_BUDGET: Duration = Duration::from_millis(4);
-/// Most passes made to measure the visible lines exactly (each may move the viewport lines).
-const VIEWPORT_SETTLE_PASSES: usize = 3;
 
 /// Options controlling how the editor widget renders and reacts to input.
 #[derive(Clone, Debug)]
@@ -179,39 +176,6 @@ impl ViewState {
     }
 }
 
-/// The longest line of a buffer revision (no word wrap).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LongestLine {
-    /// Buffer revision it was computed for.
-    revision: u64,
-    /// Tab width used to measure.
-    tab_width: usize,
-    /// Display width in columns (tabs expanded).
-    cols: usize,
-    /// Index of the longest line.
-    line: usize,
-}
-
-/// Cached line geometry for word wrap mode. Lines not measured yet count as one row
-/// (`estimate`) until `settle` and `fill` measure them.
-#[derive(Default)]
-struct WrapCache {
-    /// Font, wrap width and tab width the heights were measured with.
-    params: Option<(FontId, f32, usize)>,
-    /// Buffer revision `heights` and `tops` were computed for.
-    revision: Option<u64>,
-    /// Wrapped height of every line (one entry per buffer line), estimated when unmeasured.
-    heights: Vec<f32>,
-    /// Whether each entry of `heights` was measured.
-    measured: Vec<bool>,
-    /// Number of `false` entries of `measured`.
-    unmeasured: usize,
-    /// Line where `fill` resumes looking for unmeasured lines.
-    fill_from: usize,
-    /// Top of every line, plus the total height as the last element.
-    tops: Vec<f32>,
-}
-
 /// Font and layout measurements for one frame.
 struct Metrics {
     /// Height of one text row.
@@ -258,43 +222,6 @@ impl Metrics {
     /// X offset of the text from the content left edge.
     fn text_x(&self) -> f32 {
         self.gutter_width + TEXT_PAD
-    }
-}
-
-/// Vertical placement of lines in content coordinates.
-enum RowMap {
-    /// Every line is one row high.
-    Fixed { row_height: f32, lines: usize },
-    /// Variable heights: tops of lines plus the total height last.
-    Wrapped(Vec<f32>),
-}
-
-impl RowMap {
-    /// Top of `line`.
-    fn top(&self, line: usize) -> f32 {
-        match self {
-            RowMap::Fixed { row_height, .. } => line as f32 * row_height,
-            RowMap::Wrapped(tops) => tops[line.min(tops.len() - 1)],
-        }
-    }
-
-    /// Total content height.
-    fn total(&self) -> f32 {
-        match self {
-            RowMap::Fixed { row_height, lines } => *lines as f32 * row_height,
-            RowMap::Wrapped(tops) => *tops.last().unwrap_or(&0.0),
-        }
-    }
-
-    /// Line containing content y coordinate `y`, clamped to the document.
-    fn line_at(&self, y: f32) -> usize {
-        match self {
-            RowMap::Fixed { row_height, lines } => {
-                let line = (y / row_height).floor().max(0.0) as usize;
-                line.min(lines.saturating_sub(1))
-            }
-            RowMap::Wrapped(tops) => line_at_y(tops, y),
-        }
     }
 }
 
@@ -367,165 +294,6 @@ pub fn show_editor(
     out
 }
 
-/// Translates this frame's keyboard events into commands on `tab`.
-fn handle_keyboard(
-    ui: &Ui,
-    tab: &mut Tab,
-    opts: &ViewOptions,
-    page: usize,
-    key_handler: &mut Option<&mut KeyHandler<'_>>,
-    out: &mut ViewOutput,
-) {
-    // Only the keyboard events are copied (none at all in most frames).
-    let events = ui.input(|i| keyboard_events(&i.events));
-    for ev in &events {
-        if let Some(up) = page_key(ev) {
-            tab.view.page_anchor = Some(tab.view.caret_offset.unwrap_or(0.0));
-            if let Some(handler) = key_handler.as_mut() {
-                // Vim mode: move the caret one line at a time so every mode clamps it.
-                let arrow = if up { Key::ArrowUp } else { Key::ArrowDown };
-                for _ in 0..page {
-                    handler(&key_event(arrow), tab);
-                }
-                continue;
-            }
-        }
-        if let Some(handler) = key_handler.as_mut()
-            && handler(ev, tab)
-        {
-            tab.scroll_to_cursor = true;
-            continue;
-        }
-        let Some(cmd) = event_to_command(ev, page) else {
-            continue;
-        };
-        if let Some(text) = tab.apply(cmd, &opts.edit) {
-            out.clipboard = Some(text);
-        }
-    }
-}
-
-/// Returns `Some(true)` for a PageUp press and `Some(false)` for a PageDown press (Shift
-/// allowed, to extend the selection), `None` for any other event.
-fn page_key(ev: &egui::Event) -> Option<bool> {
-    let egui::Event::Key {
-        key,
-        pressed: true,
-        modifiers,
-        ..
-    } = ev
-    else {
-        return None;
-    };
-    if modifiers.ctrl || modifiers.alt || modifiers.mac_cmd {
-        return None;
-    }
-    match key {
-        Key::PageUp => Some(true),
-        Key::PageDown => Some(false),
-        _ => None,
-    }
-}
-
-/// A plain press of `key` without modifiers.
-fn key_event(key: Key) -> egui::Event {
-    egui::Event::Key {
-        key,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: Modifiers::NONE,
-    }
-}
-
-/// Copies the events of `events` the editor consumes from the keyboard.
-fn keyboard_events(events: &[egui::Event]) -> Vec<egui::Event> {
-    events
-        .iter()
-        .filter(|e| is_keyboard_event(e))
-        .cloned()
-        .collect()
-}
-
-/// True for events the editor (or its key handler) consumes from the keyboard.
-fn is_keyboard_event(ev: &egui::Event) -> bool {
-    matches!(
-        ev,
-        egui::Event::Text(_)
-            | egui::Event::Ime(egui::ImeEvent::Commit(_))
-            | egui::Event::Copy
-            | egui::Event::Cut
-            | egui::Event::Paste(_)
-            | egui::Event::Key { pressed: true, .. }
-    )
-}
-
-/// Maps one keyboard event to an editing command; `page` is the PageUp/PageDown size.
-fn event_to_command(ev: &egui::Event, page: usize) -> Option<EditCommand> {
-    match ev {
-        egui::Event::Text(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
-            let text: String = text.chars().filter(|c| !c.is_control()).collect();
-            (!text.is_empty()).then_some(EditCommand::InsertText(text))
-        }
-        egui::Event::Copy => Some(EditCommand::Copy),
-        egui::Event::Cut => Some(EditCommand::Cut),
-        egui::Event::Paste(text) => (!text.is_empty()).then(|| EditCommand::Paste(text.clone())),
-        egui::Event::Key {
-            key,
-            pressed: true,
-            modifiers,
-            ..
-        } => key_to_command(*key, *modifiers, page),
-        _ => None,
-    }
-}
-
-/// Maps a key press to an editing command using the platform conventions
-/// (`Cmd`/`Alt` arrows on macOS, `Ctrl` arrows elsewhere). `page` is the page size in lines.
-pub fn key_to_command(key: Key, mods: Modifiers, page: usize) -> Option<EditCommand> {
-    key_to_command_for(key, mods, page, cfg!(target_os = "macos"))
-}
-
-/// `key_to_command` with an explicit platform flag (testable on every OS).
-fn key_to_command_for(key: Key, mods: Modifiers, page: usize, mac: bool) -> Option<EditCommand> {
-    let select = mods.shift;
-    let word = if mac { mods.alt } else { mods.ctrl };
-    let cmd_arrow = mac && mods.mac_cmd;
-    let doc_jump = if mac { mods.mac_cmd } else { mods.ctrl };
-    let plain = !mods.ctrl && !mods.alt && !mods.mac_cmd;
-    let cmd = match key {
-        Key::ArrowLeft if cmd_arrow => EditCommand::Home { select },
-        Key::ArrowLeft if word => EditCommand::WordLeft { select },
-        Key::ArrowLeft => EditCommand::Left { select },
-        Key::ArrowRight if cmd_arrow => EditCommand::End { select },
-        Key::ArrowRight if word => EditCommand::WordRight { select },
-        Key::ArrowRight => EditCommand::Right { select },
-        Key::ArrowUp if cmd_arrow => EditCommand::DocStart { select },
-        Key::ArrowUp => EditCommand::Up { select },
-        Key::ArrowDown if cmd_arrow => EditCommand::DocEnd { select },
-        Key::ArrowDown => EditCommand::Down { select },
-        Key::Home if doc_jump => EditCommand::DocStart { select },
-        Key::Home => EditCommand::Home { select },
-        Key::End if doc_jump => EditCommand::DocEnd { select },
-        Key::End => EditCommand::End { select },
-        Key::PageUp => EditCommand::PageUp {
-            select,
-            lines: page,
-        },
-        Key::PageDown => EditCommand::PageDown {
-            select,
-            lines: page,
-        },
-        Key::Enter if plain => EditCommand::Newline,
-        Key::Backspace => EditCommand::Backspace,
-        Key::Delete => EditCommand::Delete,
-        Key::Tab if plain && mods.shift => EditCommand::Outdent,
-        Key::Tab if plain => EditCommand::Indent,
-        _ => return None,
-    };
-    Some(cmd)
-}
-
 /// Number of lines moved by PageUp/PageDown: visible rows minus one, at least one.
 fn page_lines(view_height: f32, row_height: f32) -> usize {
     if row_height <= 0.0 {
@@ -534,18 +302,6 @@ fn page_lines(view_height: f32, row_height: f32) -> usize {
     ((view_height / row_height).floor() as usize)
         .saturating_sub(1)
         .max(1)
-}
-
-/// Index of the line containing `y` given line tops with the total height last.
-fn line_at_y(tops: &[f32], y: f32) -> usize {
-    let lines = tops.len().saturating_sub(1);
-    if lines == 0 {
-        return 0;
-    }
-    tops[..lines]
-        .partition_point(|&top| top <= y)
-        .saturating_sub(1)
-        .min(lines - 1)
 }
 
 /// Returns `line` with every tab replaced by the spaces up to the next tab stop, plus the
@@ -608,256 +364,6 @@ fn build_layout_job(
     job
 }
 
-/// Measures the wrapped height of `line` laid out `width` points wide.
-fn measure_line(
-    fonts: &mut egui::epaint::FontsView<'_>,
-    rope: &Rope,
-    line: usize,
-    m: &Metrics,
-    width: f32,
-) -> f32 {
-    let text = text_nav::line_text(rope, line);
-    if text.is_empty() {
-        return m.row_height;
-    }
-    let spans = [(0..text.chars().count(), m.base.clone())];
-    let job = build_layout_job(
-        &text,
-        &spans,
-        &m.base,
-        m.tab_width,
-        Some(width),
-        m.row_height,
-    );
-    fonts.layout_job(job).size().y.max(m.row_height)
-}
-
-impl WrapCache {
-    /// Brings line heights and tops up to date with the buffer and the viewport: lines edited
-    /// since the last update are re-measured (or estimated, for big edits and a changed font,
-    /// wrap width or tab width), the lines in `viewport` (content coordinates) are measured
-    /// exactly, and other unmeasured lines are measured for at most `WRAP_FRAME_BUDGET`.
-    /// Returns the vertical shift of the first visible line caused by lines measured above it
-    /// (scroll by it to keep the view still) and whether unmeasured lines remain.
-    fn update(
-        &mut self,
-        ui: &Ui,
-        buffer: &Buffer,
-        m: &Metrics,
-        width: f32,
-        viewport: Rect,
-    ) -> (f32, bool) {
-        let params = (m.base.font_id.clone(), width, m.tab_width);
-        if self.params.as_ref() != Some(&params) {
-            self.params = Some(params);
-            self.revision = None;
-        }
-        let rope = buffer.rope();
-        let deadline = Instant::now() + WRAP_FRAME_BUDGET;
-        ui.ctx().fonts_mut(|fonts| {
-            let mut measure = |line| measure_line(fonts, rope, line, m, width);
-            self.refresh(buffer, m.row_height, &mut measure);
-            self.settle(viewport, &mut measure);
-            let first = line_at_y(&self.tops, viewport.min.y);
-            let before = self.tops[first];
-            let pending = self.fill(deadline, &mut measure);
-            (self.tops[first] - before, pending)
-        })
-    }
-
-    /// Re-measures the lines edited since `revision` with `measure` (every line when there
-    /// is no previous revision; more than `EAGER_WRAP_LINES` lines get `estimate` instead,
-    /// to be measured later) and rebuilds `tops` from the first edited line.
-    fn refresh(&mut self, buffer: &Buffer, estimate: f32, mut measure: impl FnMut(usize) -> f32) {
-        if self.revision == Some(buffer.revision()) {
-            return;
-        }
-        let lines = buffer.rope().len_lines();
-        let everything = DirtyLines {
-            start: 0,
-            end: lines,
-            old_end: usize::MAX,
-        };
-        let dirty = match self.revision {
-            Some(rev) => buffer.dirty_lines_since(rev).unwrap_or(everything),
-            None => everything,
-        };
-        let old_end = dirty.old_end.min(self.heights.len());
-        let consistent = dirty.start <= old_end
-            && dirty.end <= lines
-            && self.heights.len() - old_end + dirty.end == lines;
-        let dirty = match consistent {
-            true => DirtyLines { old_end, ..dirty },
-            false => DirtyLines {
-                old_end: self.heights.len(),
-                ..everything
-            },
-        };
-        let eager = dirty.end - dirty.start <= EAGER_WRAP_LINES;
-        let fresh: Vec<f32> = match eager {
-            true => (dirty.start..dirty.end).map(&mut measure).collect(),
-            false => vec![estimate; dirty.end - dirty.start],
-        };
-        let dropped = self.measured[dirty.start..dirty.old_end]
-            .iter()
-            .filter(|m| !**m)
-            .count();
-        self.unmeasured -= dropped;
-        if !eager {
-            self.unmeasured += fresh.len();
-        }
-        let flags = std::iter::repeat_n(eager, fresh.len());
-        self.measured.splice(dirty.start..dirty.old_end, flags);
-        self.heights.splice(dirty.start..dirty.old_end, fresh);
-        self.fill_from = self.fill_from.min(dirty.start);
-        self.retop(dirty.start);
-        self.revision = Some(buffer.revision());
-    }
-
-    /// Measures the unmeasured lines of `lines` and rebuilds `tops` when any height changed.
-    /// Returns true when something changed.
-    fn measure_lines(
-        &mut self,
-        lines: Range<usize>,
-        measure: &mut impl FnMut(usize) -> f32,
-    ) -> bool {
-        let mut first_changed = None;
-        for line in lines {
-            if self.measured[line] {
-                continue;
-            }
-            let height = measure(line);
-            self.measured[line] = true;
-            self.unmeasured -= 1;
-            if height != self.heights[line] {
-                self.heights[line] = height;
-                first_changed.get_or_insert(line);
-            }
-        }
-        let Some(first) = first_changed else {
-            return false;
-        };
-        self.retop(first);
-        true
-    }
-
-    /// Measures the lines shown in `viewport` (content coordinates) exactly. Measuring may
-    /// grow lines and push others out of the viewport, so this repeats a few times.
-    fn settle(&mut self, viewport: Rect, measure: &mut impl FnMut(usize) -> f32) {
-        if self.heights.is_empty() {
-            return;
-        }
-        for _ in 0..VIEWPORT_SETTLE_PASSES {
-            let first = line_at_y(&self.tops, viewport.min.y);
-            let last = line_at_y(&self.tops, viewport.max.y);
-            if !self.measure_lines(first..last + 1, measure) {
-                return;
-            }
-        }
-    }
-
-    /// Measures unmeasured lines, from `fill_from` on and then from the top, until
-    /// `deadline`. Returns true when some are still unmeasured.
-    fn fill(&mut self, deadline: Instant, measure: &mut impl FnMut(usize) -> f32) -> bool {
-        let lines = self.heights.len();
-        let mut first_changed = None;
-        let mut line = self.fill_from.min(lines);
-        let mut scanned = 0;
-        while self.unmeasured > 0 && scanned < lines && Instant::now() < deadline {
-            if line >= lines {
-                line = 0;
-            }
-            if !self.measured[line] {
-                let height = measure(line);
-                self.measured[line] = true;
-                self.unmeasured -= 1;
-                if height != self.heights[line] {
-                    self.heights[line] = height;
-                    first_changed = Some(first_changed.map_or(line, |f: usize| f.min(line)));
-                }
-            }
-            line += 1;
-            scanned += 1;
-        }
-        self.fill_from = line;
-        if let Some(first) = first_changed {
-            self.retop(first);
-        }
-        self.unmeasured > 0
-    }
-
-    /// Rebuilds `tops` from line `from` on.
-    fn retop(&mut self, from: usize) {
-        self.tops.truncate(from);
-        let mut y = match from {
-            0 => 0.0,
-            n => self.tops[n - 1] + self.heights[n - 1],
-        };
-        for h in &self.heights[from..] {
-            self.tops.push(y);
-            y += h;
-        }
-        self.tops.push(y);
-    }
-}
-
-/// Returns the longest of `lines` (display columns, line index), the first one on ties;
-/// `(0, lines.start)` for an empty range.
-fn longest_in(rope: &Rope, lines: Range<usize>, tab_width: usize) -> (usize, usize) {
-    let first = lines.start;
-    lines
-        .map(|i| (text_nav::text_width(rope.line(i).chars(), tab_width), i))
-        .fold((0, first), |best, cur| match cur.0 > best.0 {
-            true => cur,
-            false => best,
-        })
-}
-
-/// Returns the longest line of `buffer`, reusing `old` when possible: only the lines edited
-/// since `old` are measured, and the whole buffer is rescanned only when the old longest line
-/// was edited and no edited line is at least as long.
-fn longest_line(buffer: &Buffer, old: Option<LongestLine>, tab_width: usize) -> LongestLine {
-    let rope = buffer.rope();
-    let revision = buffer.revision();
-    let rescan = || {
-        let (cols, line) = longest_in(rope, 0..rope.len_lines(), tab_width);
-        LongestLine {
-            revision,
-            tab_width,
-            cols,
-            line,
-        }
-    };
-    let Some(old) = old.filter(|o| o.tab_width == tab_width) else {
-        return rescan();
-    };
-    let Some(dirty) = buffer.dirty_lines_since(old.revision) else {
-        return old;
-    };
-    let (cols, line) = longest_in(rope, dirty.start..dirty.end, tab_width);
-    let replaced = (dirty.start..dirty.old_end).contains(&old.line);
-    if cols > old.cols || (replaced && cols == old.cols) {
-        return LongestLine {
-            revision,
-            tab_width,
-            cols,
-            line,
-        };
-    }
-    if replaced {
-        return rescan();
-    }
-    let line = match old.line >= dirty.old_end {
-        true => old.line - dirty.old_end + dirty.end,
-        false => old.line,
-    };
-    LongestLine {
-        revision,
-        line,
-        ..old
-    }
-}
-
 /// Where the content sits this frame: line placement, screen origin and visible area.
 struct Placement {
     /// Vertical placement of lines.
@@ -890,28 +396,7 @@ impl Frame<'_> {
             .opts
             .word_wrap
             .then(|| (viewport.width() - text_x - TEXT_PAD).max(MIN_WRAP_WIDTH));
-        let rows = match wrap_width {
-            Some(width) => {
-                let wrap = &mut self.tab.view.wrap;
-                let (shift, pending) = wrap.update(ui, &self.tab.buffer, self.m, width, viewport);
-                if shift != 0.0 {
-                    // Lines measured above the view grew it: keep the visible text still.
-                    ui.scroll_with_delta_animation(
-                        vec2(0.0, -shift),
-                        egui::style::ScrollAnimation::none(),
-                    );
-                }
-                if pending {
-                    ui.ctx().request_repaint();
-                }
-                // Borrowed for the frame (moved back at the end), never cloned.
-                RowMap::Wrapped(std::mem::take(&mut self.tab.view.wrap.tops))
-            }
-            None => RowMap::Fixed {
-                row_height: self.m.row_height,
-                lines: self.tab.buffer.rope().len_lines(),
-            },
-        };
+        let rows = self.row_map(ui, viewport, wrap_width);
 
         // Content size and interaction.
         let width = match wrap_width {
@@ -946,6 +431,43 @@ impl Frame<'_> {
         self.paint(ui, &galleys, &pl);
 
         let caret = self.caret_rect(ui, &galleys, &pl);
+        self.scroll_for_caret(ui, caret, &pl);
+        if self.focused {
+            self.paint_caret(ui, caret);
+            report_ime_area(ui, caret);
+        }
+        if let RowMap::Wrapped(tops) = pl.rows {
+            self.tab.view.wrap.tops = tops;
+        }
+    }
+
+    /// Placement of the lines this frame: fixed rows, or the wrapped heights brought up to
+    /// date for `viewport` (scrolling to keep the view still when lines measured above it
+    /// grew, and repainting while lines are left to measure).
+    fn row_map(&mut self, ui: &Ui, viewport: Rect, wrap_width: Option<f32>) -> RowMap {
+        let Some(width) = wrap_width else {
+            return RowMap::Fixed {
+                row_height: self.m.row_height,
+                lines: self.tab.buffer.rope().len_lines(),
+            };
+        };
+        let wrap = &mut self.tab.view.wrap;
+        let (shift, pending) = wrap.update(ui, &self.tab.buffer, self.m, width, viewport);
+        if shift != 0.0 {
+            // A positive delta moves the content down: scroll by the growth above the view.
+            ui.scroll_with_delta_animation(vec2(0.0, -shift), egui::style::ScrollAnimation::none());
+        }
+        if pending {
+            ui.ctx().request_repaint();
+        }
+        // Borrowed for the frame (moved back at the end of `run`), never cloned.
+        RowMap::Wrapped(std::mem::take(&mut wrap.tops))
+    }
+
+    /// Scrolls after a PageUp/PageDown (the caret keeps its screen row) or when the caret must
+    /// be revealed, and remembers the caret offset from the viewport top.
+    fn scroll_for_caret(&mut self, ui: &Ui, caret: Rect, pl: &Placement) {
+        let (origin, viewport) = (pl.origin, pl.viewport);
         let caret_offset = caret.min.y - origin.y - viewport.min.y;
         self.tab.view.caret_offset = Some(caret_offset);
         if let Some(anchor) = self.tab.view.page_anchor.take() {
@@ -962,30 +484,11 @@ impl Frame<'_> {
             self.tab.scroll_to_cursor = false;
             let margin = SCROLL_MARGIN_CHARS * self.m.char_width;
             let target = Rect::from_min_max(
-                pos2(caret.min.x - text_x, caret.min.y),
+                pos2(caret.min.x - self.m.text_x(), caret.min.y),
                 pos2(caret.max.x + margin, caret.max.y),
             );
             // Caret jumps (`G`, `:N`, find next, ...) land instantly, never with a smooth scroll.
             ui.scroll_to_rect_animation(target, None, egui::style::ScrollAnimation::none());
-        }
-        if self.focused {
-            self.paint_caret(ui, caret);
-            let to_global = ui
-                .ctx()
-                .layer_transform_to_global(ui.layer_id())
-                .unwrap_or_default();
-            let clip = ui.clip_rect();
-            ui.output_mut(|o| {
-                o.ime = Some(egui::output::IMEOutput {
-                    purpose: egui::IMEPurpose::Normal,
-                    rect: to_global * clip,
-                    cursor_rect: to_global * caret,
-                    should_interrupt_composition: false,
-                });
-            });
-        }
-        if let RowMap::Wrapped(tops) = pl.rows {
-            self.tab.view.wrap.tops = tops;
         }
     }
 
@@ -1240,6 +743,23 @@ impl Frame<'_> {
     }
 }
 
+/// Tells the platform where the text input (and its caret) is, for IME candidate windows.
+fn report_ime_area(ui: &Ui, caret: Rect) {
+    let to_global = ui
+        .ctx()
+        .layer_transform_to_global(ui.layer_id())
+        .unwrap_or_default();
+    let clip = ui.clip_rect();
+    ui.output_mut(|o| {
+        o.ime = Some(egui::output::IMEOutput {
+            purpose: egui::IMEPurpose::Normal,
+            rect: to_global * clip,
+            cursor_rect: to_global * caret,
+            should_interrupt_composition: false,
+        });
+    });
+}
+
 /// True when a held primary button at char `pos` must move the selection head. Nothing moves
 /// until the pointer has left the press position (`dragged`), so a caret that vim clamped
 /// after the press (a click past the line end) does not turn the click into a selection.
@@ -1275,221 +795,10 @@ fn selection_rects(galley: &Galley, a: usize, b: usize, extra: f32) -> Vec<Rect>
 
 #[cfg(test)]
 mod tests {
+    use super::keys::key_event;
     use super::*;
-
-    const NONE: Modifiers = Modifiers::NONE;
-    const SHIFT: Modifiers = Modifiers::SHIFT;
-    const CTRL: Modifiers = Modifiers::CTRL;
-
-    /// Builds a fully measured wrap cache for `buffer` where a line is as tall as its char
-    /// count (min 1).
-    fn wrap_for(buffer: &Buffer) -> WrapCache {
-        let mut wrap = WrapCache::default();
-        wrap.refresh(buffer, 1.0, |i| height_of(buffer, i));
-        let far = Instant::now() + Duration::from_secs(60);
-        assert!(!wrap.fill(far, &mut |i| height_of(buffer, i)));
-        wrap
-    }
-
-    /// Fake wrapped height: the line length, at least 1.
-    fn height_of(buffer: &Buffer, line: usize) -> f32 {
-        buffer.rope().line(line).len_chars().max(1) as f32
-    }
-
-    #[test]
-    fn wrap_cache_remeasures_only_edited_lines() {
-        let mut buffer = Buffer::from_text("a\nbb\nccc\ndddd\neeeee");
-        let mut wrap = wrap_for(&buffer);
-        buffer.replace(3..3, "XX\nYYYYYYY\n");
-        let mut measured = Vec::new();
-        wrap.refresh(&buffer, 1.0, |i| {
-            measured.push(i);
-            height_of(&buffer, i)
-        });
-        assert_eq!(measured, vec![1, 2, 3]);
-        let fresh = wrap_for(&buffer);
-        assert_eq!(wrap.heights, fresh.heights);
-        assert_eq!(wrap.tops, fresh.tops);
-        // Deleting lines shrinks the cache too.
-        buffer.replace(0..8, "");
-        wrap.refresh(&buffer, 1.0, |i| height_of(&buffer, i));
-        let fresh = wrap_for(&buffer);
-        assert_eq!(wrap.heights, fresh.heights);
-        assert_eq!(wrap.tops, fresh.tops);
-        // Unchanged revision: nothing is measured.
-        let mut calls = 0;
-        wrap.refresh(&buffer, 1.0, |_| {
-            calls += 1;
-            1.0
-        });
-        assert_eq!(calls, 0);
-    }
-
-    #[test]
-    fn big_wrap_updates_measure_the_viewport_first_then_fill() {
-        let text: String = (0..1000)
-            .map(|i| format!("{}\n", "x".repeat(i % 7)))
-            .collect();
-        let buffer = Buffer::from_text(&text);
-        let lines = buffer.rope().len_lines();
-        let mut wrap = WrapCache::default();
-        let mut calls = 0;
-        wrap.refresh(&buffer, 1.0, |_| {
-            calls += 1;
-            1.0
-        });
-        assert_eq!(calls, 0, "a whole-buffer refresh only estimates");
-        assert_eq!(wrap.unmeasured, lines);
-        // Rows 10..20 of the content are visible.
-        let viewport = Rect::from_min_max(pos2(0.0, 10.0), pos2(100.0, 20.0));
-        let mut measured = Vec::new();
-        wrap.settle(viewport, &mut |i| {
-            measured.push(i);
-            height_of(&buffer, i)
-        });
-        assert!(
-            measured.contains(&10) && measured.len() < 40,
-            "{measured:?}"
-        );
-        let far = Instant::now() + Duration::from_secs(60);
-        assert!(!wrap.fill(far, &mut |i| height_of(&buffer, i)));
-        assert_eq!(wrap.unmeasured, 0);
-        let exact = wrap_for(&buffer);
-        assert_eq!(wrap.heights, exact.heights);
-        assert_eq!(wrap.tops, exact.tops);
-        // An expired budget measures nothing.
-        let mut wrap = WrapCache::default();
-        wrap.refresh(&buffer, 1.0, |_| 1.0);
-        assert!(wrap.fill(Instant::now(), &mut |_| 2.0));
-    }
-
-    #[test]
-    fn longest_line_updates_incrementally() {
-        let mut buffer = Buffer::from_text("aaaa\nbb\naaaaaa\nc");
-        let l = longest_line(&buffer, None, 4);
-        assert_eq!((l.cols, l.line), (6, 2));
-        // Grow a short line past the longest.
-        buffer.replace(5..5, "bbbbbbbb");
-        let l = longest_line(&buffer, Some(l), 4);
-        assert_eq!((l.cols, l.line), (10, 1));
-        // Insert lines before: the longest line index moves.
-        buffer.replace(0..0, "x\ny\n");
-        let l = longest_line(&buffer, Some(l), 4);
-        assert_eq!((l.cols, l.line), (10, 3));
-        // Shrink the longest line: rescan finds the next one.
-        let start = buffer.rope().line_to_char(3);
-        buffer.replace(start..start + 9, "");
-        let l = longest_line(&buffer, Some(l), 4);
-        assert_eq!((l.cols, l.line), (6, 4));
-        // A tab width change rescans with the new width.
-        buffer.replace(0..0, "\t\t");
-        let l = longest_line(&buffer, Some(l), 8);
-        assert_eq!((l.cols, l.line), (17, 0));
-    }
-
-    #[test]
-    fn arrows_map_to_moves() {
-        assert_eq!(
-            key_to_command_for(Key::ArrowLeft, NONE, 10, false),
-            Some(EditCommand::Left { select: false })
-        );
-        assert_eq!(
-            key_to_command_for(Key::ArrowRight, SHIFT, 10, false),
-            Some(EditCommand::Right { select: true })
-        );
-        assert_eq!(
-            key_to_command_for(Key::ArrowLeft, CTRL, 10, false),
-            Some(EditCommand::WordLeft { select: false })
-        );
-        assert_eq!(
-            key_to_command_for(Key::ArrowRight, CTRL | SHIFT, 10, false),
-            Some(EditCommand::WordRight { select: true })
-        );
-    }
-
-    #[test]
-    fn mac_uses_alt_for_words_and_cmd_for_lines() {
-        assert_eq!(
-            key_to_command_for(Key::ArrowLeft, Modifiers::ALT, 10, true),
-            Some(EditCommand::WordLeft { select: false })
-        );
-        assert_eq!(
-            key_to_command_for(Key::ArrowRight, Modifiers::MAC_CMD, 10, true),
-            Some(EditCommand::End { select: false })
-        );
-        assert_eq!(
-            key_to_command_for(Key::ArrowUp, Modifiers::MAC_CMD, 10, true),
-            Some(EditCommand::DocStart { select: false })
-        );
-    }
-
-    #[test]
-    fn home_end_and_doc_jumps() {
-        assert_eq!(
-            key_to_command_for(Key::Home, NONE, 10, false),
-            Some(EditCommand::Home { select: false })
-        );
-        assert_eq!(
-            key_to_command_for(Key::End, CTRL | SHIFT, 10, false),
-            Some(EditCommand::DocEnd { select: true })
-        );
-    }
-
-    #[test]
-    fn page_keys_carry_page_size() {
-        assert_eq!(
-            key_to_command_for(Key::PageDown, SHIFT, 7, false),
-            Some(EditCommand::PageDown {
-                select: true,
-                lines: 7
-            })
-        );
-    }
-
-    #[test]
-    fn editing_keys() {
-        assert_eq!(
-            key_to_command_for(Key::Enter, NONE, 1, false),
-            Some(EditCommand::Newline)
-        );
-        assert_eq!(key_to_command_for(Key::Enter, CTRL, 1, false), None);
-        assert_eq!(
-            key_to_command_for(Key::Tab, NONE, 1, false),
-            Some(EditCommand::Indent)
-        );
-        assert_eq!(
-            key_to_command_for(Key::Tab, SHIFT, 1, false),
-            Some(EditCommand::Outdent)
-        );
-        assert_eq!(key_to_command_for(Key::Tab, CTRL, 1, false), None);
-        assert_eq!(
-            key_to_command_for(Key::Backspace, NONE, 1, false),
-            Some(EditCommand::Backspace)
-        );
-        assert_eq!(key_to_command_for(Key::A, CTRL, 1, false), None);
-    }
-
-    #[test]
-    fn text_events_become_inserts() {
-        let ev = egui::Event::Text("é".into());
-        assert_eq!(
-            event_to_command(&ev, 1),
-            Some(EditCommand::InsertText("é".into()))
-        );
-        let ime = egui::Event::Ime(egui::ImeEvent::Commit("ö".into()));
-        assert_eq!(
-            event_to_command(&ime, 1),
-            Some(EditCommand::InsertText("ö".into()))
-        );
-        assert_eq!(
-            event_to_command(&egui::Event::Text("\u{8}".into()), 1),
-            None
-        );
-        assert_eq!(
-            event_to_command(&egui::Event::Paste("x".into()), 1),
-            Some(EditCommand::Paste("x".into()))
-        );
-    }
+    use eframe::egui::{Key, Modifiers};
+    use ropey::Rope;
 
     #[test]
     fn held_click_past_clamped_caret_does_not_drag() {
@@ -1503,38 +812,9 @@ mod tests {
     }
 
     #[test]
-    fn only_keyboard_events_are_copied() {
-        let events = vec![
-            egui::Event::PointerMoved(Pos2::ZERO),
-            egui::Event::Text("a".into()),
-            egui::Event::Copy,
-            egui::Event::Key {
-                key: Key::A,
-                physical_key: None,
-                pressed: false,
-                repeat: false,
-                modifiers: NONE,
-            },
-        ];
-        let kept = keyboard_events(&events);
-        assert_eq!(kept, vec![egui::Event::Text("a".into()), egui::Event::Copy]);
-        assert!(keyboard_events(&[]).is_empty());
-    }
-
-    #[test]
     fn page_lines_is_visible_rows_minus_one() {
         assert_eq!(page_lines(200.0, 20.0), 9);
         assert_eq!(page_lines(10.0, 20.0), 1);
-    }
-
-    #[test]
-    fn line_at_y_uses_tops() {
-        let tops = [0.0, 10.0, 30.0, 40.0];
-        assert_eq!(line_at_y(&tops, -5.0), 0);
-        assert_eq!(line_at_y(&tops, 9.9), 0);
-        assert_eq!(line_at_y(&tops, 10.0), 1);
-        assert_eq!(line_at_y(&tops, 35.0), 2);
-        assert_eq!(line_at_y(&tops, 100.0), 2);
     }
 
     #[test]
@@ -1774,20 +1054,5 @@ mod tests {
     #[test]
     fn page_keys_scroll_the_view_in_vim_mode() {
         check_page_keys_scroll_the_view(true);
-    }
-
-    #[test]
-    fn page_key_ignores_modified_presses() {
-        assert_eq!(page_key(&key_event(Key::PageUp)), Some(true));
-        assert_eq!(page_key(&key_event(Key::PageDown)), Some(false));
-        let ctrl = egui::Event::Key {
-            key: Key::PageDown,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: CTRL,
-        };
-        assert_eq!(page_key(&ctrl), None);
-        assert_eq!(page_key(&key_event(Key::ArrowDown)), None);
     }
 }
