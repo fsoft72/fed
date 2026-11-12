@@ -12,7 +12,7 @@ use crate::buffer::Buffer;
 use crate::editing::{self, EditCommand, EditSettings, EditorState};
 use crate::find_bar::{FindBar, MatchDecorator};
 use crate::highlight::{self, HighlightAssets, HighlightCache, HighlightDecorator};
-use crate::markdown::Preview;
+use crate::markdown::{Preview, PreviewLayout};
 use crate::spell::{SpellCache, SpellChecker, SpellDecorator, SpellMode};
 use crate::view::{self, KeyHandler, ViewOptions, ViewOutput, ViewState};
 use crate::vim::VimState;
@@ -58,10 +58,9 @@ pub struct Tab {
     syntax_path: Option<PathBuf>,
     /// Spell check state: Markdown prose ranges, painted marks and per-line results.
     spell: SpellCache,
-    /// True while the Markdown preview panel is shown for this tab.
-    pub preview_open: bool,
-    /// Markdown preview state, created when the preview opens and dropped when it closes.
-    pub preview: Option<Preview>,
+    /// Markdown preview state: `Some` exactly while the preview panel is shown for this tab
+    /// (created when it opens, dropped when it closes).
+    preview: Option<Preview>,
     /// Vim emulation state (used only while vim mode is on).
     pub vim: VimState,
     /// Rendering caches owned by the editor widget.
@@ -82,7 +81,6 @@ impl Tab {
             syntax: None,
             syntax_path: None,
             spell: SpellCache::default(),
-            preview_open: false,
             preview: None,
             vim: VimState::new(),
             view: ViewState::default(),
@@ -196,9 +194,21 @@ impl Tab {
     /// Opens or closes the Markdown preview. Closing drops the preview state (its renderer
     /// cache and its copy of the text) until the preview is opened again.
     pub fn toggle_preview(&mut self) {
-        self.preview_open = !self.preview_open;
-        if !self.preview_open {
-            self.preview = None;
+        self.preview = match self.preview {
+            Some(_) => None,
+            None => Some(Preview::new(self.id)),
+        };
+    }
+
+    /// True while the Markdown preview panel is shown for this tab.
+    pub fn is_preview_open(&self) -> bool {
+        self.preview.is_some()
+    }
+
+    /// Draws the Markdown preview of this tab's text, when it is open.
+    pub fn show_preview(&mut self, ui: &mut egui::Ui, layout: PreviewLayout) {
+        if let Some(preview) = &mut self.preview {
+            preview.show(ui, &self.buffer, layout);
         }
     }
 
@@ -275,10 +285,10 @@ mod tests {
     fn closing_the_preview_drops_its_state() {
         let mut tab = Tab::new(Buffer::from_text("# hi"));
         tab.toggle_preview();
-        assert!(tab.preview_open);
-        tab.preview = Some(Preview::new(tab.id));
+        assert!(tab.is_preview_open());
+        assert!(tab.preview.is_some(), "opening creates the preview state");
         tab.toggle_preview();
-        assert!(!tab.preview_open);
+        assert!(!tab.is_preview_open());
         assert!(tab.preview.is_none());
     }
 

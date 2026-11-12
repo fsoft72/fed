@@ -21,7 +21,7 @@ use crate::find_bar::{BarMode, FindBar};
 use crate::fonts;
 use crate::highlight::{AssetsHandle, HighlightAssets};
 use crate::keymap::{Action, KeyChord, Keymap};
-use crate::markdown::{self, Preview};
+use crate::markdown;
 use crate::settings_ui::{SaveDebounce, SettingsEvent, SettingsWindow};
 use crate::spell::SpellService;
 use crate::tab::{EditorEnv, Tab};
@@ -737,7 +737,7 @@ impl FedApp {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
-        if !tab.preview_open || !markdown::is_markdown_path(tab.buffer.path()) {
+        if !tab.is_preview_open() || !markdown::is_markdown_path(tab.buffer.path()) {
             return;
         }
         let half = ui.available_width() / 2.0;
@@ -748,10 +748,7 @@ impl FedApp {
         egui::Panel::right("fed_preview")
             .resizable(true)
             .default_size(half)
-            .show(ui, |ui| {
-                let preview = tab.preview.get_or_insert_with(|| Preview::new(tab.id));
-                preview.show(ui, &tab.buffer, layout);
-            });
+            .show(ui, |ui| tab.show_preview(ui, layout));
     }
 
     /// Draws the find or go-to-line bar above the status bar and shows its message.

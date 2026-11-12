@@ -172,7 +172,7 @@ impl FedApp {
             .tabs
             .get(self.active)
             .filter(|t| markdown::is_markdown_path(t.buffer.path()))
-            .map(|t| t.preview_open);
+            .map(Tab::is_preview_open);
         let mut action = None;
         egui::Panel::top("fed_tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
