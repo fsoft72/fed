@@ -5,7 +5,7 @@ use ropey::Rope;
 
 use crate::buffer::Buffer;
 use crate::search::{SearchError, SearchQuery, find_next};
-use crate::text_nav::{self, CharClass, char_class};
+use crate::text_nav;
 
 /// A vim cursor motion.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,14 +263,14 @@ pub fn is_empty_line(rope: &Rope, line: usize) -> bool {
     text_nav::line_end(rope, start) == start
 }
 
-/// Returns the char at `i`, or `None` past the end.
-fn char_at(rope: &Rope, i: usize) -> Option<char> {
-    (i < rope.len_chars()).then(|| rope.char(i))
+/// Vim `w`: like `text_nav::next_word_start` but an empty line counts as a word.
+pub fn next_word_start(rope: &Rope, pos: usize, big: bool) -> usize {
+    text_nav::next_word_start_with(rope, pos, big, true)
 }
 
-/// Returns true when `i` is the `\n` of an empty line.
-fn is_empty_line_at(rope: &Rope, i: usize) -> bool {
-    char_at(rope, i) == Some('\n') && (i == 0 || rope.char(i - 1) == '\n')
+/// Vim `b`: like `text_nav::prev_word_start` but an empty line counts as a word.
+pub fn prev_word_start(rope: &Rope, pos: usize, big: bool) -> usize {
+    text_nav::prev_word_start_with(rope, pos, big, true)
 }
 
 /// Moves `count` lines up or down keeping the preferred column.
@@ -298,52 +298,6 @@ fn vertical(
         linewise: true,
         inclusive: false,
     })
-}
-
-/// Vim `w`: like `text_nav::next_word_start` but an empty line counts as a word.
-pub fn next_word_start(rope: &Rope, pos: usize, big: bool) -> usize {
-    let len = rope.len_chars();
-    let Some(first) = char_at(rope, pos) else {
-        return len;
-    };
-    let mut i = pos;
-    let class = char_class(first, big);
-    if class != CharClass::Whitespace {
-        while char_at(rope, i).is_some_and(|c| char_class(c, big) == class) {
-            i += 1;
-        }
-    }
-    while let Some(c) = char_at(rope, i) {
-        if char_class(c, big) != CharClass::Whitespace {
-            break;
-        }
-        if c == '\n' && char_at(rope, i + 1) == Some('\n') {
-            return i + 1;
-        }
-        i += 1;
-    }
-    i
-}
-
-/// Vim `b`: like `text_nav::prev_word_start` but an empty line counts as a word.
-pub fn prev_word_start(rope: &Rope, pos: usize, big: bool) -> usize {
-    let pos = pos.min(rope.len_chars());
-    if pos == 0 {
-        return 0;
-    }
-    let is_ws = |i: usize| char_class(rope.char(i), big) == CharClass::Whitespace;
-    let mut i = pos - 1;
-    while is_ws(i) {
-        if is_empty_line_at(rope, i) || i == 0 {
-            return i;
-        }
-        i -= 1;
-    }
-    let class = char_class(rope.char(i), big);
-    while i > 0 && char_class(rope.char(i - 1), big) == class {
-        i -= 1;
-    }
-    i
 }
 
 /// Finds `c` in the current line `count` times; `repeat` skips an adjacent till target.

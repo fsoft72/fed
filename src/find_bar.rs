@@ -69,6 +69,28 @@ struct BarInput {
     close: bool,
 }
 
+/// Enter and Escape pressed in a single-line bar field this frame.
+struct FieldKeys {
+    /// Enter was pressed in the field (it keeps the keyboard focus).
+    submitted: bool,
+    /// Escape was pressed while the field had the focus.
+    escaped: bool,
+}
+
+/// Reads Enter and Escape for `field`; after Enter the field asks for the focus back, so the
+/// user can press Enter again (next match, replace again).
+fn field_keys(ui: &egui::Ui, field: &egui::Response) -> FieldKeys {
+    let submitted = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+    if submitted {
+        field.request_focus();
+    }
+    let escape = ui.input(|i| i.key_pressed(Key::Escape));
+    FieldKeys {
+        submitted,
+        escaped: escape && (field.has_focus() || field.lost_focus()),
+    }
+}
+
 /// State of the find/replace and go-to-line bars (shared by all tabs).
 pub struct FindBar {
     /// Bar currently shown.
@@ -217,9 +239,9 @@ impl FindBar {
                 field.request_focus();
             }
             input.changed |= field.changed();
-            if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+            let keys = field_keys(ui, &field);
+            if keys.submitted {
                 input.step = Some(!ui.input(|i| i.modifiers.shift));
-                field.request_focus();
             }
             input.changed |= ui
                 .toggle_value(&mut self.query.case_sensitive, "Aa")
@@ -243,8 +265,7 @@ impl FindBar {
             if ui.small_button("x").on_hover_text("Close").clicked() {
                 input.close = true;
             }
-            let escape = ui.input(|i| i.key_pressed(Key::Escape));
-            input.close |= escape && (field.has_focus() || field.lost_focus());
+            input.close |= keys.escaped;
         });
         if replace_mode {
             ui.horizontal(|ui| {
@@ -254,14 +275,11 @@ impl FindBar {
                         .hint_text("Replace with")
                         .desired_width(FIELD_WIDTH),
                 );
-                if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    input.replace = true;
-                    field.request_focus();
-                }
+                let keys = field_keys(ui, &field);
+                input.replace = keys.submitted;
                 input.replace |= ui.button("Replace").clicked();
                 input.replace_all |= ui.button("Replace all").clicked();
-                let escape = ui.input(|i| i.key_pressed(Key::Escape));
-                input.close |= escape && (field.has_focus() || field.lost_focus());
+                input.close |= keys.escaped;
             });
         }
         if ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F3)) {
@@ -414,18 +432,15 @@ impl FindBar {
             if field.changed() {
                 self.error = None;
             }
-            if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                submit = true;
-                field.request_focus();
-            }
+            let keys = field_keys(ui, &field);
+            submit = keys.submitted;
             if let Some(err) = &self.error {
                 ui.colored_label(ui.visuals().error_fg_color, err);
             }
             if ui.small_button("x").on_hover_text("Close").clicked() {
                 close = true;
             }
-            let escape = ui.input(|i| i.key_pressed(Key::Escape));
-            close |= escape && (field.has_focus() || field.lost_focus());
+            close |= keys.escaped;
         });
         if close || submit {
             // The editor takes focus in this same frame: hide the key from it.

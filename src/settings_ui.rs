@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Event, Key};
 
-use crate::config::{Settings, UiTheme};
+use crate::config::{FONT_SIZE_RANGE, Settings, TAB_WIDTH_RANGE, UiTheme};
 use crate::fonts::FontCatalog;
 use crate::keymap::{Action, KeyChord, Keymap, chord_has_modifier};
 use crate::spell::SpellStatus;
@@ -18,10 +18,6 @@ const DEFAULT_SIZE: [f32; 2] = [760.0, 560.0];
 const NAV_WIDTH: f32 = 170.0;
 /// Inner margin of the section list frame, in logical pixels.
 const NAV_MARGIN: i8 = 4;
-/// Font size range offered by the settings window, in points.
-const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 6.0..=72.0;
-/// Tab width range offered by the settings window, in columns.
-const TAB_WIDTH_RANGE: std::ops::RangeInclusive<usize> = 1..=16;
 /// Height of the font family list inside its combo box.
 const FONT_LIST_HEIGHT: f32 = 300.0;
 /// Width of the font family and code theme combo boxes.

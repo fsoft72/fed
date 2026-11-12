@@ -27,8 +27,6 @@ const MAX_WORD_CACHE: usize = 50_000;
 const MAX_LINE_CACHE: usize = 4_096;
 /// Maximum number of suggestions returned for a word.
 const MAX_SUGGESTIONS: usize = 8;
-/// Name of the Markdown syntax.
-const MARKDOWN_SYNTAX: &str = "Markdown";
 /// Name of the plain text syntax.
 const PLAIN_TEXT_SYNTAX: &str = "Plain Text";
 /// Color of the underline under misspelled words.
@@ -341,10 +339,13 @@ pub enum SpellMode {
 }
 
 impl SpellMode {
-    /// Picks the mode for a syntax name.
-    pub fn for_syntax(syntax: &str) -> SpellMode {
+    /// Picks the mode for a document: Markdown by file extension (the same test as the
+    /// preview, `markdown::is_markdown_path`), Plain for the plain text syntax, Code otherwise.
+    pub fn for_document(path: Option<&std::path::Path>, syntax: &str) -> SpellMode {
+        if crate::markdown::is_markdown_path(path) {
+            return SpellMode::Markdown;
+        }
         match syntax {
-            MARKDOWN_SYNTAX => SpellMode::Markdown,
             PLAIN_TEXT_SYNTAX => SpellMode::Plain,
             _ => SpellMode::Code,
         }
@@ -771,8 +772,17 @@ mod tests {
 
     #[test]
     fn mode_follows_syntax_name() {
-        assert_eq!(SpellMode::for_syntax("Markdown"), SpellMode::Markdown);
-        assert_eq!(SpellMode::for_syntax("Plain Text"), SpellMode::Plain);
-        assert_eq!(SpellMode::for_syntax("Rust"), SpellMode::Code);
+        use std::path::Path;
+        let md = Some(Path::new("notes.MDOWN"));
+        assert_eq!(
+            SpellMode::for_document(md, "Plain Text"),
+            SpellMode::Markdown
+        );
+        assert_eq!(
+            SpellMode::for_document(None, "Plain Text"),
+            SpellMode::Plain
+        );
+        let rs = Some(Path::new("main.rs"));
+        assert_eq!(SpellMode::for_document(rs, "Rust"), SpellMode::Code);
     }
 }

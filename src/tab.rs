@@ -162,7 +162,7 @@ impl Tab {
             env.theme,
             !large && warm,
         );
-        let mode = SpellMode::for_syntax(&syntax);
+        let mode = SpellMode::for_document(self.buffer.path(), &syntax);
         let mut spelled =
             SpellDecorator::new(&mut highlighted, checker, mode, &mut spell, ui.ctx());
         let mut deco = MatchDecorator::new(&mut spelled, env.matches);

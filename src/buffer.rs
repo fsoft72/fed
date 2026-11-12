@@ -585,7 +585,7 @@ impl LoadJob {
 }
 
 /// Maps `\r\n` and lone `\r` to `\n` so the rope never contains `\r`.
-fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+pub fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains('\r') {
         return text.into();
     }

@@ -42,31 +42,61 @@ pub(crate) enum CloseWindowChoice {
     Cancel,
 }
 
-/// Shows the "unsaved changes" modal for the tab named `name`. Returns the user's answer in
-/// the frame it is given; Escape or a click outside the modal counts as Cancel.
-pub(crate) fn confirm_close_tab(ctx: &egui::Context, name: &str) -> Option<CloseTabChoice> {
-    let modal = egui::Modal::new(egui::Id::unique(CLOSE_TAB_MODAL_ID)).show(ctx, |ui| {
-        ui.heading("Unsaved changes");
-        ui.label(format!("Save changes to \"{name}\" before closing?"));
-        ui.add_space(8.0);
+/// Space between the message and the buttons of a confirmation modal.
+const MODAL_BUTTON_GAP: f32 = 8.0;
+/// Title of the unsaved-changes modals.
+const UNSAVED_TITLE: &str = "Unsaved changes";
+
+/// Shows a modal with `title`, the content drawn by `body` and one button per `buttons`
+/// entry. Returns the value of the clicked button in the frame it is clicked; Escape or a
+/// click outside the modal returns `cancel`.
+fn confirm_modal<T: Copy>(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui),
+    buttons: &[(&str, T)],
+    cancel: T,
+) -> Option<T> {
+    let modal = egui::Modal::new(egui::Id::unique(id)).show(ctx, |ui| {
+        ui.heading(title);
+        body(ui);
+        ui.add_space(MODAL_BUTTON_GAP);
         let mut choice = None;
         ui.horizontal(|ui| {
-            if ui.button("Save").clicked() {
-                choice = Some(CloseTabChoice::Save);
-            }
-            if ui.button("Discard").clicked() {
-                choice = Some(CloseTabChoice::Discard);
-            }
-            if ui.button("Cancel").clicked() {
-                choice = Some(CloseTabChoice::Cancel);
+            for (label, value) in buttons {
+                if ui.button(*label).clicked() {
+                    choice = Some(*value);
+                }
             }
         });
         choice
     });
     if modal.inner.is_none() && modal.should_close() {
-        return Some(CloseTabChoice::Cancel);
+        return Some(cancel);
     }
     modal.inner
+}
+
+/// Shows the "unsaved changes" modal for the tab named `name`. Returns the user's answer in
+/// the frame it is given; Escape or a click outside the modal counts as Cancel.
+pub(crate) fn confirm_close_tab(ctx: &egui::Context, name: &str) -> Option<CloseTabChoice> {
+    let body = |ui: &mut egui::Ui| {
+        ui.label(format!("Save changes to \"{name}\" before closing?"));
+    };
+    let buttons = [
+        ("Save", CloseTabChoice::Save),
+        ("Discard", CloseTabChoice::Discard),
+        ("Cancel", CloseTabChoice::Cancel),
+    ];
+    confirm_modal(
+        ctx,
+        CLOSE_TAB_MODAL_ID,
+        UNSAVED_TITLE,
+        body,
+        &buttons,
+        CloseTabChoice::Cancel,
+    )
 }
 
 /// Shows the "unsaved changes" modal listing the modified files `names`. Returns the user's
@@ -75,31 +105,26 @@ pub(crate) fn confirm_close_window(
     ctx: &egui::Context,
     names: &[String],
 ) -> Option<CloseWindowChoice> {
-    let modal = egui::Modal::new(egui::Id::unique(CLOSE_WINDOW_MODAL_ID)).show(ctx, |ui| {
-        ui.heading("Unsaved changes");
+    let body = |ui: &mut egui::Ui| {
         ui.label("These files have unsaved changes:");
         for name in names {
             ui.label(format!("  {name}"));
         }
-        ui.add_space(8.0);
-        let mut choice = None;
-        ui.horizontal(|ui| {
-            if ui.button("Save all").clicked() {
-                choice = Some(CloseWindowChoice::SaveAll);
-            }
-            if ui.button("Discard all").clicked() {
-                choice = Some(CloseWindowChoice::DiscardAll);
-            }
-            if ui.button("Cancel").clicked() {
-                choice = Some(CloseWindowChoice::Cancel);
-            }
-        });
-        choice
-    });
-    if modal.inner.is_none() && modal.should_close() {
-        return Some(CloseWindowChoice::Cancel);
-    }
-    modal.inner
+    };
+    let buttons = [
+        ("Save all", CloseWindowChoice::SaveAll),
+        ("Discard all", CloseWindowChoice::DiscardAll),
+        ("Cancel", CloseWindowChoice::Cancel),
+    ];
+    let cancel = CloseWindowChoice::Cancel;
+    confirm_modal(
+        ctx,
+        CLOSE_WINDOW_MODAL_ID,
+        UNSAVED_TITLE,
+        body,
+        &buttons,
+        cancel,
+    )
 }
 
 impl FedApp {

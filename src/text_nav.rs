@@ -36,6 +36,21 @@ fn class_at(rope: &Rope, pos: usize, big: bool) -> Option<CharClass> {
 
 /// Returns the start of the next word after `pos` (vim `w`), or the document end.
 pub fn next_word_start(rope: &Rope, pos: usize, big: bool) -> usize {
+    next_word_start_with(rope, pos, big, false)
+}
+
+/// Returns the start of the word before `pos` (vim `b`), or 0.
+pub fn prev_word_start(rope: &Rope, pos: usize, big: bool) -> usize {
+    prev_word_start_with(rope, pos, big, false)
+}
+
+/// True when the char at `i` is the line break of an empty line.
+pub fn is_empty_line_at(rope: &Rope, i: usize) -> bool {
+    i < rope.len_chars() && rope.char(i) == '\n' && (i == 0 || rope.char(i - 1) == '\n')
+}
+
+/// `next_word_start`; with `empty_lines`, an empty line counts as a word (vim `w`).
+pub fn next_word_start_with(rope: &Rope, pos: usize, big: bool, empty_lines: bool) -> usize {
     let len = rope.len_chars();
     let mut i = pos.min(len);
     let Some(start_class) = class_at(rope, i, big) else {
@@ -47,15 +62,21 @@ pub fn next_word_start(rope: &Rope, pos: usize, big: bool) -> usize {
         }
     }
     while class_at(rope, i, big) == Some(CharClass::Whitespace) {
+        if empty_lines && rope.char(i) == '\n' && is_empty_line_at(rope, i + 1) {
+            return i + 1;
+        }
         i += 1;
     }
     i
 }
 
-/// Returns the start of the word before `pos` (vim `b`), or 0.
-pub fn prev_word_start(rope: &Rope, pos: usize, big: bool) -> usize {
+/// `prev_word_start`; with `empty_lines`, an empty line counts as a word (vim `b`).
+pub fn prev_word_start_with(rope: &Rope, pos: usize, big: bool, empty_lines: bool) -> usize {
     let mut i = pos.min(rope.len_chars());
     while i > 0 && class_at(rope, i - 1, big) == Some(CharClass::Whitespace) {
+        if empty_lines && is_empty_line_at(rope, i - 1) {
+            return i - 1;
+        }
         i -= 1;
     }
     if i == 0 {
@@ -198,6 +219,15 @@ pub fn matching_bracket(rope: &Rope, pos: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use ropey::Rope;
+
+    #[test]
+    fn empty_lines_count_as_words_only_on_request() {
+        let rope = Rope::from_str("a\n\nb");
+        assert_eq!(next_word_start_with(&rope, 0, false, false), 3);
+        assert_eq!(next_word_start_with(&rope, 0, false, true), 2);
+        assert_eq!(prev_word_start_with(&rope, 3, false, false), 0);
+        assert_eq!(prev_word_start_with(&rope, 3, false, true), 2);
+    }
 
     #[test]
     fn move_word_over_accented_text() {

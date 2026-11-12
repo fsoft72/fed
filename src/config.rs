@@ -10,13 +10,13 @@ use serde::{Deserialize, Serialize};
 /// Default editor font size in points.
 const DEFAULT_FONT_SIZE: f32 = 14.0;
 /// Allowed font size range in points.
-const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 6.0..=72.0;
+pub const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 6.0..=72.0;
 /// Default Markdown preview font size in points.
 const DEFAULT_PREVIEW_FONT_SIZE: f32 = 14.0;
 /// Default tab width in columns.
 const DEFAULT_TAB_WIDTH: usize = 4;
 /// Allowed tab width range in columns.
-const TAB_WIDTH_RANGE: std::ops::RangeInclusive<usize> = 1..=16;
+pub const TAB_WIDTH_RANGE: std::ops::RangeInclusive<usize> = 1..=16;
 /// Default syntax theme for the light UI.
 const DEFAULT_CODE_THEME_LIGHT: &str = "InspiredGitHub";
 /// Default syntax theme for the dark UI.

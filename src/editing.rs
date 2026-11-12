@@ -241,12 +241,8 @@ fn move_vertical(
 /// Replaces the selection with `text` and puts the caret after it.
 fn insert_text(state: &mut EditorState, buf: &mut Buffer, text: &str) {
     let range = state.selection.range();
-    let pos = range.start
-        + text
-            .replace("\r\n", "\n")
-            .replace('\r', "\n")
-            .chars()
-            .count();
+    // The buffer stores `text` with its line breaks normalized: count what it inserts.
+    let pos = range.start + crate::buffer::normalize_newlines(text).chars().count();
     buf.replace(range, text);
     state.selection = Selection::caret(pos);
 }
