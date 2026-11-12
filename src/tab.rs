@@ -221,6 +221,19 @@ impl Tab {
         self.typing = false;
     }
 
+    /// Keeps the selection inside the text after the whole buffer was replaced (reload) and
+    /// scrolls the caret into view.
+    pub fn clamp_selection(&mut self) {
+        let len = self.buffer.rope().len_chars();
+        let sel = self.editor.selection;
+        self.editor.selection = crate::editing::Selection {
+            anchor: sel.anchor.min(len),
+            head: sel.head.min(len),
+        };
+        self.editor.preferred_col = None;
+        self.scroll_to_cursor = true;
+    }
+
     /// Replaces the vim state with a fresh one in Normal mode (vim mode switched on or off),
     /// closing any open undo group first and collapsing the selection to the caret.
     pub fn reset_vim(&mut self) {

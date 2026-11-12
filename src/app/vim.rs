@@ -13,6 +13,8 @@ use crate::vim::{Mode, VimEffect, VimKey, VimState, keys};
 
 /// Vim error for `:w {file}` on an existing file.
 const VIM_FILE_EXISTS: &str = "E13: File exists (add ! to override)";
+/// Vim error for `:w` when another program changed the file since it was read.
+const VIM_CHANGED_ON_DISK: &str = "E: file changed on disk since it was read (add ! to override)";
 /// Vim error for `:q` on a buffer with unsaved changes.
 const VIM_NO_WRITE: &str = "No write since last change (add ! to override)";
 /// The vim command bar font is this much larger than the editor font.
@@ -53,6 +55,10 @@ fn vim_save_message(outcome: &SaveOutcome, path: &str) -> Option<VimMessage> {
         }),
         SaveOutcome::Failed(e) => Some(VimMessage {
             text: e.clone(),
+            error: true,
+        }),
+        SaveOutcome::ChangedOnDisk => Some(VimMessage {
+            text: VIM_CHANGED_ON_DISK.to_string(),
             error: true,
         }),
         SaveOutcome::Cancelled => None,
@@ -142,13 +148,16 @@ impl FedApp {
                 VimEffect::Message(text) => self.set_vim_message(text, false),
                 VimEffect::Error(text) => self.set_vim_message(text, true),
                 VimEffect::Write(None) => {
-                    self.vim_write();
+                    self.vim_write(false);
                 }
                 VimEffect::Write(Some(path)) => self.vim_write_copy(path, false),
-                VimEffect::ForceWrite(path) => self.vim_write_copy(path, true),
+                VimEffect::ForceWrite(None) => {
+                    self.vim_write(true);
+                }
+                VimEffect::ForceWrite(Some(path)) => self.vim_write_copy(path, true),
                 VimEffect::Quit { force } => self.vim_quit(ctx, force),
                 VimEffect::WriteQuit => {
-                    if self.vim_write() {
+                    if self.vim_write(false) {
                         self.remove_tab(ctx, self.active);
                     }
                 }
@@ -162,10 +171,18 @@ impl FedApp {
     }
 
     /// `:w`: saves the active tab (Save As dialog when untitled) and reports the outcome in
-    /// the command bar. Returns true when the file was written.
-    pub(super) fn vim_write(&mut self) -> bool {
-        let outcome = self.save_tab_outcome(self.active);
-        let saved = self.report_save(self.active, &outcome);
+    /// the command bar. A file changed on disk is refused unless `force` (`:w!`), which
+    /// overwrites it. Returns true when the file was written.
+    pub(super) fn vim_write(&mut self, force: bool) -> bool {
+        let outcome = match force && self.tabs[self.active].buffer.path().is_some() {
+            true => self.overwrite_tab_outcome(self.active),
+            false => self.save_tab_outcome(self.active),
+        };
+        // The command bar reports a file changed on disk; no dialog in vim mode.
+        let saved = match outcome {
+            SaveOutcome::ChangedOnDisk => false,
+            _ => self.report_save(self.active, &outcome),
+        };
         let path = tab_path(&self.tabs[self.active]);
         self.vim_message = vim_save_message(&outcome, &path);
         saved
@@ -178,7 +195,7 @@ impl FedApp {
         let tab = &mut self.tabs[self.active];
         let path = resolve_vim_path(path, tab.buffer.path());
         if tab.buffer.path().is_some_and(|own| same_file(own, &path)) {
-            self.vim_write();
+            self.vim_write(force);
             return;
         }
         if !force && write_copy_refused(&path, tab.buffer.path()) {

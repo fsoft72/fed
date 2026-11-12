@@ -179,6 +179,8 @@ enum SaveOutcome {
     Saved,
     /// The user cancelled the Save As dialog.
     Cancelled,
+    /// Nothing was written: another program changed the file since it was read.
+    ChangedOnDisk,
     /// Writing failed with this message.
     Failed(String),
 }
@@ -188,6 +190,7 @@ impl SaveOutcome {
     fn from_result(result: Result<(), crate::buffer::BufferError>) -> SaveOutcome {
         match result {
             Ok(()) => SaveOutcome::Saved,
+            Err(crate::buffer::BufferError::ChangedOnDisk(_)) => SaveOutcome::ChangedOnDisk,
             Err(e) => SaveOutcome::Failed(e.to_string()),
         }
     }
@@ -625,10 +628,43 @@ impl FedApp {
         outcome
     }
 
-    /// Shows the outcome of saving the tab at `idx` in the status bar; returns true when the
-    /// file was written.
+    /// Saves the tab at `idx` to its file even when the file changed on disk, without
+    /// reporting.
+    fn overwrite_tab_outcome(&mut self, idx: usize) -> SaveOutcome {
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return SaveOutcome::Cancelled;
+        };
+        tab.end_typing();
+        SaveOutcome::from_result(tab.buffer.save_overwrite())
+    }
+
+    /// Replaces the text of the tab at `idx` with its file on disk (one undo step) and reports
+    /// the result in the status bar.
+    fn reload_tab(&mut self, idx: usize) {
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        tab.end_typing();
+        match tab.buffer.reload() {
+            Ok(()) => {
+                tab.clamp_selection();
+                let path = tab_path(tab);
+                self.set_status(format!("reloaded {path}"), Severity::Info);
+            }
+            Err(e) => self.set_status(e.to_string(), Severity::Error),
+        }
+    }
+
+    /// Shows the outcome of saving the tab at `idx` in the status bar (a file changed on disk
+    /// asks whether to overwrite or reload it); returns true when the file was written.
     fn report_save(&mut self, idx: usize, outcome: &SaveOutcome) -> bool {
         match outcome {
+            SaveOutcome::ChangedOnDisk => {
+                let path = tab_path(&self.tabs[idx]);
+                self.set_status(format!("{path} changed on disk"), Severity::Warning);
+                self.pending = Some(Pending::ChangedOnDisk(self.tabs[idx].id));
+                false
+            }
             SaveOutcome::Saved => {
                 let path = tab_path(&self.tabs[idx]);
                 self.set_status(format!("saved {path}"), Severity::Info);
@@ -1089,6 +1125,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn saving_a_file_changed_on_disk_asks_first() {
+        let dir = temp_dir("changed");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "alpha").unwrap();
+        let mut app = test_app(vec![path.clone()], FakeDialogs::default());
+        app.apply_to_active(EditCommand::InsertText("x".into()));
+        std::fs::write(&path, "changed elsewhere").unwrap();
+        assert!(!app.save_tab(0));
+        assert_eq!(app.pending, Some(Pending::ChangedOnDisk(app.tabs[0].id)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed elsewhere");
+        app.pending = None;
+        app.resolve_changed_on_disk(0, dialogs::ChangedOnDiskChoice::Overwrite);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "xalpha");
+        std::fs::write(&path, "third version").unwrap();
+        app.resolve_changed_on_disk(0, dialogs::ChangedOnDiskChoice::Reload);
+        assert_eq!(app.tabs[0].buffer.text(), "third version");
+        assert!(!app.tabs[0].buffer.is_modified());
+    }
+
+    #[test]
+    fn vim_write_refuses_a_changed_file_unless_forced() {
+        let dir = temp_dir("vim-changed");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "alpha").unwrap();
+        let mut app = test_app(vec![path.clone()], FakeDialogs::default());
+        app.apply_to_active(EditCommand::InsertText("x".into()));
+        std::fs::write(&path, "changed elsewhere").unwrap();
+        assert!(!app.vim_write(false));
+        assert!(app.vim_message.is_some());
+        assert_eq!(
+            app.pending, None,
+            "vim reports in the command bar, no dialog"
+        );
+        assert!(app.vim_write(true));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "xalpha");
     }
 
     #[test]

@@ -51,8 +51,9 @@ pub struct LineRange {
 pub enum ExCommand {
     /// `:w`, `:w {file}`.
     Write(Option<PathBuf>),
-    /// `:w! {file}`: write a copy even when the file exists.
-    ForceWrite(PathBuf),
+    /// `:w!`: write even when the file changed on disk; `:w! {file}`: write a copy even when
+    /// the file exists.
+    ForceWrite(Option<PathBuf>),
     /// `:q`, `:q!`.
     Quit {
         /// Discard unsaved changes (`!`).
@@ -110,8 +111,9 @@ pub fn parse(input: &str) -> Result<ExCommand, String> {
     }
     let arg = tail.trim();
     let cmd = match name {
+        "w" | "write" if bang && arg.is_empty() => ExCommand::ForceWrite(None),
         "w" | "write" if arg.is_empty() => ExCommand::Write(None),
-        "w" | "write" if bang => ExCommand::ForceWrite(PathBuf::from(arg)),
+        "w" | "write" if bang => ExCommand::ForceWrite(Some(PathBuf::from(arg))),
         "w" | "write" => ExCommand::Write(Some(PathBuf::from(arg))),
         "q" | "quit" if arg.is_empty() => ExCommand::Quit { force: bang },
         "wq" if arg.is_empty() => ExCommand::WriteQuit,
@@ -124,7 +126,6 @@ pub fn parse(input: &str) -> Result<ExCommand, String> {
     if range.is_some() {
         return Err(NO_RANGE_ALLOWED.to_string());
     }
-    // `:w!` without a file is a plain write.
     let bang_allowed = matches!(
         cmd,
         ExCommand::Quit { .. } | ExCommand::Write(None) | ExCommand::ForceWrite(_)
@@ -402,10 +403,10 @@ mod tests {
         assert_eq!(parse("q!"), Ok(ExCommand::Quit { force: true }));
         assert_eq!(parse("wq"), Ok(ExCommand::WriteQuit));
         assert_eq!(parse("x"), Ok(ExCommand::Exit));
-        assert_eq!(parse("w!"), Ok(ExCommand::Write(None)));
+        assert_eq!(parse("w!"), Ok(ExCommand::ForceWrite(None)));
         assert_eq!(
             parse("w! out.txt"),
-            Ok(ExCommand::ForceWrite(PathBuf::from("out.txt")))
+            Ok(ExCommand::ForceWrite(Some(PathBuf::from("out.txt"))))
         );
         assert!(parse("wq!").is_err());
         assert_eq!(

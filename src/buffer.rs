@@ -6,6 +6,7 @@ use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::SystemTime;
 
 use ropey::{Rope, RopeBuilder};
 
@@ -76,6 +77,30 @@ pub enum BufferError {
     /// A save was requested but the buffer is not bound to a path.
     #[error("buffer has no file path")]
     NoPath,
+    /// The file was changed on disk by another program since it was read or saved.
+    #[error("{0}: file changed on disk since it was read")]
+    ChangedOnDisk(PathBuf),
+}
+
+/// What the file of a buffer looked like on disk when it was last read or written, to notice
+/// changes made by other programs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiskStamp {
+    /// Last modification time, when the file system reports one.
+    modified: Option<SystemTime>,
+    /// File size in bytes.
+    len: u64,
+}
+
+impl DiskStamp {
+    /// Stamp of the file at `path`, `None` when it does not exist (or cannot be read).
+    fn of(path: &Path) -> Option<DiskStamp> {
+        let meta = fs::metadata(path).ok()?;
+        Some(DiskStamp {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+        })
+    }
 }
 
 /// One primitive text replacement, stored so it can be reverted.
@@ -123,6 +148,8 @@ pub struct Buffer {
     /// Canonical form of `path`, computed when it is bound or saved; `None` while the file
     /// does not exist.
     canonical: Option<PathBuf>,
+    /// The bound file as last read or written by this buffer; `None` when it did not exist.
+    disk: Option<DiskStamp>,
     line_ending: LineEnding,
     large: bool,
     revision: u64,
@@ -164,6 +191,7 @@ impl Buffer {
             rope,
             path: None,
             canonical: None,
+            disk: None,
             line_ending: if crlf {
                 LineEnding::Crlf
             } else {
@@ -186,22 +214,35 @@ impl Buffer {
     /// `MAX_FILE_BYTES` is refused before it is read. The text is held at most twice while
     /// loading (the file contents and the rope).
     pub fn load(path: &Path) -> Result<Buffer, BufferError> {
-        let io_err = |source| BufferError::Io {
-            path: path.to_path_buf(),
-            source,
-        };
-        check_size(path)?;
-        let mut buf = match fs::read(path) {
-            Ok(bytes) => {
-                let text = String::from_utf8(bytes)
-                    .map_err(|_| BufferError::NotUtf8(path.to_path_buf()))?;
-                Self::from_text(&text)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::new(),
-            Err(e) => return Err(io_err(e)),
-        };
+        let (text, disk) = read_file(path)?;
+        let mut buf = Self::from_text(text.as_deref().unwrap_or(""));
         buf.bind(path.to_path_buf());
+        buf.disk = disk;
         Ok(buf)
+    }
+
+    /// Replaces the content with the file on disk, as one undo step (so the reload can be
+    /// undone), and marks the buffer as saved. The save line ending follows the file again.
+    /// Callers must close any open undo group first.
+    pub fn reload(&mut self) -> Result<(), BufferError> {
+        debug_assert_eq!(self.group_depth, 0, "reload with an open undo group");
+        let path = self.path.clone().ok_or(BufferError::NoPath)?;
+        let (text, disk) = read_file(&path)?;
+        let text = text.unwrap_or_default();
+        self.line_ending = detect_line_ending(&text);
+        let len = self.rope.len_chars();
+        self.replace(0..len, &text);
+        self.saved_position = Some(self.position);
+        self.disk = disk;
+        Ok(())
+    }
+
+    /// True when the bound file was created, changed or deleted by another program since this
+    /// buffer last read or wrote it (modification time or size differ).
+    pub fn changed_on_disk(&self) -> bool {
+        self.path
+            .as_deref()
+            .is_some_and(|path| DiskStamp::of(path) != self.disk)
     }
 
     /// Returns the bound file path, if any.
@@ -229,14 +270,27 @@ impl Buffer {
             .is_some_and(|own| same_file(own, self.canonical.as_deref(), path, canonical))
     }
 
-    /// Saves to the bound path. Callers must close any open undo group first.
+    /// Saves to the bound path. Refuses with `ChangedOnDisk` when another program changed the
+    /// file since it was read or saved (see `save_overwrite`). Callers must close any open
+    /// undo group first.
     pub fn save(&mut self) -> Result<(), BufferError> {
+        let path = self.path.clone().ok_or(BufferError::NoPath)?;
+        if self.changed_on_disk() {
+            return Err(BufferError::ChangedOnDisk(path));
+        }
+        self.save_overwrite()
+    }
+
+    /// Saves to the bound path even when the file changed on disk. Callers must close any
+    /// open undo group first.
+    pub fn save_overwrite(&mut self) -> Result<(), BufferError> {
         debug_assert_eq!(self.group_depth, 0, "save with an open undo group");
         let path = self.path.clone().ok_or(BufferError::NoPath)?;
         self.write_copy(&path)?;
         self.saved_position = Some(self.position);
         // The file exists now, even if it did not when the buffer was bound.
         self.canonical = fs::canonicalize(&path).ok();
+        self.disk = DiskStamp::of(&path);
         Ok(())
     }
 
@@ -244,6 +298,7 @@ impl Buffer {
     /// path, so a failed "Save As" does not silently retarget later saves.
     pub fn save_as(&mut self, path: PathBuf) -> Result<(), BufferError> {
         self.write_copy(&path)?;
+        self.disk = DiskStamp::of(&path);
         self.bind(path);
         self.saved_position = Some(self.position);
         Ok(())
@@ -618,6 +673,26 @@ fn detect_line_ending(text: &str) -> LineEnding {
     }
 }
 
+/// Reads the UTF-8 text of the file at `path` and its stamp taken before the read (so a
+/// change during the read is noticed later). A missing file gives `(None, None)`; a file over
+/// `MAX_FILE_BYTES` is refused before it is read.
+fn read_file(path: &Path) -> Result<(Option<String>, Option<DiskStamp>), BufferError> {
+    check_size(path)?;
+    let disk = DiskStamp::of(path);
+    match fs::read(path) {
+        Ok(bytes) => {
+            let text =
+                String::from_utf8(bytes).map_err(|_| BufferError::NotUtf8(path.to_path_buf()))?;
+            Ok((Some(text), disk))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((None, None)),
+        Err(source) => Err(BufferError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Returns the size of the file at `path` in bytes, 0 when it cannot be read (a missing
 /// file opens empty, other errors are reported by the read itself).
 pub fn file_size(path: &Path) -> u64 {
@@ -725,6 +800,54 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn save_refuses_a_file_changed_on_disk() {
+        let dir = temp_dir("changed");
+        let path = dir.join("a.txt");
+        fs::write(&path, "one\n").unwrap();
+        let mut buf = Buffer::load(&path).unwrap();
+        assert!(!buf.changed_on_disk());
+        buf.replace(0..0, "x");
+        fs::write(&path, "other program\n").unwrap();
+        assert!(buf.changed_on_disk());
+        assert!(matches!(buf.save(), Err(BufferError::ChangedOnDisk(_))));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "other program\n");
+        buf.save_overwrite().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "xone\n");
+        assert!(!buf.changed_on_disk(), "own saves do not count");
+        buf.replace(0..1, "");
+        buf.save().unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(buf.changed_on_disk(), "a deleted file counts as changed");
+    }
+
+    #[test]
+    fn a_missing_file_created_by_someone_else_counts_as_changed() {
+        let dir = temp_dir("created");
+        let path = dir.join("new.txt");
+        let buf = Buffer::load(&path).unwrap();
+        assert!(!buf.changed_on_disk());
+        fs::write(&path, "hi").unwrap();
+        assert!(buf.changed_on_disk());
+    }
+
+    #[test]
+    fn reload_takes_the_disk_text_as_one_undo_step() {
+        let dir = temp_dir("reload");
+        let path = dir.join("a.txt");
+        fs::write(&path, "old\n").unwrap();
+        let mut buf = Buffer::load(&path).unwrap();
+        buf.replace(0..0, "mine ");
+        fs::write(&path, "new\r\ntext\r\n").unwrap();
+        buf.reload().unwrap();
+        assert_eq!(buf.text(), "new\ntext\n");
+        assert_eq!(buf.line_ending(), LineEnding::Crlf);
+        assert!(!buf.is_modified());
+        assert!(!buf.changed_on_disk());
+        buf.undo();
+        assert_eq!(buf.text(), "mine old\n");
     }
 
     #[test]

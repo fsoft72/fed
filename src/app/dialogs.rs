@@ -9,6 +9,10 @@ use crate::tab::Tab;
 const CLOSE_TAB_MODAL_ID: &str = "fed_close_tab_modal";
 /// Id of the close-window confirmation modal.
 const CLOSE_WINDOW_MODAL_ID: &str = "fed_close_window_modal";
+/// Id of the "changed on disk" modal.
+const CHANGED_ON_DISK_MODAL_ID: &str = "fed_changed_on_disk_modal";
+/// Title of the "changed on disk" modal.
+const CHANGED_ON_DISK_TITLE: &str = "File changed on disk";
 
 /// A confirmation the application is waiting for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,6 +22,19 @@ pub(crate) enum Pending {
     /// Closing the window while the tabs listed in `names` (paths, computed once when the
     /// dialog opens) have unsaved changes.
     CloseWindow { names: Vec<String> },
+    /// Saving the tab with this id was refused: its file changed on disk.
+    ChangedOnDisk(u64),
+}
+
+/// Answer to the "changed on disk" question asked when a save is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChangedOnDiskChoice {
+    /// Write the editor text over the file anyway.
+    Overwrite,
+    /// Replace the editor text with the file (undoable).
+    Reload,
+    /// Leave both alone.
+    Cancel,
 }
 
 /// Answer to the close-tab confirmation.
@@ -127,6 +144,32 @@ pub(crate) fn confirm_close_window(
     )
 }
 
+/// Shows the modal telling that the file of the tab named `name` changed on disk. Returns
+/// the user's answer in the frame it is given; Escape or a click outside counts as Cancel.
+pub(crate) fn confirm_changed_on_disk(
+    ctx: &egui::Context,
+    name: &str,
+) -> Option<ChangedOnDiskChoice> {
+    let body = |ui: &mut egui::Ui| {
+        ui.label(format!(
+            "\"{name}\" was changed by another program since it was opened or saved."
+        ));
+    };
+    let buttons = [
+        ("Overwrite", ChangedOnDiskChoice::Overwrite),
+        ("Reload", ChangedOnDiskChoice::Reload),
+        ("Cancel", ChangedOnDiskChoice::Cancel),
+    ];
+    confirm_modal(
+        ctx,
+        CHANGED_ON_DISK_MODAL_ID,
+        CHANGED_ON_DISK_TITLE,
+        body,
+        &buttons,
+        ChangedOnDiskChoice::Cancel,
+    )
+}
+
 impl FedApp {
     /// Saves every modified tab; stops and returns false at the first failure or cancel.
     fn save_all_modified(&mut self) -> bool {
@@ -190,7 +233,35 @@ impl FedApp {
         match &self.pending {
             Some(Pending::CloseTab(id)) => self.close_tab_dialog(ctx, *id),
             Some(Pending::CloseWindow { .. }) => self.close_window_dialog(ctx),
+            Some(Pending::ChangedOnDisk(id)) => self.changed_on_disk_dialog(ctx, *id),
             None => {}
+        }
+    }
+
+    /// Runs the "changed on disk" question for the tab with `id`.
+    fn changed_on_disk_dialog(&mut self, ctx: &egui::Context, id: u64) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
+            self.pending = None;
+            return;
+        };
+        let name = self.tabs[idx].buffer.display_name();
+        let Some(choice) = confirm_changed_on_disk(ctx, &name) else {
+            return;
+        };
+        self.pending = None;
+        self.tabs[self.active].focus_editor();
+        self.resolve_changed_on_disk(idx, choice);
+    }
+
+    /// Carries out the answer to the "changed on disk" question for the tab at `idx`.
+    pub(super) fn resolve_changed_on_disk(&mut self, idx: usize, choice: ChangedOnDiskChoice) {
+        match choice {
+            ChangedOnDiskChoice::Overwrite => {
+                let outcome = self.overwrite_tab_outcome(idx);
+                self.report_save(idx, &outcome);
+            }
+            ChangedOnDiskChoice::Reload => self.reload_tab(idx),
+            ChangedOnDiskChoice::Cancel => {}
         }
     }
 
