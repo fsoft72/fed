@@ -219,12 +219,66 @@ pub fn preview_visuals(dark: bool) -> egui::Visuals {
     }
 }
 
+/// Side of the sun/moon icon of the preview light/dark toggle, in points.
+const MODE_ICON_SIZE: f32 = 12.0;
+/// Id salt of the icon slot inside the preview light/dark toggle.
+const MODE_ICON_ID: &str = "fed_preview_mode_icon";
+/// Number of rays of the sun icon.
+const SUN_RAYS: usize = 8;
+/// Stroke width of the sun rays, in points.
+const ICON_STROKE_WIDTH: f32 = 1.5;
+
 /// Label of the preview light/dark toggle: it names the mode a click switches to.
 pub fn preview_mode_toggle_label(dark: bool) -> &'static str {
     match dark {
-        true => "\u{2600} Light",
-        false => "\u{1F319} Dark",
+        true => "Light",
+        false => "Dark",
     }
+}
+
+/// Draws the small light/dark toggle of the preview: a painted sun (switch to light) or
+/// moon (switch to dark) followed by its label. The icon is painted, not a glyph, because
+/// the bundled fonts carry no emoji. Returns the button response.
+pub fn preview_mode_toggle(ui: &mut egui::Ui, dark: bool) -> egui::Response {
+    let icon = egui::IdSalt::new(MODE_ICON_ID);
+    let slot = egui::Atom::custom(icon, egui::Vec2::splat(MODE_ICON_SIZE));
+    let label = preview_mode_toggle_label(dark);
+    let response = egui::Button::new((slot, label)).small().atom_ui(ui);
+    if let Some(rect) = response.rect(icon) {
+        let visuals = ui.style().interact(&response.response);
+        let color = visuals.text_color();
+        match dark {
+            true => paint_sun(ui.painter(), rect, color),
+            false => paint_moon(ui.painter(), rect, color, visuals.weak_bg_fill),
+        }
+    }
+    response.response
+}
+
+/// Paints a sun inside `rect`: a filled disc with short rays around it.
+fn paint_sun(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) / 2.0;
+    let stroke = egui::Stroke::new(ICON_STROKE_WIDTH, color);
+    painter.circle_filled(center, radius * 0.4, color);
+    for i in 0..SUN_RAYS {
+        let angle = i as f32 * std::f32::consts::TAU / SUN_RAYS as f32;
+        let dir = egui::Vec2::angled(angle);
+        painter.line_segment(
+            [center + dir * radius * 0.65, center + dir * radius],
+            stroke,
+        );
+    }
+}
+
+/// Paints a crescent moon inside `rect`: a disc in `color` with an offset disc in the
+/// button background `bg` cut out of its upper right part.
+fn paint_moon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, bg: egui::Color32) {
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) / 2.0;
+    painter.circle_filled(center, radius, color);
+    let offset = egui::vec2(radius * 0.45, -radius * 0.35);
+    painter.circle_filled(center + offset, radius * 0.8, bg);
 }
 
 /// How long the buffer must stay unchanged before the preview source is rebuilt.

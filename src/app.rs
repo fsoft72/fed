@@ -758,9 +758,7 @@ impl FedApp {
                 ui.style_mut().visuals = visuals;
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = markdown::preview_mode_toggle_label(dark);
-                        toggled = ui
-                            .small_button(label)
+                        toggled = markdown::preview_mode_toggle(ui, dark)
                             .on_hover_text("Switch the preview between light and dark")
                             .clicked();
                     });
