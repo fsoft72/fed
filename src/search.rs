@@ -149,6 +149,47 @@ pub struct Substitution {
     pub last_line: usize,
 }
 
+/// Which matches of a line a replacement rewrites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MatchRule {
+    /// Every match of the line, not only the first.
+    global: bool,
+    /// Matches of no text are left alone (the find bar never shows them).
+    skip_empty: bool,
+}
+
+/// Replaces the matches of `re` in `text` chosen by `rule` with `replacement` (`$1` groups
+/// expanded) and returns the new text with the number of replaced matches, or `None` when
+/// nothing matched. The count is exactly the number of replacements made.
+fn replace_in_line(
+    re: &Regex,
+    text: &str,
+    replacement: &str,
+    rule: MatchRule,
+) -> Option<(String, usize)> {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut count = 0;
+    for caps in re.captures_iter(text) {
+        let m = caps.get(0).expect("group 0 is the whole match");
+        if rule.skip_empty && m.is_empty() {
+            continue;
+        }
+        out.push_str(&text[last..m.start()]);
+        caps.expand(replacement, &mut out);
+        last = m.end();
+        count += 1;
+        if !rule.global {
+            break;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    out.push_str(&text[last..]);
+    Some((out, count))
+}
+
 /// Rewrites the content of `lines` (end-exclusive, 0-based) and returns the match count and
 /// the last line that matched.
 ///
@@ -160,9 +201,8 @@ fn rewrite_lines(
     re: &Regex,
     replacement: &str,
     lines: Range<usize>,
-    global: bool,
+    rule: MatchRule,
 ) -> (usize, Option<usize>) {
-    let limit = if global { 0 } else { 1 };
     let end = lines.end.min(buf.rope().len_lines());
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
     let mut count = 0;
@@ -170,17 +210,11 @@ fn rewrite_lines(
     for index in lines.start..end {
         let rope = buf.rope();
         let text = text_nav::line_text(rope, index);
-        let matches = if global {
-            re.find_iter(&text).count()
-        } else {
-            usize::from(re.is_match(&text))
-        };
-        if matches == 0 {
+        let Some((new_text, matches)) = replace_in_line(re, &text, replacement, rule) else {
             continue;
-        }
+        };
         count += matches;
         last_line = Some(index);
-        let new_text = re.replacen(&text, limit, replacement).into_owned();
         let start = rope.line_to_char(index);
         edits.push((start..start + text.chars().count(), new_text));
     }
@@ -204,7 +238,12 @@ pub fn substitute(
     global: bool,
 ) -> Result<Substitution, SearchError> {
     buf.begin_group();
-    let (count, last_line) = rewrite_lines(buf, re, replacement, lines, global);
+    // Vim semantics: empty matches count (`:s/^/# /` prefixes the lines).
+    let rule = MatchRule {
+        global,
+        skip_empty: false,
+    };
+    let (count, last_line) = rewrite_lines(buf, re, replacement, lines, rule);
     buf.end_group();
     match last_line {
         Some(last_line) => Ok(Substitution { count, last_line }),
@@ -216,7 +255,12 @@ pub fn substitute(
 pub fn replace_all(buf: &mut Buffer, re: &Regex, replacement: &str) -> usize {
     let lines = 0..buf.rope().len_lines();
     buf.begin_group();
-    let (count, _) = rewrite_lines(buf, re, replacement, lines, true);
+    // Only the matches the find bar shows and counts (`line_matches` skips empty ones).
+    let rule = MatchRule {
+        global: true,
+        skip_empty: true,
+    };
+    let (count, _) = rewrite_lines(buf, re, replacement, lines, rule);
     buf.end_group();
     count
 }
@@ -415,6 +459,27 @@ mod tests {
         assert_eq!((dirty.start, dirty.end, dirty.old_end), (0, 2000, 2000));
         let matches = find_all(buf.rope(), &Regex::new("b").unwrap());
         assert_eq!(matches.len(), 2000);
+    }
+
+    #[test]
+    fn replace_all_counts_and_replaces_only_the_matches_shown() {
+        let mut buf = Buffer::from_text("baab\nxyz\n");
+        let re = Regex::new("a*").unwrap();
+        assert_eq!(find_all(buf.rope(), &re).len(), 1);
+        assert_eq!(replace_all(&mut buf, &re, "X"), 1);
+        assert_eq!(buf.text(), "bXb\nxyz\n");
+    }
+
+    #[test]
+    fn substitute_keeps_empty_matches_like_vim() {
+        let mut buf = Buffer::from_text("a\nb\n");
+        let re = Regex::new("^").unwrap();
+        let sub = substitute(&mut buf, &re, "# ", 0..2, false).unwrap();
+        assert_eq!(sub.count, 2);
+        assert_eq!(buf.text(), "# a\n# b\n");
+        let mut buf = Buffer::from_text("baab\n");
+        let sub = substitute(&mut buf, &Regex::new("a*").unwrap(), "X", 0..1, true).unwrap();
+        assert_eq!(buf.text().matches('X').count(), sub.count);
     }
 
     #[test]
