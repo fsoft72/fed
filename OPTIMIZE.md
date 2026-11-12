@@ -64,7 +64,7 @@
 - [x] **Inconsistent lock poisoning policy** - `SpellService::status` recovers from poisoning with `PoisonError::into_inner`, while `checker()`, `AssetsHandle::get`, `ensure_warm` and the decorators `expect` on the same kind of locks, so a panic in a background thread turns into a UI crash on the next frame; pick one policy (recover and report) for all shared slots.
   - File(s): `src/spell/mod.rs`, `src/highlight.rs`
 
-- [ ] **`same_file` canonicalizes every open tab on each open** - `try_open` calls `canonicalize` for both paths of every tab and every pending load, so restoring a session of N files makes O(N^2) file system calls; store the canonical path in `Buffer` when it is loaded or saved and compare that.
+- [x] **`same_file` canonicalizes every open tab on each open** - `try_open` calls `canonicalize` for both paths of every tab and every pending load, so restoring a session of N files makes O(N^2) file system calls; store the canonical path in `Buffer` when it is loaded or saved and compare that.
   - File(s): `src/app.rs`, `src/app/vim.rs`, `src/buffer.rs`
 
 - [ ] **Closed previews keep their memory** - `Tab::preview` (a `CommonMarkCache` plus a full copy of the source) stays allocated after the preview is toggled off; set it to `None` when `preview_open` becomes false.

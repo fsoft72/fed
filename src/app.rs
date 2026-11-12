@@ -405,15 +405,22 @@ impl FedApp {
     /// `BACKGROUND_LOAD_BYTES` or more are read on a background thread and get their tab in a
     /// later frame (`poll_loads`); files over `buffer::MAX_FILE_BYTES` are refused.
     fn try_open(&mut self, path: PathBuf) -> Result<(), String> {
+        // One canonicalize for the new path; open tabs and loads keep theirs.
+        let canonical = path.canonicalize().ok();
+        let canonical = canonical.as_deref();
         let open = self
             .tabs
             .iter()
-            .position(|t| t.buffer.path().is_some_and(|p| same_file(p, &path)));
+            .position(|t| t.buffer.is_bound_to(&path, canonical));
         if let Some(idx) = open {
             self.activate(idx);
             return Ok(());
         }
-        if self.loads.iter().any(|job| same_file(job.path(), &path)) {
+        if self
+            .loads
+            .iter()
+            .any(|job| job.is_loading(&path, canonical))
+        {
             return Ok(());
         }
         let size = buffer::check_size(&path).map_err(|e| e.to_string())?;
@@ -1097,6 +1104,10 @@ mod tests {
             Some(b.as_path()),
             "a missing file opens empty"
         );
+        app.active = 1;
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        app.open_path(dir.join("sub").join("..").join("a.txt"));
+        assert_eq!(app.active, 0, "the same file through another path");
         app.open_path(a);
         assert_eq!(
             app.tabs.len(),

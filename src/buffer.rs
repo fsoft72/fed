@@ -120,6 +120,9 @@ pub struct DirtyLines {
 pub struct Buffer {
     rope: Rope,
     path: Option<PathBuf>,
+    /// Canonical form of `path`, computed when it is bound or saved; `None` while the file
+    /// does not exist.
+    canonical: Option<PathBuf>,
     line_ending: LineEnding,
     large: bool,
     revision: u64,
@@ -160,6 +163,7 @@ impl Buffer {
         Buffer {
             rope,
             path: None,
+            canonical: None,
             line_ending: if crlf {
                 LineEnding::Crlf
             } else {
@@ -196,7 +200,7 @@ impl Buffer {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::new(),
             Err(e) => return Err(io_err(e)),
         };
-        buf.path = Some(path.to_path_buf());
+        buf.bind(path.to_path_buf());
         Ok(buf)
     }
 
@@ -207,7 +211,22 @@ impl Buffer {
 
     /// Binds the buffer to `path` without saving.
     pub fn set_path(&mut self, path: PathBuf) {
+        self.bind(path);
+    }
+
+    /// Binds the buffer to `path` and remembers its canonical form.
+    fn bind(&mut self, path: PathBuf) {
+        self.canonical = fs::canonicalize(&path).ok();
         self.path = Some(path);
+    }
+
+    /// True when the buffer is bound to the file `path`, whose canonical form is `canonical`
+    /// (see `same_file`). Compares the canonical path kept by the buffer, so checking every
+    /// open tab costs no file system call.
+    pub fn is_bound_to(&self, path: &Path, canonical: Option<&Path>) -> bool {
+        self.path
+            .as_deref()
+            .is_some_and(|own| same_file(own, self.canonical.as_deref(), path, canonical))
     }
 
     /// Saves to the bound path. Callers must close any open undo group first.
@@ -216,6 +235,8 @@ impl Buffer {
         let path = self.path.clone().ok_or(BufferError::NoPath)?;
         self.write_copy(&path)?;
         self.saved_position = Some(self.position);
+        // The file exists now, even if it did not when the buffer was bound.
+        self.canonical = fs::canonicalize(&path).ok();
         Ok(())
     }
 
@@ -223,7 +244,7 @@ impl Buffer {
     /// path, so a failed "Save As" does not silently retarget later saves.
     pub fn save_as(&mut self, path: PathBuf) -> Result<(), BufferError> {
         self.write_copy(&path)?;
-        self.path = Some(path);
+        self.bind(path);
         self.saved_position = Some(self.position);
         Ok(())
     }
@@ -559,6 +580,17 @@ fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// True when paths `a` and `b` name the same file: equal paths, or equal canonical forms
+/// (`a_canonical` and `b_canonical`, `None` when that file does not exist).
+pub fn same_file(
+    a: &Path,
+    a_canonical: Option<&Path>,
+    b: &Path,
+    b_canonical: Option<&Path>,
+) -> bool {
+    a == b || (a_canonical.is_some() && a_canonical == b_canonical)
+}
+
 /// True when `rope` is at least `LARGE_FILE_BYTES` long or one of `lines` is longer than
 /// `LONG_LINE_CHARS` chars.
 fn is_large_text(rope: &Rope, lines: Range<usize>) -> bool {
@@ -630,6 +662,8 @@ fn build_rope(text: &str) -> Rope {
 pub struct LoadJob {
     /// The file being loaded.
     path: PathBuf,
+    /// Canonical form of `path` (`None` when the file does not exist).
+    canonical: Option<PathBuf>,
     /// Receives the load result.
     rx: Receiver<Result<Buffer, BufferError>>,
 }
@@ -643,12 +677,22 @@ impl LoadJob {
             // Nobody listening (the app closed) is fine.
             let _ = tx.send(Buffer::load(&thread_path));
         });
-        LoadJob { path, rx }
+        let canonical = fs::canonicalize(&path).ok();
+        LoadJob {
+            path,
+            canonical,
+            rx,
+        }
     }
 
     /// The file being loaded.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// True when this job loads the file `path` with canonical form `canonical`.
+    pub fn is_loading(&self, path: &Path, canonical: Option<&Path>) -> bool {
+        same_file(&self.path, self.canonical.as_deref(), path, canonical)
     }
 
     /// Returns the result once the thread is done, `None` while it is still loading.
@@ -681,6 +725,28 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn buffers_compare_files_by_canonical_path() {
+        let dir = temp_dir("canonical");
+        let path = dir.join("a.txt");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        // `Path` equality ignores `.` components but not `..`.
+        let dotted = dir.join("sub").join("..").join("a.txt");
+        let mut buf = Buffer::load(&path).unwrap();
+        let canonical = |p: &Path| fs::canonicalize(p).ok();
+        assert!(buf.is_bound_to(&path, None), "the same path, file missing");
+        assert!(!buf.is_bound_to(&dotted, canonical(&dotted).as_deref()));
+        buf.save().unwrap();
+        let c = canonical(&dotted);
+        assert!(c.is_some());
+        assert!(buf.is_bound_to(&dotted, c.as_deref()), "known once saved");
+        assert!(!buf.is_bound_to(&dir.join("b.txt"), None));
+        let loaded = Buffer::load(&dotted).unwrap();
+        assert!(loaded.is_bound_to(&path, canonical(&path).as_deref()));
+        let job = LoadJob::spawn(dotted.clone());
+        assert!(job.is_loading(&path, canonical(&path).as_deref()));
     }
 
     #[test]
