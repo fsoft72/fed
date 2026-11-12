@@ -3,6 +3,8 @@
 //! Pure logic over a [`Buffer`] and an [`EditorState`]; the UI translates input into
 //! [`VimKey`]s and acts on the returned [`VimEffect`]s.
 //!
+//! `keys` translates egui keyboard events into `VimKey`s.
+//!
 //! One file per mode: `normal` (parsing and Normal commands), `insert`, `visual` and
 //! `command_mode`; `operator` applies `d c y > <`, `motion` and `textobj` find their ranges
 //! and `cmdline` parses and runs ex commands.
@@ -10,6 +12,7 @@
 pub mod cmdline;
 mod command_mode;
 mod insert;
+pub mod keys;
 pub mod motion;
 mod normal;
 mod operator;

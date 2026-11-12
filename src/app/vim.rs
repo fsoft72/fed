@@ -9,8 +9,7 @@ use super::{FedApp, SaveOutcome, Severity, close_requires_confirmation, same_fil
 use crate::editing::EditSettings;
 use crate::fonts;
 use crate::tab::Tab;
-use crate::view;
-use crate::vim::{Mode, VimEffect, VimKey, VimState};
+use crate::vim::{Mode, VimEffect, VimKey, VimState, keys};
 
 /// Vim error for `:w {file}` on an existing file.
 const VIM_FILE_EXISTS: &str = "E13: File exists (add ! to override)";
@@ -104,7 +103,7 @@ pub(super) fn route_event(
             .filter(|&c| c != '\r')
             .map(VimKey::Char)
             .collect(),
-        _ => view::egui_event_to_vim_keys(ev),
+        _ => keys::egui_event_to_vim_keys(ev),
     };
     for key in keys {
         let fx = tab
