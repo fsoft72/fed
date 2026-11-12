@@ -59,7 +59,7 @@
   - File(s): `src/config.rs`, `src/settings_ui.rs`, `src/app/dialogs.rs`, `src/find_bar.rs`, `src/vim/motion.rs`, `src/editing.rs`, `src/markdown.rs`, `src/spell/mod.rs`
 - [x] **Dead code and a dropped style** - `text_nav::matching_bracket` and `words::words` are only used by tests, and `StyledSpan::bold` is computed but never applied in `HighlightDecorator::decorate`, so bold theme styles are lost.
   - File(s): `src/text_nav.rs`, `src/spell/words.rs`, `src/highlight.rs`
-- [ ] **Undo history clones whole steps and is unbounded** - `Buffer::undo` / `redo` clone `history[position]` instead of borrowing it (a `replace_all` step duplicates the whole text), and the history has no size cap.
+- [x] **Undo history clones whole steps and is unbounded** - `Buffer::undo` / `redo` clone `history[position]` instead of borrowing it (a `replace_all` step duplicates the whole text), and the history has no size cap.
   - File(s): `src/buffer.rs`
 - [ ] **Small vim correctness gaps** - `2.` after `d3w` deletes 6 words instead of 2 (`with_count` only swaps a leading count); Insert-mode soft tab uses the char column instead of the display column on lines containing tabs; `enclosing_open` walks back char by char with `rope.char(i)` to the start of the file.
   - File(s): `src/vim/normal.rs`, `src/vim/mod.rs`, `src/vim/textobj.rs`

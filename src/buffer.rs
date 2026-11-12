@@ -17,6 +17,10 @@ pub const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 pub const BACKGROUND_LOAD_BYTES: u64 = 1024 * 1024;
 /// Lines longer than this many chars flag the buffer as large.
 pub const LONG_LINE_CHARS: usize = 10_000;
+/// Most undo steps kept; older ones are dropped.
+const MAX_UNDO_STEPS: usize = 1000;
+/// Most text (removed plus inserted bytes) the undo history keeps; older steps are dropped.
+const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
 /// Number of recent edits remembered by `first_dirty_line_since`.
 const EDIT_LOG_LEN: usize = 1024;
 /// Suffix of the temporary file used for atomic saves.
@@ -119,7 +123,10 @@ pub struct Buffer {
     line_ending: LineEnding,
     large: bool,
     revision: u64,
-    history: Vec<Vec<Edit>>,
+    /// Undo steps, oldest first, bounded by `MAX_UNDO_STEPS` and `MAX_UNDO_BYTES`.
+    history: VecDeque<Vec<Edit>>,
+    /// Text size of `history` (see `step_bytes`).
+    history_bytes: usize,
     /// Number of history steps currently applied.
     position: usize,
     /// History position at the last save, if still reachable.
@@ -163,7 +170,8 @@ impl Buffer {
             },
             large,
             revision: 0,
-            history: Vec::new(),
+            history: VecDeque::new(),
+            history_bytes: 0,
             position: 0,
             saved_position: Some(0),
             group_depth: 0,
@@ -335,13 +343,15 @@ impl Buffer {
             return None;
         }
         self.position -= 1;
-        let step = self.history[self.position].clone();
+        // Moved out while applying (`apply` needs `&mut self`), never cloned.
+        let step = std::mem::take(&mut self.history[self.position]);
         let mut cursor = 0;
         for edit in step.iter().rev() {
             let end = edit.pos + edit.inserted.chars().count();
             self.apply(edit.pos..end, &edit.removed);
             cursor = edit.pos + edit.removed.chars().count();
         }
+        self.history[self.position] = step;
         Some(cursor)
     }
 
@@ -352,14 +362,15 @@ impl Buffer {
         if self.position >= self.history.len() {
             return None;
         }
-        let step = self.history[self.position].clone();
-        self.position += 1;
+        let step = std::mem::take(&mut self.history[self.position]);
         let mut cursor = 0;
         for edit in &step {
             let end = edit.pos + edit.removed.chars().count();
             self.apply(edit.pos..end, &edit.inserted);
             cursor = edit.pos + edit.inserted.chars().count();
         }
+        self.history[self.position] = step;
+        self.position += 1;
         Some(cursor)
     }
 
@@ -449,14 +460,27 @@ impl Buffer {
             )
     }
 
-    /// Pushes a finished step, dropping any redo tail.
+    /// Pushes a finished step, dropping any redo tail, then drops the oldest steps while the
+    /// history is over `MAX_UNDO_STEPS` or `MAX_UNDO_BYTES` (the newest step always stays).
     fn push_step(&mut self, edits: Vec<Edit>) {
-        self.history.truncate(self.position);
+        for dropped in self.history.drain(self.position..) {
+            self.history_bytes -= step_bytes(&dropped);
+        }
         if self.saved_position.is_some_and(|s| s > self.position) {
             self.saved_position = None;
         }
-        self.history.push(edits);
+        self.history_bytes += step_bytes(&edits);
+        self.history.push_back(edits);
         self.position += 1;
+        while self.history.len() > 1
+            && (self.history.len() > MAX_UNDO_STEPS || self.history_bytes > MAX_UNDO_BYTES)
+        {
+            let oldest = self.history.pop_front().expect("history is not empty");
+            self.history_bytes -= step_bytes(&oldest);
+            self.position -= 1;
+            // The saved state was before the dropped step: it can no longer be reached.
+            self.saved_position = self.saved_position.and_then(|s| s.checked_sub(1));
+        }
     }
 
     /// Applies a raw replacement: updates rope, revision, dirty line and marks.
@@ -494,6 +518,13 @@ impl Buffer {
             inserted: text.to_string(),
         }
     }
+}
+
+/// Text size of an undo step: the bytes it removed plus the bytes it inserted.
+fn step_bytes(step: &[Edit]) -> usize {
+    step.iter()
+        .map(|e| e.removed.len() + e.inserted.len())
+        .sum()
 }
 
 /// Returns the majority line ending of `text`: CRLF only when CRLF line breaks outnumber
@@ -746,6 +777,42 @@ mod tests {
         buf.begin_group();
         buf.replace(0..0, "x");
         buf.undo();
+    }
+
+    #[test]
+    fn undo_history_keeps_the_newest_steps() {
+        let mut buf = Buffer::from_text("");
+        for _ in 0..MAX_UNDO_STEPS + 10 {
+            buf.replace(0..0, "x");
+        }
+        assert_eq!(buf.history.len(), MAX_UNDO_STEPS);
+        let mut undone = 0;
+        while buf.undo().is_some() {
+            undone += 1;
+        }
+        assert_eq!(undone, MAX_UNDO_STEPS);
+        assert_eq!(buf.text(), "x".repeat(10));
+        // The empty saved state was dropped with the oldest steps.
+        assert!(buf.is_modified());
+        while buf.redo().is_some() {}
+        assert_eq!(buf.text().len(), MAX_UNDO_STEPS + 10);
+    }
+
+    #[test]
+    fn undo_history_is_bounded_by_size() {
+        let mut buf = Buffer::from_text("");
+        let big = "y".repeat(MAX_UNDO_BYTES / 3);
+        for _ in 0..4 {
+            let len = buf.rope().len_chars();
+            buf.replace(len..len, &big);
+        }
+        assert!(buf.history_bytes <= MAX_UNDO_BYTES);
+        assert_eq!(buf.history.len(), 3);
+        assert_eq!(buf.history_bytes, 3 * big.len());
+        // Undo and redo leave the steps in place.
+        buf.undo();
+        buf.redo();
+        assert_eq!(buf.history_bytes, 3 * big.len());
     }
 
     #[test]
