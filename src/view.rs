@@ -12,6 +12,7 @@ use ropey::Rope;
 
 use crate::buffer::{Buffer, DirtyLines};
 use crate::editing::{EditCommand, EditSettings};
+use crate::highlight::StyledSpan;
 use crate::tab::Tab;
 use crate::text_nav::{self, CharClass};
 use crate::vim::Mode;
@@ -55,13 +56,6 @@ pub struct ViewOptions {
     pub vim: bool,
 }
 
-/// Formatting of one line: char ranges within the line with their text format.
-#[derive(Clone, Debug, Default)]
-pub struct LineDecor {
-    /// Non-overlapping char ranges (within the line) and their formats.
-    pub spans: Vec<(Range<usize>, TextFormat)>,
-}
-
 /// Supplies per-line formatting (syntax highlighting, spell underlines, find matches).
 ///
 /// Timing: `show_editor` applies this frame's keyboard edits first, then calls `prepare` with
@@ -81,6 +75,14 @@ pub trait Decorator {
         line: &str,
         base: &TextFormat,
     ) -> Vec<(Range<usize>, TextFormat)>;
+
+    /// Syntax spans (token colors and classes) of line `line_idx`, when this decorator or
+    /// one it wraps highlights syntax; `None` otherwise, or while the line is not parsed yet.
+    /// Wrapping decorators forward the call, so a layer can read the token classes of the
+    /// layers below it (the spell checker checks only comments and strings in code).
+    fn syntax_spans(&mut self, _line_idx: usize) -> Option<&[StyledSpan]> {
+        None
+    }
 }
 
 /// Applies `apply` to the parts of `spans` covered by `ranges`, splitting spans at the range

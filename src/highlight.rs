@@ -606,6 +606,11 @@ impl Decorator for HighlightDecorator<'_> {
         self.rope = Some(buffer.rope().clone());
     }
 
+    /// The cached spans of the line (see `spans`).
+    fn syntax_spans(&mut self, line_idx: usize) -> Option<&[StyledSpan]> {
+        self.spans(line_idx)
+    }
+
     /// Returns the colored runs of the line, with unstyled gaps left to `base`.
     fn decorate(
         &mut self,

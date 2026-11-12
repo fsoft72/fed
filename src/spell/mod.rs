@@ -16,7 +16,7 @@ use ropey::Rope;
 
 use crate::buffer::Buffer;
 use crate::config::ConfigPaths;
-use crate::highlight::HighlightDecorator;
+use crate::highlight::StyledSpan;
 use crate::sync;
 use crate::view::{self, Decorator};
 
@@ -404,9 +404,10 @@ fn line_key(line: &str, ranges: &[Range<usize>]) -> u64 {
 
 /// Decorator that underlines misspelled words on top of the highlight decorator. Without a
 /// checker it only passes the highlight spans through.
-pub struct SpellDecorator<'a, 'b> {
-    /// Highlight decorator providing the base spans and the token kinds for code.
-    inner: &'a mut HighlightDecorator<'b>,
+pub struct SpellDecorator<'a> {
+    /// Decorator below this one: the base spans, and the token kinds of code lines through
+    /// `syntax_spans`.
+    inner: &'a mut dyn Decorator,
     /// Shared checker; `None` when spell checking is off.
     checker: Option<Arc<RwLock<SpellChecker>>>,
     /// Which text is checked.
@@ -419,17 +420,17 @@ pub struct SpellDecorator<'a, 'b> {
     rope: Option<Rope>,
 }
 
-impl<'a, 'b> SpellDecorator<'a, 'b> {
+impl<'a> SpellDecorator<'a> {
     /// Creates a decorator over `inner`; `cache` is the tab's spell state and `ctx` is
     /// repainted when the Markdown ranges are refreshed in the background. With no `checker`
     /// nothing is underlined.
     pub fn new(
-        inner: &'a mut HighlightDecorator<'b>,
+        inner: &'a mut dyn Decorator,
         checker: Option<Arc<RwLock<SpellChecker>>>,
         mode: SpellMode,
         cache: &'a mut SpellCache,
         ctx: &egui::Context,
-    ) -> SpellDecorator<'a, 'b> {
+    ) -> SpellDecorator<'a> {
         SpellDecorator {
             inner,
             checker,
@@ -480,7 +481,7 @@ impl<'a, 'b> SpellDecorator<'a, 'b> {
             SpellMode::Plain => std::iter::once(0..len).collect(),
             SpellMode::Code => self
                 .inner
-                .spans(line_idx)
+                .syntax_spans(line_idx)
                 .map(words::code_checkable)
                 .unwrap_or_default(),
             SpellMode::Markdown => {
@@ -501,7 +502,12 @@ impl<'a, 'b> SpellDecorator<'a, 'b> {
     }
 }
 
-impl Decorator for SpellDecorator<'_, '_> {
+impl Decorator for SpellDecorator<'_> {
+    /// The syntax spans of the inner decorator.
+    fn syntax_spans(&mut self, line_idx: usize) -> Option<&[StyledSpan]> {
+        self.inner.syntax_spans(line_idx)
+    }
+
     /// Prepares the inner decorator, clears the marks and refreshes the Markdown ranges (the
     /// parse itself runs on a worker thread, never here).
     fn prepare(&mut self, buffer: &Buffer) {
@@ -554,6 +560,32 @@ impl Decorator for SpellDecorator<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::highlight::{HighlightDecorator, SpanKind};
+    use crate::view::PlainDecorator;
+
+    /// Decorator below the spell checker that knows the token kinds of its lines but has no
+    /// formatting of its own: every line is plain and has the token `spans`.
+    struct FakeSyntax {
+        /// Plain formatting.
+        plain: PlainDecorator,
+        /// The spans of every line.
+        spans: Vec<StyledSpan>,
+    }
+
+    impl Decorator for FakeSyntax {
+        fn decorate(
+            &mut self,
+            line_idx: usize,
+            line: &str,
+            base: &TextFormat,
+        ) -> Vec<(Range<usize>, TextFormat)> {
+            self.plain.decorate(line_idx, line, base)
+        }
+
+        fn syntax_spans(&mut self, _line_idx: usize) -> Option<&[StyledSpan]> {
+            Some(&self.spans)
+        }
+    }
 
     /// Builds a checker with a tiny dictionary.
     fn checker() -> SpellChecker {
@@ -655,6 +687,34 @@ mod tests {
         drop(deco);
         // "doesn't" is unknown: its split part "doesn" is flagged, "t" is too short.
         assert_eq!(cache.marks, HashSet::from_iter([21..26]));
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn code_mode_reads_the_token_kinds_of_any_decorator_below() {
+        let span = |range: Range<usize>, kind| StyledSpan {
+            range,
+            color: Color32::WHITE,
+            italic: false,
+            underline: false,
+            kind,
+        };
+        let mut fake = FakeSyntax {
+            plain: PlainDecorator,
+            spans: vec![span(0..6, SpanKind::Other), span(6..14, SpanKind::Comment)],
+        };
+        // Another layer in between forwards the token kinds.
+        let mut middle = crate::find_bar::MatchDecorator::with_matches(&mut fake, Vec::new());
+        let mut cache = SpellCache::default();
+        let text = "xyzzy // xyzzy";
+        let buffer = Buffer::from_text(text);
+        let ctx = egui::Context::default();
+        let checker = Some(Arc::new(RwLock::new(checker())));
+        let mut deco = SpellDecorator::new(&mut middle, checker, SpellMode::Code, &mut cache, &ctx);
+        deco.prepare(&buffer);
+        deco.decorate(0, text, &TextFormat::default());
+        drop(deco);
+        assert_eq!(cache.marks, HashSet::from_iter([9..14]), "only the comment");
     }
 
     #[test]

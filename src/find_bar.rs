@@ -13,6 +13,7 @@ use ropey::Rope;
 
 use crate::buffer::Buffer;
 use crate::editing::Selection;
+use crate::highlight::StyledSpan;
 use crate::job::BackgroundJob;
 use crate::search::{self, SearchQuery};
 use crate::tab::Tab;
@@ -773,6 +774,11 @@ impl<'a> MatchDecorator<'a> {
 }
 
 impl Decorator for MatchDecorator<'_> {
+    /// The syntax spans of the inner decorator.
+    fn syntax_spans(&mut self, line_idx: usize) -> Option<&[StyledSpan]> {
+        self.inner.syntax_spans(line_idx)
+    }
+
     /// Prepares the inner decorator, reads the matches of the edited buffer and snapshots
     /// its text.
     fn prepare(&mut self, buffer: &Buffer) {

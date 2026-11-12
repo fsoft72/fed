@@ -152,9 +152,12 @@ impl Tab {
             .assets
             .is_some_and(|a| a.ensure_warm(&syntax, self.buffer.rope(), ui.ctx()));
         let checker = env.checker.filter(|_| !large);
+        let mode = SpellMode::for_document(self.buffer.path(), &syntax);
         // The caches are moved out so the decorators do not borrow the tab the widget edits.
         let mut highlight = std::mem::take(&mut self.highlight);
         let mut spell = std::mem::take(&mut self.spell);
+        // The decorator chain, bottom to top: syntax colors, spell underlines, find matches.
+        // Each layer wraps the one below as a `&mut dyn Decorator`.
         let mut highlighted = HighlightDecorator::new(
             &mut highlight,
             env.assets.map(Arc::as_ref),
@@ -162,13 +165,10 @@ impl Tab {
             env.theme,
             !large && warm,
         );
-        let mode = SpellMode::for_document(self.buffer.path(), &syntax);
         let mut spelled =
             SpellDecorator::new(&mut highlighted, checker, mode, &mut spell, ui.ctx());
         let mut deco = MatchDecorator::new(&mut spelled, env.find, self.id);
         let out = view::show_editor(ui, self, opts, &mut deco, key_handler);
-        drop(deco);
-        drop(spelled);
         if highlighted.is_incomplete() {
             // Lines past the parse budget were drawn plain: continue next frame.
             ui.ctx().request_repaint();
