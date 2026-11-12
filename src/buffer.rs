@@ -1,6 +1,5 @@
 //! Rope-backed text buffer with undo/redo, marks, line endings and atomic saving.
 
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -135,8 +134,6 @@ pub struct Buffer {
     group_depth: usize,
     group_edits: Vec<Edit>,
     marks: Vec<(char, usize)>,
-    /// Lowest edited line since the last take (a `Cell` so decorators can take it from `&Buffer`).
-    dirty_line: Cell<Option<usize>>,
     /// Recent edits, oldest first.
     edit_log: VecDeque<LoggedEdit>,
 }
@@ -178,7 +175,6 @@ impl Buffer {
             group_depth: 0,
             group_edits: Vec::new(),
             marks: Vec::new(),
-            dirty_line: Cell::new(None),
             edit_log: VecDeque::new(),
         }
     }
@@ -386,11 +382,6 @@ impl Buffer {
         self.marks.iter().find(|(n, _)| *n == name).map(|(_, p)| *p)
     }
 
-    /// Returns and clears the lowest line index touched since the last call.
-    pub fn take_dirty_line(&self) -> Option<usize> {
-        self.dirty_line.take()
-    }
-
     /// Returns the lowest line edited after revision `since`, or `None` when the buffer is
     /// still at `since`. See `dirty_lines_since`.
     pub fn first_dirty_line_since(&self, since: u64) -> Option<usize> {
@@ -398,8 +389,7 @@ impl Buffer {
     }
 
     /// Returns the lines changed after revision `since`, merged into one range, or `None`
-    /// when the buffer is still at `since`. Every caller tracks its own revision, unlike
-    /// `take_dirty_line`. When `since` is older than the remembered edits (or newer than the
+    /// when the buffer is still at `since`. Every caller tracks its own revision. When `since` is older than the remembered edits (or newer than the
     /// buffer, i.e. a different buffer) the whole buffer counts as replaced.
     pub fn dirty_lines_since(&self, since: u64) -> Option<DirtyLines> {
         if since == self.revision {
@@ -482,16 +472,13 @@ impl Buffer {
         }
     }
 
-    /// Applies a raw replacement: updates rope, revision, dirty line and marks.
+    /// Applies a raw replacement: updates rope, revision, edit log and marks.
     fn apply(&mut self, range: Range<usize>, text: &str) -> Edit {
         let removed = self.rope.slice(range.clone()).to_string();
         let new_len = text.chars().count();
         let old_len = range.len();
         let line = self.rope.char_to_line(range.start);
         let old_last = self.rope.char_to_line(range.end);
-        let dirty = self.dirty_line.get();
-        self.dirty_line
-            .set(Some(dirty.map_or(line, |d| d.min(line))));
         self.rope.remove(range.clone());
         self.rope.insert(range.start, text);
         self.revision += 1;
@@ -948,15 +935,6 @@ mod tests {
     }
 
     #[test]
-    fn dirty_line_reports_lowest_edited_line() {
-        let mut buf = Buffer::from_text("one\ntwo\nthree");
-        buf.replace(8..8, "x");
-        buf.replace(4..4, "y");
-        assert_eq!(buf.take_dirty_line(), Some(1));
-        assert_eq!(buf.take_dirty_line(), None);
-    }
-
-    #[test]
     fn first_dirty_line_since_is_per_caller() {
         let mut buf = Buffer::from_text("one\ntwo\nthree");
         let start = buf.revision();
@@ -966,8 +944,6 @@ mod tests {
         buf.replace(4..4, "y");
         assert_eq!(buf.first_dirty_line_since(start), Some(1));
         assert_eq!(buf.first_dirty_line_since(mid), Some(1));
-        // The single-consumer dirty line is not consumed by these queries.
-        assert_eq!(buf.take_dirty_line(), Some(1));
         assert_eq!(buf.first_dirty_line_since(buf.revision()), None);
         // A revision newer than the buffer means another buffer: everything is dirty.
         assert_eq!(buf.first_dirty_line_since(buf.revision() + 5), Some(0));

@@ -226,6 +226,8 @@ pub struct HighlightCache {
     next_state: Option<LineState>,
     /// Spans of every line parsed so far.
     spans: Vec<Vec<StyledSpan>>,
+    /// Buffer revision the spans were last checked against (see `sync`).
+    revision: Option<u64>,
     /// Parsing stops (until the next frame) once this instant is passed; `None`: no limit.
     deadline: Option<Instant>,
     /// True when a request was left unanswered because the deadline passed.
@@ -260,6 +262,19 @@ impl HighlightCache {
         self.checkpoints.truncate(keep + 1);
         self.spans.truncate(keep * CHECKPOINT_LINES);
         self.next_state = None;
+    }
+
+    /// Brings the cache up to `buffer`: forgets the lines from the first one edited since the
+    /// last call (everything when the edits are no longer known).
+    pub fn sync(&mut self, buffer: &Buffer) {
+        let dirty = match self.revision {
+            Some(rev) => buffer.first_dirty_line_since(rev),
+            None => Some(0),
+        };
+        if let Some(line) = dirty {
+            self.invalidate_from(line);
+        }
+        self.revision = Some(buffer.revision());
     }
 
     /// Drops the whole cache (theme or syntax change).
@@ -395,8 +410,6 @@ pub struct HighlightDecorator<'a> {
     enabled: bool,
     /// Snapshot of the buffer text taken in `prepare`.
     rope: Option<Rope>,
-    /// Lowest line touched by edits since the previous frame, taken in `prepare`.
-    last_dirty: Option<usize>,
 }
 
 impl<'a> HighlightDecorator<'a> {
@@ -415,14 +428,7 @@ impl<'a> HighlightDecorator<'a> {
             theme,
             enabled,
             rope: None,
-            last_dirty: None,
         }
-    }
-
-    /// Returns the lowest line edited since the previous frame (set by `prepare`), for
-    /// decorators that also need to invalidate per-line caches.
-    pub fn last_dirty(&self) -> Option<usize> {
-        self.last_dirty
     }
 
     /// Returns the spans of `line_idx`, or `None` when highlighting is off or the line was not
@@ -445,15 +451,12 @@ impl<'a> HighlightDecorator<'a> {
 }
 
 impl Decorator for HighlightDecorator<'_> {
-    /// Takes the buffer's dirty line, invalidates the cache from it, snapshots the text and
-    /// starts this frame's parse budget.
+    /// Invalidates the cache from the first line edited since the previous frame, snapshots
+    /// the text and starts this frame's parse budget.
     fn prepare(&mut self, buffer: &Buffer) {
         self.cache
             .begin_frame(Some(Instant::now() + FRAME_PARSE_BUDGET));
-        self.last_dirty = buffer.take_dirty_line();
-        if let Some(line) = self.last_dirty {
-            self.cache.invalidate_from(line);
-        }
+        self.cache.sync(buffer);
         self.rope = Some(buffer.rope().clone());
     }
 
@@ -542,6 +545,23 @@ mod tests {
             comments.iter().any(|r| r.start <= 14 && r.end == 21),
             "{comments:?}"
         );
+    }
+
+    #[test]
+    fn sync_invalidates_from_the_first_edited_line() {
+        let a = assets();
+        let theme = "base16-ocean.dark";
+        let mut buf = Buffer::from_text("/* open\nstill comment\n");
+        let mut cache = HighlightCache::new();
+        cache.sync(&buf);
+        cache.line_spans(&a, "Rust", theme, buf.rope(), 1).unwrap();
+        cache.sync(&buf);
+        assert_eq!(cache.spans.len(), 2, "no edit: nothing is dropped");
+        buf.replace(0..2, "//");
+        cache.sync(&buf);
+        assert!(cache.spans.is_empty());
+        let spans = cache.line_spans(&a, "Rust", theme, buf.rope(), 1).unwrap();
+        assert!(ranges_of(spans, SpanKind::Comment).is_empty());
     }
 
     #[test]
