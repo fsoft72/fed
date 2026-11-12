@@ -67,6 +67,33 @@ struct Edit {
     inserted: String,
 }
 
+/// Lines touched by one primitive edit, remembered for `dirty_lines_since`.
+#[derive(Clone, Copy, Debug)]
+struct LoggedEdit {
+    /// Buffer revision right after the edit.
+    revision: u64,
+    /// First line of the edit.
+    start: usize,
+    /// Last line the replaced text covered, before the edit.
+    old_last: usize,
+    /// Last line the inserted text covers, after the edit.
+    new_last: usize,
+}
+
+/// Lines changed since a revision: `start..end` in the current buffer replaced
+/// `start..old_end` of the buffer at that revision. Lines before `start` are unchanged and
+/// line `l >= end` is old line `l - end + old_end`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirtyLines {
+    /// First changed line (same index before and after).
+    pub start: usize,
+    /// End (exclusive) of the changed lines in the current buffer.
+    pub end: usize,
+    /// End (exclusive) of the replaced lines in the old buffer. `usize::MAX` when the edits
+    /// are no longer known: everything from `start` on is replaced, whatever the old length.
+    pub old_end: usize,
+}
+
 /// A rope-backed text buffer.
 pub struct Buffer {
     rope: Rope,
@@ -84,8 +111,8 @@ pub struct Buffer {
     marks: Vec<(char, usize)>,
     /// Lowest edited line since the last take (a `Cell` so decorators can take it from `&Buffer`).
     dirty_line: Cell<Option<usize>>,
-    /// Recent edits as `(revision after the edit, first edited line)`, oldest first.
-    edit_log: VecDeque<(u64, usize)>,
+    /// Recent edits, oldest first.
+    edit_log: VecDeque<LoggedEdit>,
 }
 
 impl Default for Buffer {
@@ -329,27 +356,60 @@ impl Buffer {
     }
 
     /// Returns the lowest line edited after revision `since`, or `None` when the buffer is
-    /// still at `since`. Every caller tracks its own revision, unlike `take_dirty_line`.
-    /// When `since` is older than the remembered edits (or newer than the buffer, i.e. a
-    /// different buffer), the whole buffer counts as dirty and line 0 is returned.
+    /// still at `since`. See `dirty_lines_since`.
     pub fn first_dirty_line_since(&self, since: u64) -> Option<usize> {
+        self.dirty_lines_since(since).map(|d| d.start)
+    }
+
+    /// Returns the lines changed after revision `since`, merged into one range, or `None`
+    /// when the buffer is still at `since`. Every caller tracks its own revision, unlike
+    /// `take_dirty_line`. When `since` is older than the remembered edits (or newer than the
+    /// buffer, i.e. a different buffer) the whole buffer counts as replaced.
+    pub fn dirty_lines_since(&self, since: u64) -> Option<DirtyLines> {
         if since == self.revision {
             return None;
         }
+        let everything = DirtyLines {
+            start: 0,
+            end: self.rope.len_lines(),
+            old_end: usize::MAX,
+        };
         let covered = since < self.revision
             && self
                 .edit_log
                 .front()
-                .is_some_and(|&(rev, _)| rev <= since + 1);
+                .is_some_and(|e| e.revision <= since + 1);
         if !covered {
-            return Some(0);
+            return Some(everything);
         }
-        self.edit_log
-            .iter()
-            .rev()
-            .take_while(|(rev, _)| *rev > since)
-            .map(|(_, line)| *line)
-            .min()
+        let first = self.edit_log.partition_point(|e| e.revision <= since);
+        let mut dirty: Option<(usize, usize, isize)> = None;
+        for e in self.edit_log.range(first..) {
+            let shift = e.new_last as isize - e.old_last as isize;
+            let (start, end, delta) = match dirty {
+                None => (e.start, e.new_last + 1, shift),
+                Some((start, end, delta)) => {
+                    // Map the window end through this edit (after it: shifted; inside the
+                    // replaced lines: the end of the inserted ones; before it: unchanged),
+                    // then make the window cover the edit.
+                    let end = if end > e.old_last + 1 {
+                        (end as isize + shift) as usize
+                    } else if end > e.start {
+                        e.new_last + 1
+                    } else {
+                        end
+                    };
+                    (start.min(e.start), end.max(e.new_last + 1), delta + shift)
+                }
+            };
+            dirty = Some((start, end, delta));
+        }
+        let (start, end, delta) = dirty?;
+        Some(DirtyLines {
+            start,
+            end,
+            old_end: (end as isize - delta) as usize,
+        })
     }
 
     /// Returns the file name, or `"untitled"` when unnamed.
@@ -379,6 +439,7 @@ impl Buffer {
         let new_len = text.chars().count();
         let old_len = range.len();
         let line = self.rope.char_to_line(range.start);
+        let old_last = self.rope.char_to_line(range.end);
         let dirty = self.dirty_line.get();
         self.dirty_line
             .set(Some(dirty.map_or(line, |d| d.min(line))));
@@ -388,7 +449,12 @@ impl Buffer {
         if self.edit_log.len() == EDIT_LOG_LEN {
             self.edit_log.pop_front();
         }
-        self.edit_log.push_back((self.revision, line));
+        self.edit_log.push_back(LoggedEdit {
+            revision: self.revision,
+            start: line,
+            old_last,
+            new_last: self.rope.char_to_line(range.start + new_len),
+        });
         for (_, pos) in &mut self.marks {
             if *pos >= range.end {
                 *pos = *pos + new_len - old_len;
@@ -583,6 +649,83 @@ mod tests {
         }
         assert_eq!(buf.first_dirty_line_since(0), Some(0));
         assert_eq!(buf.first_dirty_line_since(buf.revision() - 1), Some(2));
+    }
+
+    /// Checks `dirty_lines_since` against a line-by-line diff of the two texts.
+    fn assert_dirty_lines_consistent(old: &str, buf: &Buffer, since: u64) {
+        let old_lines: Vec<&str> = old.split('\n').collect();
+        let new_text = buf.text();
+        let new_lines: Vec<&str> = new_text.split('\n').collect();
+        let d = buf.dirty_lines_since(since).expect("changed");
+        let old_end = d.old_end.min(old_lines.len());
+        assert_eq!(old_lines[..d.start], new_lines[..d.start], "prefix {d:?}");
+        assert_eq!(
+            old_lines[old_end..],
+            new_lines[d.end..],
+            "suffix {d:?} of {old:?} -> {new_text:?}"
+        );
+    }
+
+    #[test]
+    fn dirty_lines_since_merges_edits() {
+        let old = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9";
+        let mut buf = Buffer::from_text(old);
+        let rev = buf.revision();
+        // Split line 2, join lines 6 and 7, delete line 0.
+        buf.replace(5..5, "\n");
+        let six = buf.rope().line_to_char(7);
+        buf.replace(six + 1..six + 2, "");
+        buf.replace(0..2, "");
+        assert_dirty_lines_consistent(old, &buf, rev);
+        let d = buf.dirty_lines_since(rev).unwrap();
+        assert_eq!(d.start, 0);
+        // A single insertion is exact.
+        let mid = buf.revision();
+        let before = buf.text();
+        buf.replace(2..2, "a\nb\nc");
+        let d = buf.dirty_lines_since(mid).unwrap();
+        assert_eq!(d.end - d.start, 3);
+        assert_eq!(d.old_end - d.start, 1);
+        assert_dirty_lines_consistent(&before, &buf, mid);
+    }
+
+    #[test]
+    fn dirty_lines_since_survives_random_edits() {
+        let mut seed: u64 = 0x5eed;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n.max(1)
+        };
+        let pieces = ["", "x", "\n", "ab\ncd", "\n\n", "q\n"];
+        for _ in 0..300 {
+            let old = "l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7";
+            let mut buf = Buffer::from_text(old);
+            let rev = buf.revision();
+            for _ in 0..1 + next(6) {
+                let len = buf.rope().len_chars();
+                let start = next(len + 1);
+                let end = (start + next(4)).min(len);
+                buf.replace(start..end, pieces[next(pieces.len())]);
+            }
+            if buf.revision() != rev {
+                assert_dirty_lines_consistent(old, &buf, rev);
+            }
+        }
+    }
+
+    #[test]
+    fn dirty_lines_since_unknown_history_replaces_everything() {
+        let buf = Buffer::from_text("a\nb");
+        assert_eq!(
+            buf.dirty_lines_since(7),
+            Some(DirtyLines {
+                start: 0,
+                end: 2,
+                old_end: usize::MAX
+            })
+        );
     }
 
     #[test]

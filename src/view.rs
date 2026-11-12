@@ -1,7 +1,5 @@
 //! Custom editor widget: renders a `Tab` and translates egui input into `EditCommand`s.
 
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -11,7 +9,7 @@ use eframe::egui::{
 };
 use ropey::Rope;
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, DirtyLines};
 use crate::editing::{EditCommand, EditSettings};
 use crate::tab::Tab;
 use crate::text_nav::{self, CharClass};
@@ -153,9 +151,8 @@ pub struct ViewState {
     press_pos: Option<usize>,
     /// The pointer left the press position since the last press.
     dragged: bool,
-    /// Longest line display width in columns, with the revision and tab width it was
-    /// computed for.
-    max_line_cols: Option<(u64, usize, usize)>,
+    /// Longest line display width in columns, updated from the edited lines.
+    longest: Option<LongestLine>,
     /// Wrapped line heights (word wrap only).
     wrap: WrapCache,
 }
@@ -167,15 +164,28 @@ impl ViewState {
     }
 }
 
+/// The longest line of a buffer revision (no word wrap).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LongestLine {
+    /// Buffer revision it was computed for.
+    revision: u64,
+    /// Tab width used to measure.
+    tab_width: usize,
+    /// Display width in columns (tabs expanded).
+    cols: usize,
+    /// Index of the longest line.
+    line: usize,
+}
+
 /// Cached line geometry for word wrap mode.
 #[derive(Default)]
 struct WrapCache {
     /// Font, wrap width and tab width the heights were measured with.
     params: Option<(FontId, f32, usize)>,
-    /// Wrapped height keyed by a hash of the line text.
-    heights: HashMap<u64, f32>,
-    /// Buffer revision `tops` was computed for.
+    /// Buffer revision `heights` and `tops` were computed for.
     revision: Option<u64>,
+    /// Wrapped height of every line (one entry per buffer line).
+    heights: Vec<f32>,
     /// Top of every line, plus the total height as the last element.
     tops: Vec<f32>,
 }
@@ -610,57 +620,146 @@ fn line_text(rope: &Rope, line: usize) -> String {
     text
 }
 
-/// Hash of a line's text, used as the wrap height cache key.
-fn text_hash(text: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
+/// Measures the wrapped height of `line` laid out `width` points wide.
+fn measure_line(
+    fonts: &mut egui::epaint::FontsView<'_>,
+    rope: &Rope,
+    line: usize,
+    m: &Metrics,
+    width: f32,
+) -> f32 {
+    let text = line_text(rope, line);
+    if text.is_empty() {
+        return m.row_height;
+    }
+    let spans = [(0..text.chars().count(), m.base.clone())];
+    let job = build_layout_job(
+        &text,
+        &spans,
+        &m.base,
+        m.tab_width,
+        Some(width),
+        m.row_height,
+    );
+    fonts.layout_job(job).size().y.max(m.row_height)
 }
 
 impl WrapCache {
-    /// Recomputes line tops when the buffer revision or the layout parameters changed.
-    fn update(&mut self, ui: &Ui, rope: &Rope, revision: u64, m: &Metrics, width: f32) {
+    /// Brings line heights and tops up to date with the buffer. Only lines edited since the
+    /// last update are measured again (all of them when the font, wrap width or tab width
+    /// changed), and tops are re-summed from the first edited line.
+    fn update(&mut self, ui: &Ui, buffer: &Buffer, m: &Metrics, width: f32) {
         let params = (m.base.font_id.clone(), width, m.tab_width);
         if self.params.as_ref() != Some(&params) {
-            self.heights.clear();
             self.params = Some(params);
             self.revision = None;
         }
-        if self.revision == Some(revision) {
+        if self.revision == Some(buffer.revision()) {
             return;
         }
-        self.tops.clear();
-        let mut y = 0.0;
-        let heights = &mut self.heights;
-        let tops = &mut self.tops;
+        let rope = buffer.rope();
         ui.ctx().fonts_mut(|fonts| {
-            for line in rope.lines() {
-                tops.push(y);
-                let mut text = line.to_string();
-                if text.ends_with('\n') {
-                    text.pop();
-                }
-                let height = if text.is_empty() {
-                    m.row_height
-                } else {
-                    *heights.entry(text_hash(&text)).or_insert_with(|| {
-                        let spans = [(0..text.chars().count(), m.base.clone())];
-                        let job = build_layout_job(
-                            &text,
-                            &spans,
-                            &m.base,
-                            m.tab_width,
-                            Some(width),
-                            m.row_height,
-                        );
-                        fonts.layout_job(job).size().y.max(m.row_height)
-                    })
-                };
-                y += height;
-            }
+            self.refresh(buffer, |line| measure_line(fonts, rope, line, m, width));
         });
+    }
+
+    /// Re-measures the lines edited since `revision` with `measure` (every line when there
+    /// is no previous revision) and rebuilds `tops` from the first edited line.
+    fn refresh(&mut self, buffer: &Buffer, mut measure: impl FnMut(usize) -> f32) {
+        if self.revision == Some(buffer.revision()) {
+            return;
+        }
+        let lines = buffer.rope().len_lines();
+        let everything = DirtyLines {
+            start: 0,
+            end: lines,
+            old_end: usize::MAX,
+        };
+        let dirty = match self.revision {
+            Some(rev) => buffer.dirty_lines_since(rev).unwrap_or(everything),
+            None => everything,
+        };
+        let old_end = dirty.old_end.min(self.heights.len());
+        let consistent = dirty.start <= old_end
+            && dirty.end <= lines
+            && self.heights.len() - old_end + dirty.end == lines;
+        let dirty = match consistent {
+            true => DirtyLines { old_end, ..dirty },
+            false => DirtyLines {
+                old_end: self.heights.len(),
+                ..everything
+            },
+        };
+        let fresh: Vec<f32> = (dirty.start..dirty.end).map(&mut measure).collect();
+        self.heights.splice(dirty.start..dirty.old_end, fresh);
+        self.tops.truncate(dirty.start);
+        let mut y = match dirty.start {
+            0 => 0.0,
+            n => self.tops[n - 1] + self.heights[n - 1],
+        };
+        for h in &self.heights[dirty.start..] {
+            self.tops.push(y);
+            y += h;
+        }
         self.tops.push(y);
-        self.revision = Some(revision);
+        self.revision = Some(buffer.revision());
+    }
+}
+
+/// Returns the longest of `lines` (display columns, line index), the first one on ties;
+/// `(0, lines.start)` for an empty range.
+fn longest_in(rope: &Rope, lines: Range<usize>, tab_width: usize) -> (usize, usize) {
+    let first = lines.start;
+    lines
+        .map(|i| (display_width(rope.line(i).chars(), tab_width), i))
+        .fold((0, first), |best, cur| match cur.0 > best.0 {
+            true => cur,
+            false => best,
+        })
+}
+
+/// Returns the longest line of `buffer`, reusing `old` when possible: only the lines edited
+/// since `old` are measured, and the whole buffer is rescanned only when the old longest line
+/// was edited and no edited line is at least as long.
+fn longest_line(buffer: &Buffer, old: Option<LongestLine>, tab_width: usize) -> LongestLine {
+    let rope = buffer.rope();
+    let revision = buffer.revision();
+    let rescan = || {
+        let (cols, line) = longest_in(rope, 0..rope.len_lines(), tab_width);
+        LongestLine {
+            revision,
+            tab_width,
+            cols,
+            line,
+        }
+    };
+    let Some(old) = old.filter(|o| o.tab_width == tab_width) else {
+        return rescan();
+    };
+    let Some(dirty) = buffer.dirty_lines_since(old.revision) else {
+        return old;
+    };
+    let (cols, line) = longest_in(rope, dirty.start..dirty.end, tab_width);
+    let replaced = (dirty.start..dirty.old_end).contains(&old.line);
+    if cols > old.cols || (replaced && cols == old.cols) {
+        return LongestLine {
+            revision,
+            tab_width,
+            cols,
+            line,
+        };
+    }
+    if replaced {
+        return rescan();
+    }
+    let line = match old.line >= dirty.old_end {
+        true => old.line - dirty.old_end + dirty.end,
+        false => old.line,
+    };
+    LongestLine {
+        revision,
+        line,
+        ..old
     }
 }
 
@@ -696,15 +795,14 @@ impl Frame<'_> {
             .opts
             .word_wrap
             .then(|| (viewport.width() - text_x - TEXT_PAD).max(MIN_WRAP_WIDTH));
-        let revision = self.tab.buffer.revision();
         let rows = match wrap_width {
             Some(width) => {
-                let rope = self.tab.buffer.rope().clone();
                 self.tab
                     .view
                     .wrap
-                    .update(ui, &rope, revision, self.m, width);
-                RowMap::Wrapped(self.tab.view.wrap.tops.clone())
+                    .update(ui, &self.tab.buffer, self.m, width);
+                // Borrowed for the frame (moved back at the end), never cloned.
+                RowMap::Wrapped(std::mem::take(&mut self.tab.view.wrap.tops))
             }
             None => RowMap::Fixed {
                 row_height: self.m.row_height,
@@ -770,28 +868,17 @@ impl Frame<'_> {
                 });
             });
         }
+        if let RowMap::Wrapped(tops) = pl.rows {
+            self.tab.view.wrap.tops = tops;
+        }
     }
 
-    /// Display width in columns (tabs expanded) of the longest line, cached per revision.
+    /// Display width in columns (tabs expanded) of the longest line, updated incrementally
+    /// from the lines edited since the last frame.
     fn max_line_cols(&mut self) -> usize {
-        let revision = self.tab.buffer.revision();
-        let tab_width = self.m.tab_width;
-        if let Some((rev, tw, cols)) = self.tab.view.max_line_cols
-            && rev == revision
-            && tw == tab_width
-        {
-            return cols;
-        }
-        let cols = self
-            .tab
-            .buffer
-            .rope()
-            .lines()
-            .map(|l| display_width(l.chars(), tab_width))
-            .max()
-            .unwrap_or(0);
-        self.tab.view.max_line_cols = Some((revision, tab_width, cols));
-        cols
+        let longest = longest_line(&self.tab.buffer, self.tab.view.longest, self.m.tab_width);
+        self.tab.view.longest = Some(longest);
+        longest.cols
     }
 
     /// Lays out `line` with the decorator formats.
@@ -1061,6 +1148,71 @@ mod tests {
     const NONE: Modifiers = Modifiers::NONE;
     const SHIFT: Modifiers = Modifiers::SHIFT;
     const CTRL: Modifiers = Modifiers::CTRL;
+
+    /// Builds a wrap cache for `buffer` where a line is as tall as its char count (min 1).
+    fn wrap_for(buffer: &Buffer) -> WrapCache {
+        let mut wrap = WrapCache::default();
+        wrap.refresh(buffer, |i| height_of(buffer, i));
+        wrap
+    }
+
+    /// Fake wrapped height: the line length, at least 1.
+    fn height_of(buffer: &Buffer, line: usize) -> f32 {
+        buffer.rope().line(line).len_chars().max(1) as f32
+    }
+
+    #[test]
+    fn wrap_cache_remeasures_only_edited_lines() {
+        let mut buffer = Buffer::from_text("a\nbb\nccc\ndddd\neeeee");
+        let mut wrap = wrap_for(&buffer);
+        buffer.replace(3..3, "XX\nYYYYYYY\n");
+        let mut measured = Vec::new();
+        wrap.refresh(&buffer, |i| {
+            measured.push(i);
+            height_of(&buffer, i)
+        });
+        assert_eq!(measured, vec![1, 2, 3]);
+        let fresh = wrap_for(&buffer);
+        assert_eq!(wrap.heights, fresh.heights);
+        assert_eq!(wrap.tops, fresh.tops);
+        // Deleting lines shrinks the cache too.
+        buffer.replace(0..8, "");
+        wrap.refresh(&buffer, |i| height_of(&buffer, i));
+        let fresh = wrap_for(&buffer);
+        assert_eq!(wrap.heights, fresh.heights);
+        assert_eq!(wrap.tops, fresh.tops);
+        // Unchanged revision: nothing is measured.
+        let mut calls = 0;
+        wrap.refresh(&buffer, |_| {
+            calls += 1;
+            1.0
+        });
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn longest_line_updates_incrementally() {
+        let mut buffer = Buffer::from_text("aaaa\nbb\naaaaaa\nc");
+        let l = longest_line(&buffer, None, 4);
+        assert_eq!((l.cols, l.line), (6, 2));
+        // Grow a short line past the longest.
+        buffer.replace(5..5, "bbbbbbbb");
+        let l = longest_line(&buffer, Some(l), 4);
+        assert_eq!((l.cols, l.line), (10, 1));
+        // Insert lines before: the longest line index moves.
+        buffer.replace(0..0, "x\ny\n");
+        let l = longest_line(&buffer, Some(l), 4);
+        assert_eq!((l.cols, l.line), (10, 3));
+        // Shrink the longest line: rescan finds the next one.
+        let start = buffer.rope().line_to_char(3);
+        buffer.replace(start..start + 9, "");
+        let l = longest_line(&buffer, Some(l), 4);
+        assert_eq!((l.cols, l.line), (6, 4));
+        // A tab width change rescans with the new width.
+        buffer.replace(0..0, "\t\t");
+        let l = longest_line(&buffer, Some(l), 8);
+        assert_eq!((l.cols, l.line), (17, 0));
+    }
 
     #[test]
     fn arrows_map_to_moves() {

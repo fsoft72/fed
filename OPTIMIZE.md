@@ -15,9 +15,9 @@
 
 - [x] **Vim `n`/`N`/`*`/`#` scan the whole document per press** - `Motion::SearchNext` recompiles the regex on each press and calls `search::find_next` `count` times, and `find_next` runs `find_all` (one `String` per line, every match collected) just to return one hit; make `find_next` stop at the first match from `from` (wrapping once) and compile the regex once in `last_search`.
   - File(s): `src/vim/motion.rs`, `src/search.rs`, `src/vim/mod.rs`
-- [ ] **Word wrap recomputes every line top on every keystroke** - `WrapCache::update` walks the whole rope and allocates a `String` per line on each revision change, `Frame::run` clones `wrap.tops` (one `f32` per line) every frame, and `heights` grows without bound; update tops incrementally from the buffer's dirty lines, borrow `tops` instead of cloning, and prune the height map.
+- [x] **Word wrap recomputes every line top on every keystroke** - `WrapCache::update` walks the whole rope and allocates a `String` per line on each revision change, `Frame::run` clones `wrap.tops` (one `f32` per line) every frame, and `heights` grows without bound; update tops incrementally from the buffer's dirty lines, borrow `tops` instead of cloning, and prune the height map.
   - File(s): `src/view.rs`
-- [ ] **Longest-line scan is O(document) per keystroke without wrap** - `Frame::max_line_cols` rescans every line whenever the revision changes; update it incrementally from the dirty line range (a full rescan is only needed when the longest line shrinks).
+- [x] **Longest-line scan is O(document) per keystroke without wrap** - `Frame::max_line_cols` rescans every line whenever the revision changes; update it incrementally from the dirty line range (a full rescan is only needed when the longest line shrinks).
   - File(s): `src/view.rs`
 - [ ] **Spell checking re-runs for every visible line every frame** - `SpellDecorator::decorate` re-tokenizes each visible line, takes `checker.write()` and allocates a `String` per word on every frame, with no per-line result cache, and `SpellChecker::cache` grows without limit; cache the misspelled ranges per `(line, revision)` and bound the word cache.
   - File(s): `src/spell/mod.rs`, `src/spell/words.rs`
