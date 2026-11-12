@@ -580,32 +580,6 @@ fn line_at_y(tops: &[f32], y: f32) -> usize {
         .min(lines - 1)
 }
 
-/// Display width in columns of `chars` (a line, newline excluded from the count); tabs
-/// advance to the next multiple of `tab_width`.
-fn display_width(chars: impl Iterator<Item = char>, tab_width: usize) -> usize {
-    chars
-        .filter(|&c| c != '\n')
-        .fold(0, |col, c| col + text_nav::char_advance(c, col, tab_width))
-}
-
-/// Converts a char column of `line` to a display column (tabs advance to the next tab stop).
-fn display_col(line: &str, col: usize, tab_width: usize) -> usize {
-    display_width(line.chars().take(col), tab_width)
-}
-
-/// Converts a display column to the nearest char column of `line`.
-fn buffer_col(line: &str, dcol: usize, tab_width: usize) -> usize {
-    let mut x = 0;
-    for (i, c) in line.chars().enumerate() {
-        let w = text_nav::char_advance(c, x, tab_width);
-        if dcol < x + w {
-            return if dcol - x <= w / 2 { i } else { i + 1 };
-        }
-        x += w;
-    }
-    line.chars().count()
-}
-
 /// Returns `line` with every tab replaced by the spaces up to the next tab stop, plus the
 /// byte offset in the result of every char of `line` (and of its end, as the last entry).
 fn expand_tabs(line: &str, tab_width: usize) -> (String, Vec<usize>) {
@@ -757,7 +731,7 @@ impl WrapCache {
 fn longest_in(rope: &Rope, lines: Range<usize>, tab_width: usize) -> (usize, usize) {
     let first = lines.start;
     lines
-        .map(|i| (display_width(rope.line(i).chars(), tab_width), i))
+        .map(|i| (text_nav::text_width(rope.line(i).chars(), tab_width), i))
         .fold((0, first), |best, cur| match cur.0 > best.0 {
             true => cur,
             false => best,
@@ -985,7 +959,7 @@ impl Frame<'_> {
         let x = local.x.max(pl.viewport.min.x + self.m.gutter_width) - self.m.text_x();
         let cursor = galley.cursor_from_pos(vec2(x, local.y - pl.rows.top(line)));
         let rope = self.tab.buffer.rope();
-        let col = buffer_col(
+        let col = text_nav::char_col_in(
             &text_nav::line_text(rope, line),
             cursor.index.0,
             self.m.tab_width,
@@ -1080,8 +1054,8 @@ impl Frame<'_> {
             let text = text_nav::line_text(rope, *line);
             let le = ls + text.chars().count();
             if !sel.is_empty() && sel.start <= le && sel.end > ls {
-                let a = display_col(&text, sel.start.max(ls) - ls, self.m.tab_width);
-                let b = display_col(&text, sel.end.min(le) - ls, self.m.tab_width);
+                let a = text_nav::display_col_in(&text, sel.start.max(ls) - ls, self.m.tab_width);
+                let b = text_nav::display_col_in(&text, sel.end.min(le) - ls, self.m.tab_width);
                 let extra = if sel.end > le { self.m.char_width } else { 0.0 };
                 for r in selection_rects(galley, a, b, extra) {
                     painter.rect_filled(r.translate(pos.to_vec2()), 0.0, sel_color);
@@ -1136,7 +1110,8 @@ impl Frame<'_> {
     fn caret_rect(&mut self, ui: &Ui, galleys: &[(usize, Arc<Galley>)], pl: &Placement) -> Rect {
         let rope = self.tab.buffer.rope();
         let (line, col) = text_nav::line_col(rope, self.tab.editor.selection.head);
-        let dcol = display_col(&text_nav::line_text(rope, line), col, self.m.tab_width);
+        let dcol =
+            text_nav::display_col_in(&text_nav::line_text(rope, line), col, self.m.tab_width);
         let galley = self.galley_for(ui, galleys, line, pl.wrap_width);
         let offset = pl.origin + vec2(self.m.text_x(), pl.rows.top(line));
         galley
@@ -1471,12 +1446,12 @@ mod tests {
 
     #[test]
     fn display_width_expands_tabs() {
-        assert_eq!(display_width("\t\tab\n".chars(), 4), 10);
+        assert_eq!(text_nav::text_width("\t\tab\n".chars(), 4), 10);
         // Tabs stop at multiples of the tab width.
-        assert_eq!(display_width("ab\tx".chars(), 4), 5);
-        assert_eq!(display_width("abcd\t".chars(), 4), 8);
-        assert_eq!(display_width("abc".chars(), 4), 3);
-        assert_eq!(display_width("".chars(), 4), 0);
+        assert_eq!(text_nav::text_width("ab\tx".chars(), 4), 5);
+        assert_eq!(text_nav::text_width("abcd\t".chars(), 4), 8);
+        assert_eq!(text_nav::text_width("abc".chars(), 4), 3);
+        assert_eq!(text_nav::text_width("".chars(), 4), 0);
     }
 
     #[test]
@@ -1491,14 +1466,14 @@ mod tests {
     #[test]
     fn tab_columns_round_trip() {
         let line = "a\tb";
-        assert_eq!(display_col(line, 0, 4), 0);
-        assert_eq!(display_col(line, 2, 4), 4);
-        assert_eq!(display_col(line, 3, 4), 5);
-        assert_eq!(buffer_col(line, 4, 4), 2);
-        assert_eq!(buffer_col(line, 2, 4), 1);
-        assert_eq!(buffer_col(line, 3, 4), 2);
-        assert_eq!(buffer_col(line, 99, 4), 3);
-        assert_eq!(buffer_col("abc", 1, 4), 1);
+        assert_eq!(text_nav::display_col_in(line, 0, 4), 0);
+        assert_eq!(text_nav::display_col_in(line, 2, 4), 4);
+        assert_eq!(text_nav::display_col_in(line, 3, 4), 5);
+        assert_eq!(text_nav::char_col_in(line, 4, 4), 2);
+        assert_eq!(text_nav::char_col_in(line, 2, 4), 1);
+        assert_eq!(text_nav::char_col_in(line, 3, 4), 2);
+        assert_eq!(text_nav::char_col_in(line, 99, 4), 3);
+        assert_eq!(text_nav::char_col_in("abc", 1, 4), 1);
     }
 
     #[test]
@@ -1524,7 +1499,7 @@ mod tests {
             let col = pos - rope.line_to_char(line);
             let text = text_nav::line_text(&rope, line);
             assert_eq!(
-                display_col(&text, col, 4),
+                text_nav::display_col_in(&text, col, 4),
                 text_nav::display_col(&rope, pos, 4),
                 "pos {pos}"
             );

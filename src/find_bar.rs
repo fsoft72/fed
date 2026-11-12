@@ -574,10 +574,7 @@ fn expand_match(
     }
     let line = rope.char_to_line(range.start);
     let line_start = rope.line_to_char(line);
-    let mut text = rope.line(line).to_string();
-    if text.ends_with('\n') {
-        text.pop();
-    }
+    let text = text_nav::line_text(rope, line);
     for caps in re.captures_iter(&text) {
         let m = caps.get(0)?;
         let start = line_start + text[..m.start()].chars().count();

@@ -45,7 +45,15 @@ pub fn prev_word_start(rope: &Rope, pos: usize, big: bool) -> usize {
     prev_word_start_with(rope, pos, big, false)
 }
 
-/// True when the char at `i` is the line break of an empty line.
+/// Returns true when line `line` has no chars besides its line break (the last line may have
+/// none at all).
+pub fn is_empty_line(rope: &Rope, line: usize) -> bool {
+    let start = rope.line_to_char(line);
+    line_end(rope, start) == start
+}
+
+/// True when the char at `i` is the line break of an empty line (see `is_empty_line`, by
+/// char index for scans that walk the text).
 pub fn is_empty_line_at(rope: &Rope, i: usize) -> bool {
     i < rope.len_chars() && rope.char(i) == '\n' && (i == 0 || rope.char(i - 1) == '\n')
 }
@@ -206,13 +214,37 @@ pub fn char_advance(c: char, col: usize, tab_width: usize) -> usize {
     }
 }
 
-/// Returns the display column of `pos` in its line: tabs advance to the next multiple of
-/// `tab_width`, other chars take one column.
+/// Display width in columns of `chars` (a line; a line break is not counted): tabs advance
+/// to the next multiple of `tab_width`, other chars take one column.
+pub fn text_width(chars: impl Iterator<Item = char>, tab_width: usize) -> usize {
+    chars
+        .filter(|&c| c != '\n')
+        .fold(0, |col, c| col + char_advance(c, col, tab_width))
+}
+
+/// Returns the display column of `pos` in its line (see `text_width`).
 pub fn display_col(rope: &Rope, pos: usize, tab_width: usize) -> usize {
     let start = line_start(rope, pos);
-    rope.slice(start..pos)
-        .chars()
-        .fold(0, |col, c| col + char_advance(c, col, tab_width))
+    text_width(rope.slice(start..pos).chars(), tab_width)
+}
+
+/// Converts char column `col` of the line text `line` to a display column (see `text_width`).
+pub fn display_col_in(line: &str, col: usize, tab_width: usize) -> usize {
+    text_width(line.chars().take(col), tab_width)
+}
+
+/// Converts display column `dcol` to the nearest char column of the line text `line` (a
+/// click inside a tab goes to the closer side).
+pub fn char_col_in(line: &str, dcol: usize, tab_width: usize) -> usize {
+    let mut x = 0;
+    for (i, c) in line.chars().enumerate() {
+        let w = char_advance(c, x, tab_width);
+        if dcol < x + w {
+            return if dcol - x <= w / 2 { i } else { i + 1 };
+        }
+        x += w;
+    }
+    line.chars().count()
 }
 
 /// Finds the bracket matching the one at `pos` for `()[]{}`, or `None`.
@@ -260,6 +292,19 @@ pub fn matching_bracket(rope: &Rope, pos: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_line_by_index_and_by_char_agree() {
+        let rope = Rope::from_str("a\n\nb\n\n");
+        let by_line: Vec<bool> = (0..rope.len_lines())
+            .map(|l| is_empty_line(&rope, l))
+            .collect();
+        assert_eq!(by_line, vec![false, true, false, true, true]);
+        for (l, &empty) in by_line.iter().enumerate().take(rope.len_lines() - 1) {
+            let at = rope.line_to_char(l);
+            assert_eq!(is_empty_line_at(&rope, at), empty, "line {l}");
+        }
+    }
 
     #[test]
     fn line_text_strips_the_break_and_borrows() {

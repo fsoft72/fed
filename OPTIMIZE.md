@@ -35,7 +35,7 @@
 - [x] **Syntax highlighting reparses everything after an edit** - `HighlightCache::invalidate_from` drops all spans after the edited line, so editing near the top of a long file reparses up to the viewport on every keystroke (spread over frames, with lines drawn plain meanwhile); stop reparsing when the parser state at the next checkpoint equals the old one and reuse the remaining spans shifted by the line delta from `dirty_lines_since`.
   - File(s): `src/highlight.rs`
 
-- [ ] **Duplicated line and column helpers** - `line_text` exists in `view.rs` (owned `String`) and `search.rs` (borrowed `Cow`) and is inlined again in `find_bar.rs` (`expand_match`); `display_col` exists in both `view.rs` and `text_nav.rs` with different semantics; `vim::motion::is_empty_line` overlaps `text_nav::is_empty_line_at`. Keep one version of each in `text_nav`.
+- [x] **Duplicated line and column helpers** - `line_text` exists in `view.rs` (owned `String`) and `search.rs` (borrowed `Cow`) and is inlined again in `find_bar.rs` (`expand_match`); `display_col` exists in both `view.rs` and `text_nav.rs` with different semantics; `vim::motion::is_empty_line` overlaps `text_nav::is_empty_line_at`. Keep one version of each in `text_nav`.
   - File(s): `src/view.rs`, `src/search.rs`, `src/find_bar.rs`, `src/text_nav.rs`, `src/vim/motion.rs`
 
 - [ ] **Vim key translation lives in the editor widget** - `egui_event_to_vim_keys`, `egui_event_to_vim_key` and `key_to_vim_key` are in `view.rs`, so the generic widget depends on `vim::VimKey` and `app/vim.rs` reaches into `view` for vim logic; move them to a `vim::keys` module next to `VimKey`.

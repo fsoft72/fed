@@ -257,12 +257,6 @@ pub fn line_end_of(rope: &Rope, line: usize) -> usize {
     text_nav::line_end(rope, rope.line_to_char(line))
 }
 
-/// Returns true when `line` has no chars besides its line break.
-pub fn is_empty_line(rope: &Rope, line: usize) -> bool {
-    let start = rope.line_to_char(line);
-    text_nav::line_end(rope, start) == start
-}
-
 /// Vim `w`: like `text_nav::next_word_start` but an empty line counts as a word.
 pub fn next_word_start(rope: &Rope, pos: usize, big: bool) -> usize {
     text_nav::next_word_start_with(rope, pos, big, true)
@@ -343,14 +337,14 @@ fn paragraph_next(rope: &Rope, pos: usize, count: usize) -> usize {
     let last = last_line(rope);
     let mut line = rope.char_to_line(pos);
     for _ in 0..count {
-        while line < last && is_empty_line(rope, line) {
+        while line < last && text_nav::is_empty_line(rope, line) {
             line += 1;
         }
-        while line < last && !is_empty_line(rope, line) {
+        while line < last && !text_nav::is_empty_line(rope, line) {
             line += 1;
         }
     }
-    if is_empty_line(rope, line) {
+    if text_nav::is_empty_line(rope, line) {
         return rope.line_to_char(line);
     }
     line_end_of(rope, line)
@@ -360,10 +354,10 @@ fn paragraph_next(rope: &Rope, pos: usize, count: usize) -> usize {
 fn paragraph_prev(rope: &Rope, pos: usize, count: usize) -> usize {
     let mut line = rope.char_to_line(pos);
     for _ in 0..count {
-        while line > 0 && is_empty_line(rope, line) {
+        while line > 0 && text_nav::is_empty_line(rope, line) {
             line -= 1;
         }
-        while line > 0 && !is_empty_line(rope, line) {
+        while line > 0 && !text_nav::is_empty_line(rope, line) {
             line -= 1;
         }
     }

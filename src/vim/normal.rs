@@ -556,7 +556,7 @@ impl VimState {
             if target_line > rope.char_to_line(prev) {
                 end = line_end_of(&rope, rope.char_to_line(prev));
             }
-            if end <= start && super::motion::is_empty_line(&rope, line) {
+            if end <= start && text_nav::is_empty_line(&rope, line) {
                 return Some(OpRange::Lines(line, line));
             }
         }
