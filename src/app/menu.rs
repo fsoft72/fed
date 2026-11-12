@@ -48,6 +48,36 @@ const ABOUT_NAME_SIZE: f32 = 28.0;
 const ABOUT_DETAILS_INDENT: f32 = 50.0;
 /// Minimum size of the Close button.
 const ABOUT_BUTTON_SIZE: egui::Vec2 = egui::vec2(120.0, 30.0);
+/// Space between the logo and the program name.
+const ABOUT_GAP_AFTER_LOGO: f32 = 14.0;
+/// Space between the tagline and the version pill.
+const ABOUT_GAP_BEFORE_VERSION: f32 = 8.0;
+/// Space between the version pill and the separator.
+const ABOUT_GAP_BEFORE_SEPARATOR: f32 = 18.0;
+/// Space between the separator and the details grid.
+const ABOUT_GAP_AFTER_SEPARATOR: f32 = 10.0;
+/// Space between the details grid and the Close button.
+const ABOUT_GAP_BEFORE_BUTTON: f32 = 20.0;
+/// Column and row spacing of the details grid.
+const ABOUT_DETAILS_SPACING: egui::Vec2 = egui::vec2(16.0, 8.0);
+/// White overlay alpha of the logo's top half.
+const ABOUT_LOGO_SHINE_ALPHA: u8 = 18;
+/// Horizontal shift of the logo "f" left of the center.
+const ABOUT_LOGO_LETTER_SHIFT: f32 = 6.0;
+/// Horizontal shift of the logo caret right of the center.
+const ABOUT_LOGO_CARET_SHIFT: f32 = 14.0;
+/// Width of the logo caret.
+const ABOUT_LOGO_CARET_WIDTH: f32 = 3.0;
+/// Height of the logo caret relative to the logo size.
+const ABOUT_LOGO_CARET_HEIGHT: f32 = 0.45;
+/// Corner radius of the logo caret.
+const ABOUT_LOGO_CARET_RADIUS: f32 = 1.0;
+/// White alpha of the logo caret.
+const ABOUT_LOGO_CARET_ALPHA: u8 = 190;
+/// Font size of the version pill.
+const VERSION_PILL_FONT_SIZE: f32 = 12.0;
+/// Padding around the version pill text.
+const VERSION_PILL_PADDING: egui::Vec2 = egui::vec2(10.0, 3.0);
 /// Author's GitHub profile.
 const AUTHOR_URL: &str = "https://github.com/fsoft72";
 /// Project repository.
@@ -158,21 +188,21 @@ pub(crate) fn show_about(ctx: &egui::Context) -> bool {
             ui.set_width(ABOUT_WIDTH);
             ui.vertical_centered(|ui| {
                 draw_logo(ui);
-                ui.add_space(14.0);
+                ui.add_space(ABOUT_GAP_AFTER_LOGO);
                 ui.label(
                     egui::RichText::new(ABOUT_NAME)
                         .size(ABOUT_NAME_SIZE)
                         .strong(),
                 );
                 ui.label(egui::RichText::new(ABOUT_TAGLINE).color(ui.visuals().text_color()));
-                ui.add_space(8.0);
+                ui.add_space(ABOUT_GAP_BEFORE_VERSION);
                 draw_version_pill(ui, &format!("v{}", env!("CARGO_PKG_VERSION")));
-                ui.add_space(18.0);
+                ui.add_space(ABOUT_GAP_BEFORE_SEPARATOR);
                 ui.separator();
-                ui.add_space(10.0);
+                ui.add_space(ABOUT_GAP_AFTER_SEPARATOR);
             });
             about_details(ui);
-            ui.add_space(20.0);
+            ui.add_space(ABOUT_GAP_BEFORE_BUTTON);
             ui.vertical_centered(|ui| {
                 let button = egui::Button::new("Close").min_size(ABOUT_BUTTON_SIZE);
                 ui.add(button).clicked()
@@ -196,20 +226,25 @@ fn draw_logo(ui: &mut egui::Ui) {
         sw: 0,
         se: 0,
     };
-    painter.rect_filled(top, top_radius, egui::Color32::from_white_alpha(18));
+    let shine = egui::Color32::from_white_alpha(ABOUT_LOGO_SHINE_ALPHA);
+    painter.rect_filled(top, top_radius, shine);
     let center = rect.center();
     painter.text(
-        center - egui::vec2(6.0, 0.0),
+        center - egui::vec2(ABOUT_LOGO_LETTER_SHIFT, 0.0),
         egui::Align2::CENTER_CENTER,
         "f",
         egui::FontId::monospace(ABOUT_LOGO_FONT_SIZE),
         egui::Color32::WHITE,
     );
     let caret = egui::Rect::from_center_size(
-        center + egui::vec2(14.0, 0.0),
-        egui::vec2(3.0, ABOUT_LOGO_SIZE * 0.45),
+        center + egui::vec2(ABOUT_LOGO_CARET_SHIFT, 0.0),
+        egui::vec2(
+            ABOUT_LOGO_CARET_WIDTH,
+            ABOUT_LOGO_SIZE * ABOUT_LOGO_CARET_HEIGHT,
+        ),
     );
-    painter.rect_filled(caret, 1.0, egui::Color32::from_white_alpha(190));
+    let caret_color = egui::Color32::from_white_alpha(ABOUT_LOGO_CARET_ALPHA);
+    painter.rect_filled(caret, ABOUT_LOGO_CARET_RADIUS, caret_color);
 }
 
 /// Paints `text` as a small rounded "pill" centered in the current layout.
@@ -217,10 +252,12 @@ fn draw_version_pill(ui: &mut egui::Ui, text: &str) {
     let visuals = ui.visuals();
     let color = visuals.text_color();
     let fill = visuals.widgets.inactive.weak_bg_fill;
-    let galley =
-        ui.painter()
-            .layout_no_wrap(text.to_string(), egui::FontId::monospace(12.0), color);
-    let padding = egui::vec2(10.0, 3.0);
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        egui::FontId::monospace(VERSION_PILL_FONT_SIZE),
+        color,
+    );
+    let padding = VERSION_PILL_PADDING;
     let (rect, _) = ui.allocate_exact_size(galley.size() + padding * 2.0, egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, rect.height() / 2.0, fill);
@@ -233,7 +270,7 @@ fn about_details(ui: &mut egui::Ui) {
         ui.add_space(ABOUT_DETAILS_INDENT);
         egui::Grid::new("fed_about_details")
             .num_columns(2)
-            .spacing(egui::vec2(16.0, 8.0))
+            .spacing(ABOUT_DETAILS_SPACING)
             .show(ui, |ui| {
                 caption(ui, "Author");
                 ui.hyperlink_to(AUTHOR_NAME, AUTHOR_URL);

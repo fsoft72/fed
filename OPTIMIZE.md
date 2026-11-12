@@ -65,5 +65,5 @@
   - File(s): `src/vim/normal.rs`, `src/vim/mod.rs`, `src/vim/textobj.rs`
 - [x] **Vim module layout and long functions** - Insert, Visual, command-line and operator handling all sit in `vim/mod.rs` while Normal mode is in `normal.rs`; `insert_key` (~70 lines) and `simple` (~65 lines) should be split, and `Operator` / `Target::Object` lack doc comments.
   - File(s): `src/vim/mod.rs`, `src/vim/normal.rs`
-- [ ] **Magic numbers in UI drawing** - the About dialog painting (`draw_logo`, `draw_version_pill`, `show_about`) and the repeated filter field width `140.0` in the settings sections use bare literals; promote them to named constants like the rest of the code base.
+- [x] **Magic numbers in UI drawing** - the About dialog painting (`draw_logo`, `draw_version_pill`, `show_about`) and the repeated filter field width `140.0` in the settings sections use bare literals; promote them to named constants like the rest of the code base.
   - File(s): `src/app/menu.rs`, `src/settings_ui.rs`

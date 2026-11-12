@@ -413,7 +413,13 @@ impl VimState {
     }
 
     /// `D` / `C`: applies `op` from the caret to the end of the line (`count` lines).
-    fn change_to_line_end(&mut self, op: Operator, count: Option<usize>, pos: usize, env: &mut Env) {
+    fn change_to_line_end(
+        &mut self,
+        op: Operator,
+        count: Option<usize>,
+        pos: usize,
+        env: &mut Env,
+    ) {
         let target = Target::Motion(Motion::LineEnd);
         if let Some(range) = self.op_range(op, target, count, pos, env) {
             self.apply_operator(op, range, env);

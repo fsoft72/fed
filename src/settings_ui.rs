@@ -18,6 +18,8 @@ const DEFAULT_SIZE: [f32; 2] = [760.0, 560.0];
 const NAV_WIDTH: f32 = 170.0;
 /// Inner margin of the section list frame, in logical pixels.
 const NAV_MARGIN: i8 = 4;
+/// Width of the font family filter fields.
+const FILTER_FIELD_WIDTH: f32 = 140.0;
 /// Height of the font family list inside its combo box.
 const FONT_LIST_HEIGHT: f32 = 300.0;
 /// Width of the font family and code theme combo boxes.
@@ -529,7 +531,7 @@ impl SettingsWindow {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.font_filter)
                             .hint_text("filter fonts")
-                            .desired_width(140.0),
+                            .desired_width(FILTER_FIELD_WIDTH),
                     );
                     ui.checkbox(&mut self.monospace_only, "monospace only");
                 });
@@ -614,7 +616,7 @@ impl SettingsWindow {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.preview_font_filter)
                         .hint_text("filter fonts")
-                        .desired_width(140.0),
+                        .desired_width(FILTER_FIELD_WIDTH),
                 );
                 ui.end_row();
 
