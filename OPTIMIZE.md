@@ -53,7 +53,7 @@
 - [x] **Syntax detection ignores file names and shebangs** - `syntax_for_path` looks only at the extension, so `Makefile`, `Dockerfile`, `.bashrc` or an extensionless `#!/usr/bin/env python` script are shown as plain text (and spell checked as prose). Fall back to `find_syntax_by_name` on the file name and `find_syntax_by_first_line` on the first line.
   - File(s): `src/highlight.rs` (`syntax_for_path`), `src/tab.rs` (`refresh_syntax`)
 
-- [ ] **Find bar match index is a linear scan every frame** - `count_label` runs `matches.iter().position(|m| *m == sel)` each frame the bar is open; the matches are sorted, so use `partition_point` like `next_match`.
+- [x] **Find bar match index is a linear scan every frame** - `count_label` runs `matches.iter().position(|m| *m == sel)` each frame the bar is open; the matches are sorted, so use `partition_point` like `next_match`.
   - File(s): `src/find_bar.rs` (`count_label`)
 
 - [ ] **Long command dispatch functions** - `editing::apply_command` (~125 lines) and `vim::motion::resolve` (~85 lines) are single large `match` blocks; group the arms by family (movement, deletion, selection) into helpers so each stays readable and testable on its own.

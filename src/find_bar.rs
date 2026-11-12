@@ -559,7 +559,7 @@ impl FindBar {
             return "no matches".to_string();
         }
         let sel = tab.editor.selection.range();
-        match matches.iter().position(|m| *m == sel) {
+        match match_index(&matches, &sel) {
             Some(i) => format!("{} of {}", i + 1, matches.len()),
             None => format!("{} matches", matches.len()),
         }
@@ -668,6 +668,13 @@ fn select(tab: &mut Tab, range: Range<usize>) {
     };
     tab.editor.preferred_col = None;
     tab.scroll_to_cursor = true;
+}
+
+/// Index of the match equal to `sel` in `matches` (sorted, non-overlapping), found by a binary
+/// search; `None` when the selection is not a match.
+fn match_index(matches: &[Range<usize>], sel: &Range<usize>) -> Option<usize> {
+    let idx = matches.partition_point(|m| m.start < sel.start);
+    (matches.get(idx) == Some(sel)).then_some(idx)
 }
 
 /// First match starting after `from` (or at `from` when `inclusive`), wrapping to the first.
@@ -1068,6 +1075,16 @@ mod tests {
             wait_for_search(&bar, &tab).len(),
             tab.buffer.rope().len_lines() - 1
         );
+    }
+
+    #[test]
+    fn match_index_finds_only_exact_matches() {
+        let matches = vec![0..2, 5..7, 9..12];
+        assert_eq!(match_index(&matches, &(5..7)), Some(1));
+        assert_eq!(match_index(&matches, &(9..12)), Some(2));
+        assert_eq!(match_index(&matches, &(5..6)), None);
+        assert_eq!(match_index(&matches, &(3..3)), None);
+        assert_eq!(match_index(&[], &(0..1)), None);
     }
 
     #[test]
