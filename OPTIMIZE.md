@@ -27,7 +27,7 @@
   - File(s): `src/app.rs`
 - [x] **Editor rendering juggles tab internals inside `ui`** - the `CentralPanel` closure in `FedApp::ui` (~95 lines) moves `syntax`, `highlight`, `spell_md` and `spell_marks` out of the `Tab`, builds the decorator stack in two duplicated branches and puts them back by hand (`tab.syntax = assets.map(|_| syntax)` silently drops the syntax when assets are missing); move this into a `Tab::show_editor` method that builds the decorator chain once and keep those `Tab` fields private.
   - File(s): `src/app.rs`, `src/tab.rs`
-- [ ] **Files are loaded on the UI thread with no size cap** - `Buffer::load` runs synchronously from `FedApp::try_open`, holds the file up to three times in memory (bytes, normalized copy, rope) and `LARGE_FILE_BYTES` only disables features; refuse or confirm above a hard limit and load big files on a background thread.
+- [x] **Files are loaded on the UI thread with no size cap** - `Buffer::load` runs synchronously from `FedApp::try_open`, holds the file up to three times in memory (bytes, normalized copy, rope) and `LARGE_FILE_BYTES` only disables features; refuse or confirm above a hard limit and load big files on a background thread.
   - File(s): `src/buffer.rs`, `src/app.rs`
 
 ## Medium

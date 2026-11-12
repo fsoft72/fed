@@ -198,7 +198,9 @@ system cannot open it, the error shows in the status bar.
 
 ## Large files
 
-Large files always open. When a file is 5 MB or more, or has a line longer than 10 000
+Files up to 256 MB open; bigger ones are refused with an error in the status bar. Files of
+1 MB or more are read on a background thread, so the window stays responsive and the tab
+appears when the file is loaded. When a file is 5 MB or more, or has a line longer than 10 000
 characters, syntax highlighting, spell check and word wrap are turned off for that tab and the
 status bar says so.
 

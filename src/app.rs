@@ -10,11 +10,11 @@ mod vim;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::buffer::Buffer;
+use crate::buffer::{self, BACKGROUND_LOAD_BYTES, Buffer, LoadJob};
 use crate::config::{self, ConfigPaths, Session, Settings, UiTheme};
 use crate::editing::{EditCommand, EditSettings};
 use crate::find_bar::{BarMode, FindBar};
@@ -37,6 +37,8 @@ use tab_bar::TabBarAction;
 use vim::VimMessage;
 pub use vim::vim_status_text;
 
+/// How often pending background file loads are checked.
+const LOAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Name shown for a tab without a file path.
 const UNTITLED: &str = "untitled";
 /// Status message shown when the preview is requested on a non-Markdown tab.
@@ -146,6 +148,8 @@ impl SaveOutcome {
 pub struct FedApp {
     /// Open documents, one per tab; never empty.
     tabs: Vec<Tab>,
+    /// Big files being read on background threads; each becomes a tab when done.
+    loads: Vec<LoadJob>,
     /// Index of the tab shown in the editor area.
     active: usize,
     /// Editor settings.
@@ -211,6 +215,7 @@ impl FedApp {
         let fonts = FontManager::new(&cc.egui_ctx, &settings);
         let mut app = FedApp {
             tabs: Vec::new(),
+            loads: Vec::new(),
             active: 0,
             settings,
             keymap,
@@ -315,7 +320,9 @@ impl FedApp {
         self.find_bar.open(mode, tab);
     }
 
-    /// Opens `path` in a tab (see `open_path`), returning a readable error.
+    /// Opens `path` in a tab (see `open_path`), returning a readable error. Files of
+    /// `BACKGROUND_LOAD_BYTES` or more are read on a background thread and get their tab in a
+    /// later frame (`poll_loads`); files over `buffer::MAX_FILE_BYTES` are refused.
     fn try_open(&mut self, path: PathBuf) -> Result<(), String> {
         let open = self
             .tabs
@@ -325,7 +332,22 @@ impl FedApp {
             self.activate(idx);
             return Ok(());
         }
-        let tab = Tab::new(Buffer::load(&path).map_err(|e| e.to_string())?);
+        if self.loads.iter().any(|job| same_file(job.path(), &path)) {
+            return Ok(());
+        }
+        let size = buffer::check_size(&path).map_err(|e| e.to_string())?;
+        if size >= BACKGROUND_LOAD_BYTES {
+            self.set_status(format!("loading {}...", path.display()), Severity::Info);
+            self.loads.push(LoadJob::spawn(path));
+            return Ok(());
+        }
+        let buffer = Buffer::load(&path).map_err(|e| e.to_string())?;
+        self.insert_tab(Tab::new(buffer));
+        Ok(())
+    }
+
+    /// Shows `tab` as the active tab, replacing the active tab when it is blank.
+    fn insert_tab(&mut self, tab: Tab) {
         self.leave_active();
         match self.tabs.get(self.active) {
             Some(current) if is_blank(current) => self.tabs[self.active] = tab,
@@ -334,7 +356,27 @@ impl FedApp {
                 self.active = self.tabs.len() - 1;
             }
         }
-        Ok(())
+    }
+
+    /// Opens the files whose background load finished (errors go to the status bar) and
+    /// keeps polling while loads are pending.
+    fn poll_loads(&mut self, ctx: &egui::Context) {
+        if self.loads.is_empty() {
+            return;
+        }
+        for job in std::mem::take(&mut self.loads) {
+            match job.poll() {
+                None => self.loads.push(job),
+                Some(Ok(buffer)) => {
+                    self.insert_tab(Tab::new(buffer));
+                    self.set_status(format!("opened {}", job.path().display()), Severity::Info);
+                }
+                Some(Err(e)) => self.set_status(e.to_string(), Severity::Error),
+            }
+        }
+        if !self.loads.is_empty() {
+            ctx.request_repaint_after(LOAD_POLL_INTERVAL);
+        }
     }
 
     /// Files of the previous session that still exist.
@@ -743,6 +785,7 @@ impl eframe::App for FedApp {
             self.set_status(warning, Severity::Warning);
         }
         self.status.poll_link_errors();
+        self.poll_loads(&ctx);
         match self.settings_window.capture_keys(&ctx, &mut self.keymap) {
             Some(events) => self.apply_settings_events(&ctx, events),
             None => self.handle_shortcuts(&ctx),

@@ -5,11 +5,16 @@ use std::collections::VecDeque;
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use ropey::Rope;
+use ropey::{Rope, RopeBuilder};
 
 /// Files at or above this many bytes are flagged as large.
 pub const LARGE_FILE_BYTES: usize = 5_000_000;
+/// Files bigger than this many bytes are refused instead of opened.
+pub const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Files at or above this many bytes are read on a background thread.
+pub const BACKGROUND_LOAD_BYTES: u64 = 1024 * 1024;
 /// Lines longer than this many chars flag the buffer as large.
 pub const LONG_LINE_CHARS: usize = 10_000;
 /// Number of recent edits remembered by `first_dirty_line_since`.
@@ -51,6 +56,19 @@ pub enum BufferError {
         /// Underlying I/O error.
         source: std::io::Error,
     },
+    /// The file is bigger than `MAX_FILE_BYTES`.
+    #[error("{path}: file is too large ({size} bytes, the limit is {limit} bytes)")]
+    TooLarge {
+        /// The refused file.
+        path: PathBuf,
+        /// Its size in bytes.
+        size: u64,
+        /// The limit, `MAX_FILE_BYTES`.
+        limit: u64,
+    },
+    /// The background loader thread stopped without a result.
+    #[error("{0}: loading was interrupted")]
+    LoadInterrupted(PathBuf),
     /// A save was requested but the buffer is not bound to a path.
     #[error("buffer has no file path")]
     NoPath,
@@ -132,7 +150,7 @@ impl Buffer {
     /// rope always holds LF only (CRLF and lone CR become LF).
     pub fn from_text(text: &str) -> Buffer {
         let crlf = detect_line_ending(text) == LineEnding::Crlf;
-        let rope = Rope::from_str(&normalize_newlines(text));
+        let rope = build_rope(text);
         let large =
             text.len() >= LARGE_FILE_BYTES || rope.lines().any(|l| l.len_chars() > LONG_LINE_CHARS);
         Buffer {
@@ -156,12 +174,15 @@ impl Buffer {
         }
     }
 
-    /// Loads `path`. A missing file yields an empty buffer bound to `path`.
+    /// Loads `path`. A missing file yields an empty buffer bound to `path`; a file bigger than
+    /// `MAX_FILE_BYTES` is refused before it is read. The text is held at most twice while
+    /// loading (the file contents and the rope).
     pub fn load(path: &Path) -> Result<Buffer, BufferError> {
         let io_err = |source| BufferError::Io {
             path: path.to_path_buf(),
             source,
         };
+        check_size(path)?;
         let mut buf = match fs::read(path) {
             Ok(bytes) => {
                 let text = String::from_utf8(bytes)
@@ -481,6 +502,83 @@ fn detect_line_ending(text: &str) -> LineEnding {
     }
 }
 
+/// Returns the size of the file at `path` in bytes, 0 when it cannot be read (a missing
+/// file opens empty, other errors are reported by the read itself).
+pub fn file_size(path: &Path) -> u64 {
+    fs::metadata(path).map_or(0, |m| m.len())
+}
+
+/// Returns the size of the file at `path` (see `file_size`), or `TooLarge` when it is bigger
+/// than `MAX_FILE_BYTES`.
+pub fn check_size(path: &Path) -> Result<u64, BufferError> {
+    let size = file_size(path);
+    if size > MAX_FILE_BYTES {
+        return Err(BufferError::TooLarge {
+            path: path.to_path_buf(),
+            size,
+            limit: MAX_FILE_BYTES,
+        });
+    }
+    Ok(size)
+}
+
+/// Builds the rope of `text` with `\r\n` and lone `\r` mapped to `\n`, appending the pieces
+/// between carriage returns instead of building a normalized copy of the whole text first.
+fn build_rope(text: &str) -> Rope {
+    if !text.contains('\r') {
+        return Rope::from_str(text);
+    }
+    let mut builder = RopeBuilder::new();
+    let mut rest = text;
+    while let Some(i) = rest.find('\r') {
+        builder.append(&rest[..i]);
+        let after = &rest[i + 1..];
+        if !after.starts_with('\n') {
+            builder.append("\n");
+        }
+        rest = after;
+    }
+    builder.append(rest);
+    builder.finish()
+}
+
+/// A file being loaded on a background thread.
+pub struct LoadJob {
+    /// The file being loaded.
+    path: PathBuf,
+    /// Receives the load result.
+    rx: Receiver<Result<Buffer, BufferError>>,
+}
+
+impl LoadJob {
+    /// Starts loading `path` with `Buffer::load` on a new thread.
+    pub fn spawn(path: PathBuf) -> LoadJob {
+        let (tx, rx) = mpsc::channel();
+        let thread_path = path.clone();
+        std::thread::spawn(move || {
+            // Nobody listening (the app closed) is fine.
+            let _ = tx.send(Buffer::load(&thread_path));
+        });
+        LoadJob { path, rx }
+    }
+
+    /// The file being loaded.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the result once the thread is done, `None` while it is still loading.
+    pub fn poll(&self) -> Option<Result<Buffer, BufferError>> {
+        match self.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                Some(Err(BufferError::LoadInterrupted(self.path.clone())))
+            }
+        }
+    }
+}
+
 /// Maps `\r\n` and lone `\r` to `\n` so the rope never contains `\r`.
 fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains('\r') {
@@ -562,6 +660,49 @@ mod tests {
             let buf = Buffer::from_text(&format!("a{sep}b"));
             assert_eq!(buf.rope().len_lines(), 1, "{sep:?}");
         }
+    }
+
+    #[test]
+    fn carriage_returns_become_line_feeds_in_the_rope() {
+        for (text, want) in [
+            ("a\r\nb\r\n", "a\nb\n"),
+            ("a\rb\r", "a\nb\n"),
+            ("\r\r\n\n", "\n\n\n"),
+            ("plain\n", "plain\n"),
+            ("è\r\nò", "è\nò"),
+        ] {
+            assert_eq!(build_rope(text).to_string(), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn files_over_the_limit_are_refused_unread() {
+        let path = temp_dir("too-large").join("big.bin");
+        let file = fs::File::create(&path).unwrap();
+        // Sparse: no data is written, only the size is set.
+        file.set_len(MAX_FILE_BYTES + 1).unwrap();
+        let err = Buffer::load(&path).err().expect("refused");
+        assert!(matches!(err, BufferError::TooLarge { size, .. } if size == MAX_FILE_BYTES + 1));
+        assert!(err.to_string().contains("too large"), "{err}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_job_delivers_the_buffer() {
+        let path = temp_dir("load-job").join("a.txt");
+        fs::write(&path, "x\r\ny\r\n").unwrap();
+        let job = LoadJob::spawn(path.clone());
+        assert_eq!(job.path(), path.as_path());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let buf = loop {
+            if let Some(result) = job.poll() {
+                break result.unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline, "load never finished");
+            std::thread::yield_now();
+        };
+        assert_eq!(buf.text(), "x\ny\n");
+        assert_eq!(buf.path(), Some(path.as_path()));
     }
 
     #[test]
