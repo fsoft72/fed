@@ -60,7 +60,7 @@ pub struct Tab {
     spell: SpellCache,
     /// True while the Markdown preview panel is shown for this tab.
     pub preview_open: bool,
-    /// Markdown preview state, created when the preview is first opened.
+    /// Markdown preview state, created when the preview opens and dropped when it closes.
     pub preview: Option<Preview>,
     /// Vim emulation state (used only while vim mode is on).
     pub vim: VimState,
@@ -193,6 +193,15 @@ impl Tab {
             .cloned()
     }
 
+    /// Opens or closes the Markdown preview. Closing drops the preview state (its renderer
+    /// cache and its copy of the text) until the preview is opened again.
+    pub fn toggle_preview(&mut self) {
+        self.preview_open = !self.preview_open;
+        if !self.preview_open {
+            self.preview = None;
+        }
+    }
+
     /// Gives the editor widget keyboard focus the next time this tab is shown
     /// (after switching tabs or closing a dialog).
     pub fn focus_editor(&mut self) {
@@ -247,6 +256,17 @@ mod tests {
         tab.buffer.set_path(PathBuf::from("notes.md"));
         tab.refresh_syntax(&assets);
         assert_eq!(tab.syntax.as_deref(), Some("Markdown"));
+    }
+
+    #[test]
+    fn closing_the_preview_drops_its_state() {
+        let mut tab = Tab::new(Buffer::from_text("# hi"));
+        tab.toggle_preview();
+        assert!(tab.preview_open);
+        tab.preview = Some(Preview::new());
+        tab.toggle_preview();
+        assert!(!tab.preview_open);
+        assert!(tab.preview.is_none());
     }
 
     #[test]

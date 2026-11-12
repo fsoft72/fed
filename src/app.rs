@@ -704,7 +704,7 @@ impl FedApp {
             self.set_status(PREVIEW_UNAVAILABLE.to_string(), Severity::Info);
             return;
         }
-        tab.preview_open = !tab.preview_open;
+        tab.toggle_preview();
     }
 
     /// Draws the right-hand preview panel for the active Markdown tab, if it is open.
