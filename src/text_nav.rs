@@ -174,15 +174,29 @@ pub fn pos_at(rope: &Rope, line: usize, col: usize) -> usize {
     (start + col).min(line_end(rope, start))
 }
 
+/// Columns taken by a tab starting at display column `col`: up to the next multiple of
+/// `tab_width` (a width of 0 counts as 1).
+pub fn tab_advance(col: usize, tab_width: usize) -> usize {
+    let width = tab_width.max(1);
+    width - col % width
+}
+
+/// Columns taken by `c` starting at display column `col`: tabs advance to the next tab stop,
+/// other chars take one column.
+pub fn char_advance(c: char, col: usize, tab_width: usize) -> usize {
+    match c {
+        '\t' => tab_advance(col, tab_width),
+        _ => 1,
+    }
+}
+
 /// Returns the display column of `pos` in its line: tabs advance to the next multiple of
 /// `tab_width`, other chars take one column.
 pub fn display_col(rope: &Rope, pos: usize, tab_width: usize) -> usize {
-    let width = tab_width.max(1);
     let start = line_start(rope, pos);
-    rope.slice(start..pos).chars().fold(0, |col, c| match c {
-        '\t' => col + width - col % width,
-        _ => col + 1,
-    })
+    rope.slice(start..pos)
+        .chars()
+        .fold(0, |col, c| col + char_advance(c, col, tab_width))
 }
 
 /// Finds the bracket matching the one at `pos` for `()[]{}`, or `None`.

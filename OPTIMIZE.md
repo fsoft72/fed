@@ -9,7 +9,7 @@
 
 ## High
 
-- [ ] **Tab rendering disagrees with tab-stop columns** - the view draws every `\t` as a fixed `tab_width` spaces (`expand_tabs`, `display_col`, `buffer_col`, `display_width`), while `text_nav::display_col` (used by `indent` and vim insert) advances to the next tab stop; text like `ab\tx` is drawn at a different column than the editing logic assumes and columns of mixed tabs/spaces never line up. Make the view use tab stops (one shared helper) so layout, hit testing, selection rects and indentation agree.
+- [x] **Tab rendering disagrees with tab-stop columns** - the view draws every `\t` as a fixed `tab_width` spaces (`expand_tabs`, `display_col`, `buffer_col`, `display_width`), while `text_nav::display_col` (used by `indent` and vim insert) advances to the next tab stop; text like `ab\tx` is drawn at a different column than the editing logic assumes and columns of mixed tabs/spaces never line up. Make the view use tab stops (one shared helper) so layout, hit testing, selection rects and indentation agree.
   - File(s): `src/view.rs`, `src/text_nav.rs`, `src/editing.rs`, `src/vim/insert.rs`
 
 - [ ] **Find matches rescan the whole document on every edit, on the UI thread** - `FindBar::matches` calls `search::find_all` over every line whenever the revision changes, so each keystroke with the find bar open costs a full regex pass (seconds on a large file, which is still searchable); it is also computed in `FedApp::ui` before `show_editor` applies the frame's keys, so the match highlights are one revision stale in the edit frame. Update the cache incrementally with `Buffer::dirty_lines_since` (rescan only the changed lines and shift the rest) and compute it after the keyboard edits (e.g. in `MatchDecorator::prepare`).

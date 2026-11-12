@@ -580,28 +580,24 @@ fn line_at_y(tops: &[f32], y: f32) -> usize {
         .min(lines - 1)
 }
 
-/// Display width in columns of `chars` (a line, newline excluded from the count); tabs take
-/// `tab_width` columns.
+/// Display width in columns of `chars` (a line, newline excluded from the count); tabs
+/// advance to the next multiple of `tab_width`.
 fn display_width(chars: impl Iterator<Item = char>, tab_width: usize) -> usize {
     chars
         .filter(|&c| c != '\n')
-        .map(|c| if c == '\t' { tab_width } else { 1 })
-        .sum()
+        .fold(0, |col, c| col + text_nav::char_advance(c, col, tab_width))
 }
 
-/// Converts a char column of `line` to a display column (tabs take `tab_width` columns).
+/// Converts a char column of `line` to a display column (tabs advance to the next tab stop).
 fn display_col(line: &str, col: usize, tab_width: usize) -> usize {
-    line.chars()
-        .take(col)
-        .map(|c| if c == '\t' { tab_width } else { 1 })
-        .sum()
+    display_width(line.chars().take(col), tab_width)
 }
 
 /// Converts a display column to the nearest char column of `line`.
 fn buffer_col(line: &str, dcol: usize, tab_width: usize) -> usize {
     let mut x = 0;
     for (i, c) in line.chars().enumerate() {
-        let w = if c == '\t' { tab_width } else { 1 };
+        let w = text_nav::char_advance(c, x, tab_width);
         if dcol < x + w {
             return if dcol - x <= w / 2 { i } else { i + 1 };
         }
@@ -610,13 +606,23 @@ fn buffer_col(line: &str, dcol: usize, tab_width: usize) -> usize {
     line.chars().count()
 }
 
-/// Returns `line` with tabs replaced by `tab_width` spaces.
-fn expand_tabs(text: &str, tab_width: usize) -> String {
-    if !text.contains('\t') {
-        return text.to_string();
+/// Returns `line` with every tab replaced by the spaces up to the next tab stop, plus the
+/// byte offset in the result of every char of `line` (and of its end, as the last entry).
+fn expand_tabs(line: &str, tab_width: usize) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(line.len());
+    let mut offsets = Vec::with_capacity(line.len() + 1);
+    let mut col = 0;
+    for c in line.chars() {
+        offsets.push(out.len());
+        let w = text_nav::char_advance(c, col, tab_width);
+        match c {
+            '\t' => out.extend(std::iter::repeat_n(' ', w)),
+            _ => out.push(c),
+        }
+        col += w;
     }
-    let spaces = " ".repeat(tab_width);
-    text.replace('\t', &spaces)
+    offsets.push(out.len());
+    (out, offsets)
 }
 
 /// Builds the layout job for `line`: `spans` (char ranges) on top of `base`, tabs expanded.
@@ -633,11 +639,11 @@ fn build_layout_job(
         ..Default::default()
     };
     job.wrap.max_width = wrap_width.unwrap_or(f32::INFINITY);
-    let chars: Vec<char> = line.chars().collect();
-    let len = chars.len();
+    let (expanded, offsets) = expand_tabs(line, tab_width);
+    let len = offsets.len() - 1;
     let mut append = |range: Range<usize>, format: &TextFormat| {
-        let text: String = chars[range].iter().collect();
-        job.append(&expand_tabs(&text, tab_width), 0.0, format.clone());
+        let text = &expanded[offsets[range.start]..offsets[range.end]];
+        job.append(text, 0.0, format.clone());
     };
     let mut sorted: Vec<&(Range<usize>, TextFormat)> = spans.iter().collect();
     sorted.sort_by_key(|(r, _)| r.start);
@@ -1158,7 +1164,10 @@ impl Frame<'_> {
         let head = self.tab.editor.selection.head;
         let c = (head < rope.len_chars()).then(|| rope.char(head));
         match c {
-            Some('\t') => self.m.char_width * self.m.tab_width as f32,
+            Some('\t') => {
+                let col = text_nav::display_col(rope, head, self.m.tab_width);
+                self.m.char_width * text_nav::tab_advance(col, self.m.tab_width) as f32
+            }
             Some(c) if c != '\n' => {
                 let font = &self.m.base.font_id;
                 ui.ctx()
@@ -1460,6 +1469,9 @@ mod tests {
     #[test]
     fn display_width_expands_tabs() {
         assert_eq!(display_width("\t\tab\n".chars(), 4), 10);
+        // Tabs stop at multiples of the tab width.
+        assert_eq!(display_width("ab\tx".chars(), 4), 5);
+        assert_eq!(display_width("abcd\t".chars(), 4), 8);
         assert_eq!(display_width("abc".chars(), 4), 3);
         assert_eq!(display_width("".chars(), 4), 0);
     }
@@ -1477,11 +1489,11 @@ mod tests {
     fn tab_columns_round_trip() {
         let line = "a\tb";
         assert_eq!(display_col(line, 0, 4), 0);
-        assert_eq!(display_col(line, 2, 4), 5);
-        assert_eq!(display_col(line, 3, 4), 6);
-        assert_eq!(buffer_col(line, 5, 4), 2);
-        assert_eq!(buffer_col(line, 2, 4), 1);
+        assert_eq!(display_col(line, 2, 4), 4);
+        assert_eq!(display_col(line, 3, 4), 5);
         assert_eq!(buffer_col(line, 4, 4), 2);
+        assert_eq!(buffer_col(line, 2, 4), 1);
+        assert_eq!(buffer_col(line, 3, 4), 2);
         assert_eq!(buffer_col(line, 99, 4), 3);
         assert_eq!(buffer_col("abc", 1, 4), 1);
     }
@@ -1494,11 +1506,29 @@ mod tests {
             ..Default::default()
         };
         let job = build_layout_job("a\tbcd", &[(2..4, red.clone())], &base, 2, None, 10.0);
-        assert_eq!(job.text, "a  bcd");
+        assert_eq!(job.text, "a bcd");
         assert_eq!(job.sections.len(), 3);
         assert_eq!(job.sections[1].format, red);
         let r = &job.sections[1].byte_range;
         assert_eq!(&job.text[r.start.0..r.end.0], "bc");
+    }
+
+    #[test]
+    fn view_columns_match_editing_tab_stops() {
+        let rope = Rope::from_str("ab\tx\n\t\ty");
+        for pos in [0, 2, 3, 4, 5, 6, 7] {
+            let line = rope.char_to_line(pos);
+            let col = pos - rope.line_to_char(line);
+            let text = line_text(&rope, line);
+            assert_eq!(
+                display_col(&text, col, 4),
+                text_nav::display_col(&rope, pos, 4),
+                "pos {pos}"
+            );
+        }
+        let (expanded, offsets) = expand_tabs("ab\tx", 4);
+        assert_eq!(expanded, "ab  x");
+        assert_eq!(offsets, vec![0, 1, 2, 4, 5]);
     }
 
     #[test]
