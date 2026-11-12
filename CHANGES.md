@@ -36,3 +36,7 @@
 - Added a hamburger menu at the far right of the tab bar (`src/app/menu.rs`): New tab, Open file, Close file, Save, Save As (with their current shortcuts), About, Quit. Quit goes through the window close request, so unsaved files ask for confirmation. About shows name, version, author, license and clickable GitHub links (opened via `FedApp::open_links`).
 - Tab switching shortcuts: Previous tab now defaults to `Ctrl/Cmd+1` and Next tab to `Ctrl/Cmd+2` (rebindable in Key bindings as `prev_tab` / `next_tab`). `Ctrl+Tab` and `Ctrl+Shift+Tab` keep working as fixed aliases, next to the `Cmd+Shift+Z` redo alias (`SHORTCUT_ALIASES` in `src/app.rs`).
 - About dialog redesigned (`src/app/menu.rs`): painted logo (accent rounded square with an "f" and a caret), large name, tagline, version pill, a captioned details grid (Author, With, License, Source with short link text) and a wider Close button, inside a rounded frame with more padding.
+
+## 2026-11-12
+
+- Added `OPTIMIZE.md`: prioritized list of optimization and quality improvements (3 critical, 8 high, 9 medium, 7 low).
