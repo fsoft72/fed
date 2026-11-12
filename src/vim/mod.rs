@@ -417,8 +417,8 @@ impl VimState {
                 self.auto_indent = true;
             }
             VimKey::Tab => {
-                let col = pos - text_nav::line_start(&rope, pos);
                 let width = env.settings.tab_width.max(1);
+                let col = text_nav::display_col(&rope, pos, width);
                 let unit = match env.settings.insert_spaces {
                     true => " ".repeat(width - col % width),
                     false => "\t".to_string(),

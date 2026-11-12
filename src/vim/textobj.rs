@@ -103,8 +103,8 @@ fn enclosing_open(rope: &Rope, pos: usize, open: char, close: char) -> Option<us
         return text_nav::matching_bracket(rope, pos);
     }
     let mut depth = 0usize;
-    for i in (0..pos).rev() {
-        let c = rope.char(i);
+    // One rope iterator walking back, instead of a tree lookup per char.
+    for (i, c) in (0..pos).rev().zip(rope.chars_at(pos).reversed()) {
         if c == close {
             depth += 1;
         } else if c == open {

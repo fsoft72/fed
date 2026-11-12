@@ -174,6 +174,17 @@ pub fn pos_at(rope: &Rope, line: usize, col: usize) -> usize {
     (start + col).min(line_end(rope, start))
 }
 
+/// Returns the display column of `pos` in its line: tabs advance to the next multiple of
+/// `tab_width`, other chars take one column.
+pub fn display_col(rope: &Rope, pos: usize, tab_width: usize) -> usize {
+    let width = tab_width.max(1);
+    let start = line_start(rope, pos);
+    rope.slice(start..pos).chars().fold(0, |col, c| match c {
+        '\t' => col + width - col % width,
+        _ => col + 1,
+    })
+}
+
 /// Finds the bracket matching the one at `pos` for `()[]{}`, or `None`.
 pub fn matching_bracket(rope: &Rope, pos: usize) -> Option<usize> {
     if pos >= rope.len_chars() {
@@ -189,36 +200,47 @@ pub fn matching_bracket(rope: &Rope, pos: usize) -> Option<usize> {
         '}' => ('{', '}', false),
         _ => return None,
     };
+    let (same, other) = if forward {
+        (open, close)
+    } else {
+        (close, open)
+    };
     let mut depth = 0usize;
-    let mut i = pos;
-    loop {
-        let ch = rope.char(i);
-        if ch == if forward { open } else { close } {
+    let mut step = |ch: char| {
+        if ch == same {
             depth += 1;
-        } else if ch == if forward { close } else { open } {
+        } else if ch == other {
             depth -= 1;
-            if depth == 0 {
-                return Some(i);
-            }
+            return depth == 0;
         }
-        if forward {
-            i += 1;
-            if i >= rope.len_chars() {
-                return None;
-            }
-        } else {
-            if i == 0 {
-                return None;
-            }
-            i -= 1;
-        }
+        false
+    };
+    // Rope iterators instead of a tree lookup per char.
+    if forward {
+        return (pos..)
+            .zip(rope.chars_at(pos))
+            .find_map(|(i, ch)| step(ch).then_some(i));
     }
+    (0..=pos)
+        .rev()
+        .zip(rope.chars_at(pos + 1).reversed())
+        .find_map(|(i, ch)| step(ch).then_some(i))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ropey::Rope;
+
+    #[test]
+    fn display_col_follows_tab_stops() {
+        let rope = Rope::from_str("a\tb\n\t\tc");
+        assert_eq!(display_col(&rope, 1, 4), 1);
+        assert_eq!(display_col(&rope, 2, 4), 4);
+        assert_eq!(display_col(&rope, 3, 4), 5);
+        assert_eq!(display_col(&rope, 6, 4), 8);
+        assert_eq!(display_col(&rope, 4, 0), 0);
+    }
 
     #[test]
     fn empty_lines_count_as_words_only_on_request() {

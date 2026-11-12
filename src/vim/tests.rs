@@ -633,3 +633,26 @@ fn huge_put_counts_are_refused() {
     h.feed("3p");
     assert_eq!(h.buf.rope().len_lines(), 5);
 }
+
+#[test]
+fn counted_dot_replaces_the_operator_count() {
+    let mut h = Harness::new("a b c d e f g h i\n", 0);
+    h.feed("d3w");
+    assert_eq!(h.buf.text(), "d e f g h i\n");
+    h.feed("2.");
+    assert_eq!(h.buf.text(), "f g h i\n");
+    h.feed("2d1w.");
+    assert_eq!(h.buf.text(), "\n");
+}
+
+#[test]
+fn insert_tab_uses_the_display_column() {
+    let mut h = Harness::new("\tx\n", 1);
+    h.feed("i<Tab><Esc>");
+    // The caret sits at display column 4 (after the tab): a full tab stop is inserted.
+    assert_eq!(h.buf.text(), "\t    x\n");
+    let mut h = Harness::new("ab\tx\n", 3);
+    h.feed("a<Tab><Esc>");
+    // After "ab\tx" the display column is 5: three spaces reach column 8.
+    assert_eq!(h.buf.text(), "ab\tx   \n");
+}

@@ -287,11 +287,20 @@ pub(super) fn parse_visual(keys: &[VimKey]) -> Parse<Parsed<VisualCmd>> {
     Parse::Done(Parsed { count, cmd })
 }
 
-/// Replaces the leading count of a recorded change with `count`.
+/// Replaces the count of a recorded change with `count`, like vim: both the leading count and
+/// the count typed after an operator are dropped, so `2.` after `d3w` deletes 2 words.
 fn with_count(keys: &[VimKey], count: usize) -> Vec<VimKey> {
     let (_, used) = parse_count(keys);
+    let rest = &keys[used..];
     let mut out: Vec<VimKey> = count.to_string().chars().map(VimKey::Char).collect();
-    out.extend_from_slice(&keys[used..]);
+    match rest.split_first() {
+        Some((op, after)) if operator_of(op).is_some() => {
+            let (_, inner) = parse_count(after);
+            out.push(op.clone());
+            out.extend_from_slice(&after[inner..]);
+        }
+        _ => out.extend_from_slice(rest),
+    }
     out
 }
 

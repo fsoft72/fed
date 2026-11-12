@@ -292,7 +292,7 @@ fn indent(state: &mut EditorState, buf: &mut Buffer, settings: &EditSettings) {
     let tab_width = settings.tab_width.max(1);
     if state.selection.is_empty() {
         let rope = buf.rope();
-        let col = state.selection.head - text_nav::line_start(rope, state.selection.head);
+        let col = text_nav::display_col(rope, state.selection.head, tab_width);
         let unit = if settings.insert_spaces {
             " ".repeat(tab_width - col % tab_width)
         } else {
