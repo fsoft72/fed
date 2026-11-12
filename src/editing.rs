@@ -106,22 +106,9 @@ pub fn apply_command(
     let rope = buf.rope().clone();
     let len = rope.len_chars();
     match cmd {
-        EditCommand::Left { select } => {
-            let sel = state.selection;
-            if !select && !sel.is_empty() {
-                state.selection = Selection::caret(sel.range().start);
-            } else {
-                move_head(state, head.saturating_sub(1), select);
-            }
-        }
-        EditCommand::Right { select } => {
-            let sel = state.selection;
-            if !select && !sel.is_empty() {
-                state.selection = Selection::caret(sel.range().end);
-            } else {
-                move_head(state, (head + 1).min(len), select);
-            }
-        }
+        // Caret movement.
+        EditCommand::Left { select } => move_left(state, select),
+        EditCommand::Right { select } => move_right(state, len, select),
         EditCommand::Up { select } => move_vertical(state, buf, -1, select, saved_col),
         EditCommand::Down { select } => move_vertical(state, buf, 1, select, saved_col),
         EditCommand::PageUp { select, lines } => {
@@ -136,51 +123,20 @@ pub fn apply_command(
         EditCommand::WordRight { select } => {
             move_head(state, text_nav::next_word_start(&rope, head, false), select)
         }
-        EditCommand::Home { select } => {
-            let first = text_nav::first_non_blank(&rope, head);
-            let target = if head == first {
-                text_nav::line_start(&rope, head)
-            } else {
-                first
-            };
-            move_head(state, target, select);
-        }
+        EditCommand::Home { select } => move_head(state, home_target(&rope, head), select),
         EditCommand::End { select } => move_head(state, text_nav::line_end(&rope, head), select),
         EditCommand::DocStart { select } => move_head(state, 0, select),
         EditCommand::DocEnd { select } => move_head(state, len, select),
-        EditCommand::SelectAll => {
-            state.selection = Selection {
-                anchor: 0,
-                head: len,
-            }
-        }
-        EditCommand::SelectWordAt(pos) => {
-            let r = text_nav::word_range_at(&rope, pos.min(len));
-            state.selection = Selection {
-                anchor: r.start,
-                head: r.end,
-            };
-        }
-        EditCommand::SelectLineAt(pos) => {
-            let start = text_nav::line_start(&rope, pos);
-            let end = (text_nav::line_end(&rope, pos) + 1).min(len);
-            state.selection = Selection {
-                anchor: start,
-                head: end,
-            };
-        }
         EditCommand::SetCaret { pos, select } => move_head(state, pos.min(len), select),
-        EditCommand::InsertText(text) | EditCommand::Paste(text) => insert_text(state, buf, &text),
-        EditCommand::Newline => {
-            let range = state.selection.range();
-            let line_start = text_nav::line_start(&rope, range.start);
-            let indent: String = rope
-                .slice(line_start..range.start)
-                .chars()
-                .take_while(|c| matches!(c, ' ' | '\t'))
-                .collect();
-            insert_text(state, buf, &format!("\n{indent}"));
+        // Selection.
+        EditCommand::SelectAll => select_range(state, 0..len),
+        EditCommand::SelectWordAt(pos) => {
+            select_range(state, text_nav::word_range_at(&rope, pos.min(len)))
         }
+        EditCommand::SelectLineAt(pos) => select_range(state, line_range_at(&rope, pos)),
+        // Text changes.
+        EditCommand::InsertText(text) | EditCommand::Paste(text) => insert_text(state, buf, &text),
+        EditCommand::Newline => insert_newline(state, buf),
         EditCommand::Backspace => {
             let range = delete_range(state, head.saturating_sub(1)..head);
             delete(state, buf, range);
@@ -191,26 +147,90 @@ pub fn apply_command(
         }
         EditCommand::Indent => indent(state, buf, settings),
         EditCommand::Outdent => outdent(state, buf, settings),
-        EditCommand::Undo => {
-            if let Some(pos) = buf.undo() {
-                state.selection = Selection::caret(pos);
-            }
-        }
-        EditCommand::Redo => {
-            if let Some(pos) = buf.redo() {
-                state.selection = Selection::caret(pos);
-            }
-        }
+        // History.
+        EditCommand::Undo => caret_after_history(state, buf.undo()),
+        EditCommand::Redo => caret_after_history(state, buf.redo()),
+        // Clipboard.
         EditCommand::Copy => return Some(clipboard_range(state, &rope).1),
-        EditCommand::Cut => {
-            let (range, text) = clipboard_range(state, &rope);
-            let start = range.start;
-            buf.replace(range, "");
-            state.selection = Selection::caret(start);
-            return Some(text);
-        }
+        EditCommand::Cut => return Some(cut(state, buf)),
     }
     None
+}
+
+/// Left arrow: collapses a selection to its start, else moves the head one char left.
+fn move_left(state: &mut EditorState, select: bool) {
+    let sel = state.selection;
+    if !select && !sel.is_empty() {
+        state.selection = Selection::caret(sel.range().start);
+        return;
+    }
+    move_head(state, sel.head.saturating_sub(1), select);
+}
+
+/// Right arrow: collapses a selection to its end, else moves the head one char right (at
+/// most to `len`).
+fn move_right(state: &mut EditorState, len: usize, select: bool) {
+    let sel = state.selection;
+    if !select && !sel.is_empty() {
+        state.selection = Selection::caret(sel.range().end);
+        return;
+    }
+    move_head(state, (sel.head + 1).min(len), select);
+}
+
+/// Home target of a caret at `head`: the first non-blank of the line, or the line start when
+/// the caret is already there (smart home).
+fn home_target(rope: &ropey::Rope, head: usize) -> usize {
+    let first = text_nav::first_non_blank(rope, head);
+    match head == first {
+        true => text_nav::line_start(rope, head),
+        false => first,
+    }
+}
+
+/// The whole line at `pos` with its line break (when it has one).
+fn line_range_at(rope: &ropey::Rope, pos: usize) -> Range<usize> {
+    let start = text_nav::line_start(rope, pos);
+    let end = (text_nav::line_end(rope, pos) + 1).min(rope.len_chars());
+    start..end
+}
+
+/// Selects `range`, with the head at its end.
+fn select_range(state: &mut EditorState, range: Range<usize>) {
+    state.selection = Selection {
+        anchor: range.start,
+        head: range.end,
+    };
+}
+
+/// Enter: replaces the selection with a line break followed by the indentation (spaces and
+/// tabs) of the current line.
+fn insert_newline(state: &mut EditorState, buf: &mut Buffer) {
+    let range = state.selection.range();
+    let rope = buf.rope();
+    let line_start = text_nav::line_start(rope, range.start);
+    let indent: String = rope
+        .slice(line_start..range.start)
+        .chars()
+        .take_while(|c| matches!(c, ' ' | '\t'))
+        .collect();
+    insert_text(state, buf, &format!("\n{indent}"));
+}
+
+/// Puts the caret where an undo or redo left it (`None`: nothing to undo or redo).
+fn caret_after_history(state: &mut EditorState, pos: Option<usize>) {
+    if let Some(pos) = pos {
+        state.selection = Selection::caret(pos);
+    }
+}
+
+/// Cuts the selection (or the current line, see `clipboard_range`) and returns its text.
+fn cut(state: &mut EditorState, buf: &mut Buffer) -> String {
+    let (range, text) = clipboard_range(state, buf.rope());
+    let start = range.start;
+    buf.replace(range, "");
+    state.selection = Selection::caret(start);
+    text
 }
 
 /// Moves the head to `pos`, extending the selection when `select` is set.
@@ -265,11 +285,9 @@ fn delete(state: &mut EditorState, buf: &mut Buffer, range: Range<usize>) {
 
 /// Returns the range and text for Cut/Copy: the selection, or the whole current line.
 fn clipboard_range(state: &EditorState, rope: &ropey::Rope) -> (Range<usize>, String) {
-    let range = if state.selection.is_empty() {
-        let head = state.selection.head;
-        text_nav::line_start(rope, head)..(text_nav::line_end(rope, head) + 1).min(rope.len_chars())
-    } else {
-        state.selection.range()
+    let range = match state.selection.is_empty() {
+        true => line_range_at(rope, state.selection.head),
+        false => state.selection.range(),
     };
     let text = rope.slice(range.clone()).to_string();
     (range, text)
@@ -391,6 +409,23 @@ mod tests {
             preferred_col: None,
         };
         (st, Buffer::from_text(text))
+    }
+
+    #[test]
+    fn home_and_line_helpers() {
+        let rope = ropey::Rope::from_str("  ab\ncd");
+        assert_eq!(home_target(&rope, 4), 2, "to the first non-blank");
+        assert_eq!(home_target(&rope, 2), 0, "then to the line start");
+        assert_eq!(line_range_at(&rope, 3), 0..5, "with the line break");
+        assert_eq!(line_range_at(&rope, 6), 5..7, "the last line has none");
+    }
+
+    #[test]
+    fn cut_without_selection_takes_the_line() {
+        let (mut st, mut buf) = setup("one\ntwo\n", 5, 5);
+        assert_eq!(cut(&mut st, &mut buf), "two\n");
+        assert_eq!(buf.text(), "one\n");
+        assert_eq!(st.selection, Selection::caret(4));
     }
 
     #[test]

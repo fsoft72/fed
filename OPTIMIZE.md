@@ -56,7 +56,7 @@
 - [x] **Find bar match index is a linear scan every frame** - `count_label` runs `matches.iter().position(|m| *m == sel)` each frame the bar is open; the matches are sorted, so use `partition_point` like `next_match`.
   - File(s): `src/find_bar.rs` (`count_label`)
 
-- [ ] **Long command dispatch functions** - `editing::apply_command` (~125 lines) and `vim::motion::resolve` (~85 lines) are single large `match` blocks; group the arms by family (movement, deletion, selection) into helpers so each stays readable and testable on its own.
+- [x] **Long command dispatch functions** - `editing::apply_command` (~125 lines) and `vim::motion::resolve` (~85 lines) are single large `match` blocks; group the arms by family (movement, deletion, selection) into helpers so each stays readable and testable on its own.
   - File(s): `src/editing.rs`, `src/vim/motion.rs`
 
 - [ ] **Malformed doc comment on `dirty_lines_since`** - two sentences were merged into one 150-column line ("...Every caller tracks its own revision. When `since` is older..."), and `first_dirty_line_since` has a single caller (`spell::prose::shift_stale`) that could use `dirty_lines_since(..).map(|d| d.start)` directly.

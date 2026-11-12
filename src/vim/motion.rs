@@ -147,20 +147,9 @@ pub fn resolve(
     let pos = pos.min(rope.len_chars());
     let exclusive = |pos| Some(charwise(pos, false));
     match m {
-        Motion::Left => {
-            let start = text_nav::line_start(rope, pos);
-            if pos == start {
-                return None;
-            }
-            exclusive(pos.saturating_sub(count).max(start))
-        }
-        Motion::Right => {
-            let end = text_nav::line_end(rope, pos);
-            if pos >= end {
-                return None;
-            }
-            exclusive((pos + count).min(end))
-        }
+        // Within the line.
+        Motion::Left => left(rope, pos, count),
+        Motion::Right => right(rope, pos, count),
         Motion::Up | Motion::Down => vertical(rope, pos, count, *m == Motion::Down, state),
         Motion::WordStart { big } => {
             exclusive((0..count).fold(pos, |p, _| next_word_start(rope, p, *big)))
@@ -172,36 +161,17 @@ pub fn resolve(
             let end = (0..count).fold(pos, |p, _| text_nav::word_end(rope, p, *big));
             Some(charwise(end, true))
         }
-        Motion::NextLineFirstNonBlank => {
-            let line = rope.char_to_line(pos);
-            let target = (line + count).min(last_line(rope));
-            (target > line).then(|| line_target(rope, target))
-        }
+        Motion::NextLineFirstNonBlank => next_line_first_non_blank(rope, pos, count),
         Motion::LineStart => exclusive(text_nav::line_start(rope, pos)),
         Motion::FirstNonBlank => exclusive(text_nav::first_non_blank(rope, pos)),
-        Motion::LineEnd => {
-            let here = rope.char_to_line(pos);
-            let line = (here + count - 1).min(last_line(rope)).max(here);
-            exclusive(line_end_of(rope, line))
-        }
+        Motion::LineEnd => exclusive(counted_line_end(rope, pos, count)),
         Motion::DocStart => Some(line_target(rope, 0)),
         Motion::GotoLine(n) => Some(line_target(rope, n.saturating_sub(1))),
         Motion::DocEnd => Some(line_target(rope, last_line(rope))),
         Motion::FindChar { c, forward, till } => {
             find_char(rope, pos, *c, *forward, *till, count, false)
         }
-        Motion::RepeatFind { reverse } => {
-            let last = state.last_find?;
-            find_char(
-                rope,
-                pos,
-                last.c,
-                last.forward != *reverse,
-                last.till,
-                count,
-                true,
-            )
-        }
+        Motion::RepeatFind { reverse } => repeat_find(rope, pos, state.last_find?, *reverse, count),
         Motion::MatchBracket => match_bracket(rope, pos),
         Motion::ParagraphNext => exclusive(paragraph_next(rope, pos, count)),
         Motion::ParagraphPrev => exclusive(paragraph_prev(rope, pos, count)),
@@ -211,15 +181,64 @@ pub fn resolve(
         }
         Motion::MarkExact(c) => exclusive(buf.mark(*c)?.min(rope.len_chars())),
         Motion::SearchNext { reverse } => {
-            let last = state.last_search.as_ref()?;
-            let forward = last.forward != *reverse;
-            let mut p = pos;
-            for _ in 0..count {
-                p = find_next(rope, &last.regex, p, forward)?.start;
-            }
-            exclusive(p)
+            search_next(rope, pos, state.last_search.as_ref()?, *reverse, count)
         }
     }
+}
+
+/// `h`: `count` chars left, stopping at the line start; fails at the line start.
+fn left(rope: &Rope, pos: usize, count: usize) -> Option<MotionResult> {
+    let start = text_nav::line_start(rope, pos);
+    (pos != start).then(|| charwise(pos.saturating_sub(count).max(start), false))
+}
+
+/// `l`: `count` chars right, stopping at the line end; fails at the line end.
+fn right(rope: &Rope, pos: usize, count: usize) -> Option<MotionResult> {
+    let end = text_nav::line_end(rope, pos);
+    (pos < end).then(|| charwise((pos + count).min(end), false))
+}
+
+/// `+` / Enter: first non-blank `count` lines down (linewise); fails on the last line.
+fn next_line_first_non_blank(rope: &Rope, pos: usize, count: usize) -> Option<MotionResult> {
+    let line = rope.char_to_line(pos);
+    let target = (line + count).min(last_line(rope));
+    (target > line).then(|| line_target(rope, target))
+}
+
+/// `$`: the end of the line `count - 1` lines down (clamped to the last line).
+fn counted_line_end(rope: &Rope, pos: usize, count: usize) -> usize {
+    let here = rope.char_to_line(pos);
+    let line = (here + count - 1).min(last_line(rope)).max(here);
+    line_end_of(rope, line)
+}
+
+/// `;` / `,`: repeats the char find `last`, in the opposite direction when `reverse`.
+fn repeat_find(
+    rope: &Rope,
+    pos: usize,
+    last: LastFind,
+    reverse: bool,
+    count: usize,
+) -> Option<MotionResult> {
+    let forward = last.forward != reverse;
+    find_char(rope, pos, last.c, forward, last.till, count, true)
+}
+
+/// `n` / `N`: the `count`-th match of the last search, in the opposite direction when
+/// `reverse`; fails when the pattern does not match.
+fn search_next(
+    rope: &Rope,
+    pos: usize,
+    last: &LastSearch,
+    reverse: bool,
+    count: usize,
+) -> Option<MotionResult> {
+    let forward = last.forward != reverse;
+    let mut p = pos;
+    for _ in 0..count {
+        p = find_next(rope, &last.regex, p, forward)?.start;
+    }
+    Some(charwise(p, false))
 }
 
 /// Builds a charwise result.
@@ -372,6 +391,22 @@ mod tests {
     fn go(text: &str, pos: usize, m: Motion) -> Option<usize> {
         let buf = Buffer::from_text(text);
         resolve(&m, 1, &buf, pos, &MotionContext::default()).map(|r| r.pos)
+    }
+
+    #[test]
+    fn counted_motions_stop_at_their_limits() {
+        let rope = Rope::from_str("abc\nde\nf");
+        assert_eq!(left(&rope, 0, 1), None, "h fails at the line start");
+        assert_eq!(left(&rope, 2, 5).map(|r| r.pos), Some(0));
+        assert_eq!(right(&rope, 3, 1), None, "l fails at the line end");
+        assert_eq!(right(&rope, 0, 9).map(|r| r.pos), Some(3));
+        assert_eq!(counted_line_end(&rope, 0, 2), 6);
+        assert_eq!(
+            counted_line_end(&rope, 0, 99),
+            8,
+            "clamped to the last line"
+        );
+        assert_eq!(next_line_first_non_blank(&rope, 8, 1), None);
     }
 
     #[test]
