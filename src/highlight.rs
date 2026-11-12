@@ -14,7 +14,7 @@ use syntect::highlighting::{
 };
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, DirtyLines};
 use crate::view::Decorator;
 
 /// Name of the fallback syntax.
@@ -205,7 +205,7 @@ fn find_syntax<'a>(assets: &'a HighlightAssets, name_or_ext: &str) -> &'a Syntax
 }
 
 /// Parser and highlighter state at the start of a line.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct LineState {
     /// Syntax parser state.
     parse: ParseState,
@@ -213,25 +213,45 @@ struct LineState {
     highlight: HighlightState,
 }
 
+/// Results of the lines after an edit, kept until parsing reaches them again: when the parser
+/// state at one of their checkpoints equals the old one, the rest is reused as is.
+struct Tail {
+    /// Line (current numbering) of the first entry of `spans`.
+    first_line: usize,
+    /// Spans of the lines from `first_line` on.
+    spans: Vec<Vec<StyledSpan>>,
+    /// Checkpoints within `spans` (current numbering), sorted by line.
+    checkpoints: Vec<(usize, LineState)>,
+    /// State at the start of the line after the last entry of `spans`.
+    end_state: LineState,
+}
+
 /// Per-line highlight cache: spans of every parsed line, plus parser states at checkpoints
-/// (every `CHECKPOINT_LINES` lines) and at the parse frontier, so parsing can resume after an
-/// edit without keeping a state per line.
+/// (about every `CHECKPOINT_LINES` lines) and at the parse frontier, so parsing can resume
+/// after an edit without keeping a state per line. After an edit the old results of the lines
+/// below it are kept aside and reused as soon as the parser state converges.
 #[derive(Default)]
 pub struct HighlightCache {
     /// `(syntax, theme)` the cache was built for.
     key: Option<(String, String)>,
-    /// State at the start of line `k * CHECKPOINT_LINES` for every checkpoint `k` reached.
-    checkpoints: Vec<LineState>,
-    /// State at the start of line `spans.len()`; `None` when that line is a checkpoint.
+    /// States at the start of some parsed lines, sorted by line, at most `CHECKPOINT_LINES`
+    /// apart; the first one is line 0.
+    checkpoints: Vec<(usize, LineState)>,
+    /// State at the start of line `spans.len()`; `None` when that line is the last checkpoint.
     next_state: Option<LineState>,
     /// Spans of every line parsed so far.
     spans: Vec<Vec<StyledSpan>>,
+    /// Old results of the lines after the last edit, waiting to be reused.
+    tail: Option<Tail>,
     /// Buffer revision the spans were last checked against (see `sync`).
     revision: Option<u64>,
     /// Parsing stops (until the next frame) once this instant is passed; `None`: no limit.
     deadline: Option<Instant>,
     /// True when a request was left unanswered because the deadline passed.
     starved: bool,
+    /// Number of lines parsed (tests check the reuse with it).
+    #[cfg(test)]
+    parsed: usize,
 }
 
 impl HighlightCache {
@@ -255,24 +275,77 @@ impl HighlightCache {
     /// Forgets everything computed for `line` and the lines after it. Parsing resumes from
     /// the checkpoint at or before `line`.
     pub fn invalidate_from(&mut self, line: usize) {
+        self.tail = None;
         if line >= self.spans.len() {
             return;
         }
-        let keep = line / CHECKPOINT_LINES;
-        self.checkpoints.truncate(keep + 1);
-        self.spans.truncate(keep * CHECKPOINT_LINES);
+        let keep = self.checkpoints.partition_point(|(l, _)| *l <= line).max(1);
+        self.checkpoints.truncate(keep);
+        self.spans
+            .truncate(self.checkpoints.last().map_or(0, |(l, _)| *l));
         self.next_state = None;
     }
 
-    /// Brings the cache up to `buffer`: forgets the lines from the first one edited since the
-    /// last call (everything when the edits are no longer known).
+    /// Forgets the lines changed by `dirty` (see `Buffer::dirty_lines_since`) and the lines
+    /// after them, keeping the results of the unchanged lines below the edit as a `Tail` that
+    /// parsing reuses once it converges. A previous unused tail is dropped.
+    pub fn invalidate(&mut self, dirty: DirtyLines) {
+        let tail = self.take_tail(dirty);
+        self.invalidate_from(dirty.start);
+        self.tail = tail;
+    }
+
+    /// Splits off the results of the lines after `dirty` (renumbered for the current text),
+    /// or `None` when there is nothing to reuse.
+    fn take_tail(&mut self, dirty: DirtyLines) -> Option<Tail> {
+        if dirty.old_end == usize::MAX || dirty.start >= self.spans.len() {
+            return None;
+        }
+        if dirty.old_end > self.spans.len() {
+            return None;
+        }
+        let end_state = self.frontier_state()?;
+        let renumber = |l: usize| l - dirty.old_end + dirty.end;
+        let first = self
+            .checkpoints
+            .partition_point(|(l, _)| *l < dirty.old_end);
+        let checkpoints: Vec<(usize, LineState)> = self
+            .checkpoints
+            .drain(first..)
+            .map(|(l, state)| (renumber(l), state))
+            .collect();
+        if checkpoints.is_empty() {
+            return None;
+        }
+        Some(Tail {
+            first_line: dirty.end,
+            spans: self.spans.split_off(dirty.old_end),
+            checkpoints,
+            end_state,
+        })
+    }
+
+    /// State at the start of line `spans.len()`, if known.
+    fn frontier_state(&self) -> Option<LineState> {
+        if let Some(state) = &self.next_state {
+            return Some(state.clone());
+        }
+        self.checkpoints
+            .last()
+            .filter(|(l, _)| *l == self.spans.len())
+            .map(|(_, state)| state.clone())
+    }
+
+    /// Brings the cache up to `buffer`: forgets the lines edited since the last call
+    /// (everything when the edits are no longer known), keeping the lines below for reuse.
     pub fn sync(&mut self, buffer: &Buffer) {
-        let dirty = match self.revision {
-            Some(rev) => buffer.first_dirty_line_since(rev),
-            None => Some(0),
-        };
-        if let Some(line) = dirty {
-            self.invalidate_from(line);
+        match self.revision {
+            Some(rev) => {
+                if let Some(dirty) = buffer.dirty_lines_since(rev) {
+                    self.invalidate(dirty);
+                }
+            }
+            None => self.invalidate_from(0),
         }
         self.revision = Some(buffer.revision());
     }
@@ -283,6 +356,7 @@ impl HighlightCache {
         self.checkpoints.clear();
         self.next_state = None;
         self.spans.clear();
+        self.tail = None;
     }
 
     /// True when the cache was built for `syntax` and `theme`.
@@ -292,9 +366,31 @@ impl HighlightCache {
             .is_some_and(|(s, t)| s == syntax && t == theme)
     }
 
+    /// Reuses the tail when line `line` (the parse frontier, whose start state is `state`) is
+    /// one of its checkpoints with the same state: appends its spans and checkpoints and
+    /// returns the state after them. Drops the tail once parsing has passed all of them.
+    fn splice_tail(&mut self, line: usize, state: &LineState) -> Option<LineState> {
+        let tail = self.tail.as_ref()?;
+        if tail.checkpoints.last().is_none_or(|(l, _)| *l < line) {
+            self.tail = None;
+            return None;
+        }
+        let idx = tail.checkpoints.iter().position(|(l, _)| *l == line)?;
+        if tail.checkpoints[idx].1 != *state {
+            return None;
+        }
+        let mut tail = self.tail.take()?;
+        self.spans
+            .extend(tail.spans.drain(line - tail.first_line..));
+        let known = self.checkpoints.last().is_some_and(|(l, _)| *l == line);
+        let from = if known { idx + 1 } else { idx };
+        self.checkpoints.extend(tail.checkpoints.drain(from..));
+        Some(tail.end_state)
+    }
+
     /// Returns the styled spans of `line`, parsing forward from the parse frontier. Spans
     /// cover the line text without its newline. A line already in the cache is returned as
-    /// is: callers must `invalidate_from` the first edited line. Returns `None` when the
+    /// is: callers must `sync` (or `invalidate_from`) after edits. Returns `None` when the
     /// frame deadline passed before `line` was reached (the progress made is kept).
     pub fn line_spans(
         &mut self,
@@ -325,29 +421,56 @@ impl HighlightCache {
         let highlighter = Highlighter::new(theme);
         if self.checkpoints.is_empty() {
             let syntax = find_syntax(assets, syntax_name_or_ext);
-            self.checkpoints.push(LineState {
-                parse: ParseState::new(syntax),
-                highlight: HighlightState::new(&highlighter, ScopeStack::new()),
-            });
+            self.spans.clear();
+            self.checkpoints.push((
+                0,
+                LineState {
+                    parse: ParseState::new(syntax),
+                    highlight: HighlightState::new(&highlighter, ScopeStack::new()),
+                },
+            ));
         }
-        let mut state = match self.next_state.take() {
+        let mut state = match self.frontier_state() {
             Some(state) => state,
-            None => self.checkpoints[self.spans.len() / CHECKPOINT_LINES].clone(),
+            None => {
+                // The frontier state is always kept; should it be missing, resume from the
+                // last checkpoint instead of failing.
+                let (at, state) = self.checkpoints.last().cloned().expect("line 0 checkpoint");
+                self.spans.truncate(at);
+                state
+            }
         };
+        self.next_state = None;
         while self.spans.len() <= line {
             if self.deadline.is_some_and(|d| Instant::now() >= d) {
                 self.starved = true;
                 self.next_state = Some(state);
                 return None;
             }
-            let text = rope.line(self.spans.len()).to_string();
+            let current = self.spans.len();
+            if let Some(after) = self.splice_tail(current, &state) {
+                state = after;
+                continue;
+            }
+            let text = rope.line(current).to_string();
             let spans = parse_line(assets, &highlighter, &mut state, &text);
+            #[cfg(test)]
+            {
+                self.parsed += 1;
+            }
             self.spans.push(spans);
-            if self.spans.len().is_multiple_of(CHECKPOINT_LINES) {
-                self.checkpoints.push(state.clone());
+            let last = self.checkpoints.last().map_or(0, |(l, _)| *l);
+            if self.spans.len() - last >= CHECKPOINT_LINES {
+                self.checkpoints.push((self.spans.len(), state.clone()));
             }
         }
-        self.next_state = Some(state);
+        if self
+            .checkpoints
+            .last()
+            .is_none_or(|(l, _)| *l != self.spans.len())
+        {
+            self.next_state = Some(state);
+        }
         Some(&self.spans[line])
     }
 }
@@ -562,6 +685,74 @@ mod tests {
         assert!(cache.spans.is_empty());
         let spans = cache.line_spans(&a, "Rust", theme, buf.rope(), 1).unwrap();
         assert!(ranges_of(spans, SpanKind::Comment).is_empty());
+    }
+
+    /// Rust source of `lines` lines with a block comment in the middle.
+    fn rust_source(lines: usize) -> String {
+        (0..lines)
+            .map(|i| match i {
+                50 => "/* a block\n".to_string(),
+                52 => "   comment */\n".to_string(),
+                _ => format!("let v{i} = \"s{i}\"; // n{i}\n"),
+            })
+            .collect()
+    }
+
+    /// Parses every line of `buf` with `cache` and returns the spans of each line.
+    fn all_spans(cache: &mut HighlightCache, a: &HighlightAssets, buf: &Buffer) -> Vec<String> {
+        cache.sync(buf);
+        let rope = buf.rope();
+        (0..rope.len_lines())
+            .map(|i| {
+                let spans = cache
+                    .line_spans(a, "Rust", "base16-ocean.dark", rope, i)
+                    .unwrap();
+                format!("{spans:?}")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn edits_reuse_the_lines_below_once_the_parser_converges() {
+        let a = assets();
+        let mut buf = Buffer::from_text(&rust_source(400));
+        let mut cache = HighlightCache::new();
+        all_spans(&mut cache, &a, &buf);
+        let edits: [(usize, &str); 5] = [
+            (buf.rope().line_to_char(10) + 4, "xy"),
+            (
+                buf.rope().line_to_char(100),
+                "let added = 1;\nlet more = 2;\n",
+            ),
+            (buf.rope().line_to_char(48), "/* "),
+            (buf.rope().line_to_char(48), " */"),
+            (buf.rope().line_to_char(300), "\n"),
+        ];
+        for (at, text) in edits {
+            buf.replace(at..at, text);
+            cache.parsed = 0;
+            let got = all_spans(&mut cache, &a, &buf);
+            let fresh = all_spans(&mut HighlightCache::new(), &a, &buf);
+            assert_eq!(got, fresh, "after inserting {text:?}");
+            if !text.contains("/*") && !text.contains("*/") {
+                assert!(
+                    cache.parsed <= 2 * CHECKPOINT_LINES,
+                    "reparsed {}",
+                    cache.parsed
+                );
+            }
+        }
+        // Deleting lines (across a checkpoint) also reuses the rest.
+        let (from, to) = (buf.rope().line_to_char(60), buf.rope().line_to_char(140));
+        buf.replace(from..to, "");
+        cache.parsed = 0;
+        let got = all_spans(&mut cache, &a, &buf);
+        assert_eq!(got, all_spans(&mut HighlightCache::new(), &a, &buf));
+        assert!(
+            cache.parsed <= 2 * CHECKPOINT_LINES,
+            "reparsed {}",
+            cache.parsed
+        );
     }
 
     #[test]

@@ -32,7 +32,7 @@
 - [x] **Per-frame allocations in the render path** - each visible line is copied to a `String` by `line_text` up to three times per frame (`layout_line`, `paint`, `caret_rect`), then `build_layout_job` collects a `Vec<char>`, allocates a `String` per span and another one in `expand_tabs`; borrow the line like `search::line_text` (`Cow`), compute it once per line in `Frame::run` and append byte slices to the `LayoutJob`.
   - File(s): `src/view.rs`
 
-- [ ] **Syntax highlighting reparses everything after an edit** - `HighlightCache::invalidate_from` drops all spans after the edited line, so editing near the top of a long file reparses up to the viewport on every keystroke (spread over frames, with lines drawn plain meanwhile); stop reparsing when the parser state at the next checkpoint equals the old one and reuse the remaining spans shifted by the line delta from `dirty_lines_since`.
+- [x] **Syntax highlighting reparses everything after an edit** - `HighlightCache::invalidate_from` drops all spans after the edited line, so editing near the top of a long file reparses up to the viewport on every keystroke (spread over frames, with lines drawn plain meanwhile); stop reparsing when the parser state at the next checkpoint equals the old one and reuse the remaining spans shifted by the line delta from `dirty_lines_since`.
   - File(s): `src/highlight.rs`
 
 - [ ] **Duplicated line and column helpers** - `line_text` exists in `view.rs` (owned `String`) and `search.rs` (borrowed `Cow`) and is inlined again in `find_bar.rs` (`expand_match`); `display_col` exists in both `view.rs` and `text_nav.rs` with different semantics; `vim::motion::is_empty_line` overlaps `text_nav::is_empty_line_at`. Keep one version of each in `text_nav`.
