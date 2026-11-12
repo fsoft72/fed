@@ -882,14 +882,14 @@ impl Frame<'_> {
             viewport,
             wrap_width,
         };
-        self.handle_mouse(ui, &response, &pl, out);
-
-        // Visible lines (after the mouse so the frame shows the new selection).
+        // Visible lines, laid out once: the mouse hit-tests against them (the selection is
+        // painted separately, so a new selection does not change them).
         let first = pl.rows.line_at(viewport.min.y);
         let last = pl.rows.line_at(viewport.max.y);
         let galleys: Vec<(usize, Arc<Galley>)> = (first..=last)
             .map(|i| (i, self.layout_line(ui, i, wrap_width)))
             .collect();
+        self.handle_mouse(ui, &response, &pl, &galleys, out);
         if wrap_width.is_none() {
             // Wide glyphs can make a visible line wider than its column estimate.
             let widest = galleys.iter().map(|(_, g)| g.size().x).fold(0.0, f32::max);
@@ -978,11 +978,18 @@ impl Frame<'_> {
         }
     }
 
-    /// Maps a screen position to a char index in the buffer.
-    fn hit_test(&mut self, ui: &Ui, pos: Pos2, pl: &Placement) -> usize {
+    /// Maps a screen position to a char index in the buffer, reusing the visible `galleys`
+    /// (only a line outside them, during a drag past the viewport, is laid out again).
+    fn hit_test(
+        &mut self,
+        ui: &Ui,
+        pos: Pos2,
+        pl: &Placement,
+        galleys: &[(usize, Arc<Galley>)],
+    ) -> usize {
         let local = pos - pl.origin;
         let line = pl.rows.line_at(local.y);
-        let galley = self.layout_line(ui, line, pl.wrap_width);
+        let galley = self.galley_for(ui, galleys, line, pl.wrap_width);
         // Text hidden under the gutter is not clickable.
         let x = local.x.max(pl.viewport.min.x + self.m.gutter_width) - self.m.text_x();
         let cursor = galley.cursor_from_pos(vec2(x, local.y - pl.rows.top(line)));
@@ -997,6 +1004,7 @@ impl Frame<'_> {
         ui: &Ui,
         response: &egui::Response,
         pl: &Placement,
+        galleys: &[(usize, Arc<Galley>)],
         out: &mut ViewOutput,
     ) {
         if response.hovered() {
@@ -1018,14 +1026,14 @@ impl Frame<'_> {
         if response.hovered() && pressed {
             response.request_focus();
             // The pointer may already have moved within this frame: anchor at the press.
-            let pos = self.hit_test(ui, press_origin.unwrap_or(pointer), pl);
+            let pos = self.hit_test(ui, press_origin.unwrap_or(pointer), pl, galleys);
             self.tab.view.press_pos = Some(pos);
             self.tab.view.dragged = false;
             self.tab
                 .apply(EditCommand::SetCaret { pos, select: shift }, &edit);
         }
         if down && response.is_pointer_button_down_on() {
-            let pos = self.hit_test(ui, pointer, pl);
+            let pos = self.hit_test(ui, pointer, pl, galleys);
             let view = &mut self.tab.view;
             view.dragged |= view.press_pos != Some(pos);
             let head = self.tab.editor.selection.head;
@@ -1035,10 +1043,10 @@ impl Frame<'_> {
             }
         }
         if response.triple_clicked() {
-            let pos = self.hit_test(ui, pointer, pl);
+            let pos = self.hit_test(ui, pointer, pl, galleys);
             self.tab.apply(EditCommand::SelectLineAt(pos), &edit);
         } else if response.double_clicked() {
-            let pos = self.hit_test(ui, pointer, pl);
+            let pos = self.hit_test(ui, pointer, pl, galleys);
             self.tab.apply(EditCommand::SelectWordAt(pos), &edit);
         }
         let clicked = response.hovered() && pressed;
@@ -1046,7 +1054,7 @@ impl Frame<'_> {
             out.mouse_selected = true;
         }
         if response.secondary_clicked() {
-            let pos = self.hit_test(ui, pointer, pl);
+            let pos = self.hit_test(ui, pointer, pl, galleys);
             out.context_word = self.word_at(pos);
         }
     }
@@ -1557,6 +1565,52 @@ mod tests {
         insert_spaces: true,
     };
 
+    /// Decorator that records the lines it decorates.
+    #[derive(Default)]
+    struct Recording {
+        lines: Vec<usize>,
+    }
+
+    impl Decorator for Recording {
+        fn decorate(
+            &mut self,
+            line: usize,
+            _: &str,
+            _: &TextFormat,
+        ) -> Vec<(Range<usize>, TextFormat)> {
+            self.lines.push(line);
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_click_decorates_every_visible_line_once() {
+        let ctx = egui::Context::default();
+        let text: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let mut tab = Tab::new(Buffer::from_text(&text));
+        let mut deco = Recording::default();
+        editor_frame_with(&ctx, &mut tab, Vec::new(), &mut deco);
+        let at = pos2(120.0, 40.0);
+        let press = egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        };
+        deco.lines.clear();
+        editor_frame_with(
+            &ctx,
+            &mut tab,
+            vec![egui::Event::PointerMoved(at), press],
+            &mut deco,
+        );
+        let mut unique = deco.lines.clone();
+        unique.dedup();
+        assert!(!deco.lines.is_empty());
+        assert_eq!(deco.lines, unique, "a line was decorated twice");
+        assert_ne!(tab.editor.selection.head, 0, "the click moved the caret");
+    }
+
     /// Runs one frame of the editor for `tab` in a 400x300 window, feeding `events`.
     fn editor_frame(ctx: &egui::Context, tab: &mut Tab, vim: bool, events: Vec<egui::Event>) {
         let input = egui::RawInput {
@@ -1582,6 +1636,32 @@ mod tests {
             };
             let handler: Option<&mut KeyHandler<'_>> = vim.then_some(&mut route as _);
             show_editor(ui, tab, &opts, &mut Plain, handler);
+        });
+        output.textures_delta.clear();
+    }
+
+    /// Runs one non-vim frame of the editor for `tab` in a 400x300 window with `deco`.
+    fn editor_frame_with(
+        ctx: &egui::Context,
+        tab: &mut Tab,
+        events: Vec<egui::Event>,
+        deco: &mut dyn Decorator,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))),
+            events,
+            ..Default::default()
+        };
+        let opts = ViewOptions {
+            font: FontId::monospace(14.0),
+            line_numbers: true,
+            word_wrap: false,
+            edit: EDIT,
+            keys_enabled: true,
+            vim: false,
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            show_editor(ui, tab, &opts, deco, None);
         });
         output.textures_delta.clear();
     }
