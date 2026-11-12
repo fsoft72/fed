@@ -46,7 +46,8 @@ impl<T: Send + 'static> BackgroundJob<T> {
 
 impl<T> BackgroundJob<T> {
     /// Returns the result once the job is done (`None` while it runs). The value is handed
-    /// out once; polling again afterwards gives `JobError::Lost`.
+    /// out once: polling again afterwards gives `None` until the thread has exited, then
+    /// `JobError::Lost`, so drop the job after taking its result.
     pub fn poll(&self) -> Option<Result<T, JobError>> {
         match self.rx.try_recv() {
             Ok(result) => Some(result),
@@ -88,7 +89,7 @@ mod tests {
     fn a_job_hands_out_its_value_once() {
         let job = BackgroundJob::spawn(None, || 6 * 7);
         assert_eq!(wait(&job), Ok(42));
-        assert_eq!(job.poll(), Some(Err(JobError::Lost)));
+        assert_eq!(wait(&job), Err(JobError::Lost), "the value is not handed out again");
     }
 
     #[test]
