@@ -133,8 +133,8 @@ impl ProseRanges {
 fn shift_stale(parsed: &Parsed, buffer: &Buffer) -> Vec<Range<usize>> {
     let rope = buffer.rope();
     let line = buffer
-        .first_dirty_line_since(parsed.revision)
-        .unwrap_or(0)
+        .dirty_lines_since(parsed.revision)
+        .map_or(0, |d| d.start)
         .min(rope.len_lines().saturating_sub(1));
     let pivot = rope.line_to_char(line);
     let delta = rope.len_chars() as isize - parsed.len_chars as isize;

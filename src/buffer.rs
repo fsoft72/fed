@@ -490,15 +490,11 @@ impl Buffer {
         self.marks.iter().find(|(n, _)| *n == name).map(|(_, p)| *p)
     }
 
-    /// Returns the lowest line edited after revision `since`, or `None` when the buffer is
-    /// still at `since`. See `dirty_lines_since`.
-    pub fn first_dirty_line_since(&self, since: u64) -> Option<usize> {
-        self.dirty_lines_since(since).map(|d| d.start)
-    }
-
     /// Returns the lines changed after revision `since`, merged into one range, or `None`
-    /// when the buffer is still at `since`. Every caller tracks its own revision. When `since` is older than the remembered edits (or newer than the
-    /// buffer, i.e. a different buffer) the whole buffer counts as replaced.
+    /// when the buffer is still at `since`. Every caller tracks its own revision.
+    ///
+    /// When `since` is older than the remembered edits (or newer than the buffer, i.e. a
+    /// different buffer) the whole buffer counts as replaced.
     pub fn dirty_lines_since(&self, since: u64) -> Option<DirtyLines> {
         if since == self.revision {
             return None;
@@ -1253,28 +1249,35 @@ mod tests {
     }
 
     #[test]
-    fn first_dirty_line_since_is_per_caller() {
+    fn dirty_lines_are_per_caller() {
         let mut buf = Buffer::from_text("one\ntwo\nthree");
+        let first = |buf: &Buffer, since| buf.dirty_lines_since(since).map(|d| d.start);
         let start = buf.revision();
-        assert_eq!(buf.first_dirty_line_since(start), None);
+        assert_eq!(first(&buf, start), None);
         buf.replace(8..8, "x");
         let mid = buf.revision();
         buf.replace(4..4, "y");
-        assert_eq!(buf.first_dirty_line_since(start), Some(1));
-        assert_eq!(buf.first_dirty_line_since(mid), Some(1));
-        assert_eq!(buf.first_dirty_line_since(buf.revision()), None);
+        assert_eq!(first(&buf, start), Some(1));
+        assert_eq!(first(&buf, mid), Some(1));
+        assert_eq!(first(&buf, buf.revision()), None);
         // A revision newer than the buffer means another buffer: everything is dirty.
-        assert_eq!(buf.first_dirty_line_since(buf.revision() + 5), Some(0));
+        assert_eq!(first(&buf, buf.revision() + 5), Some(0));
     }
 
     #[test]
-    fn first_dirty_line_since_falls_back_to_zero_past_the_log() {
+    fn dirty_lines_fall_back_to_everything_past_the_log() {
         let mut buf = Buffer::from_text("a\nb\nc");
         for _ in 0..EDIT_LOG_LEN + 1 {
             buf.replace(4..4, "x");
         }
-        assert_eq!(buf.first_dirty_line_since(0), Some(0));
-        assert_eq!(buf.first_dirty_line_since(buf.revision() - 1), Some(2));
+        assert_eq!(
+            buf.dirty_lines_since(0).map(|d| d.old_end),
+            Some(usize::MAX)
+        );
+        assert_eq!(
+            buf.dirty_lines_since(buf.revision() - 1).map(|d| d.start),
+            Some(2)
+        );
     }
 
     /// Checks `dirty_lines_since` against a line-by-line diff of the two texts.
