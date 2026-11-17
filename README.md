@@ -21,6 +21,16 @@ default font are built in, and there is no Qt or GTK dependency (the native file
 XDG desktop portal on Linux). On Linux it needs the usual X11 or Wayland, libxkbcommon and
 OpenGL libraries. On Windows the binary uses the GUI subsystem, so no console window opens.
 
+### Releases
+
+Pushing a tag such as `v0.1.0` (it must match the `version` in `Cargo.toml`) runs
+`.github/workflows/release.yml`. It builds native Linux (x86_64) and Windows (x86_64) binaries and
+attaches `.tar.gz` / `.zip` archives, with their SHA-256 checksums, to the GitHub release.
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
 ## Usage
 
 ```sh
