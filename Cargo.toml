@@ -13,7 +13,7 @@ name = "fed"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "accesskit"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "accesskit", "clipboard"] }
 egui_extras = { version = "0.37", features = ["file", "image"] }
 egui_commonmark = { version = "0.26", features = ["load-images"] }
 # Patched in vendor/ (line spacing of the preview text, see vendor/README.md).

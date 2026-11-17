@@ -116,3 +116,4 @@
 
 - Copy / paste / select all in vim mode: `Ctrl+C` copies the Visual selection (`y`), `Ctrl+X` cuts it (`d`), `Ctrl+V` pastes the clipboard after the caret in Normal mode (text ending with a line break is put as whole lines; Insert mode already typed it) and `Ctrl+A` enters Visual mode with the whole buffer selected (leaving Insert mode first). New `VimState::paste_text` / `select_all` and `clipboard_shortcut` in `src/app/vim.rs`. Normal mode no longer ignores a paste.
 - Copy toast: `Ctrl+C` (normal and vim mode) shows a small "Copied to clipboard" toast above the status bar that fades out after about 1.8 s (`src/app/toast.rs`, `ViewOutput::copied`, `VimEffect::Copied`).
+- Fix: the system clipboard was never used. `eframe` is built with `default-features = false`, which dropped its `clipboard` feature, so copied text stayed inside the app (and Ctrl+V could not read what other programs copied). The feature is now enabled in `Cargo.toml`.
