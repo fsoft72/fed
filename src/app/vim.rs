@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
+use super::toast::COPIED_TOAST;
 use super::{FedApp, SaveOutcome, Severity, close_requires_confirmation, tab_path};
 use crate::buffer::Buffer;
 use crate::editing::EditSettings;
@@ -91,6 +92,48 @@ pub(super) struct VimMessage {
     error: bool,
 }
 
+/// Handles the CUA clipboard shortcuts in vim mode, or returns `None` for any other event:
+/// Ctrl+C copies the Visual selection (`y`), Ctrl+X cuts it (`d`), Ctrl+V pastes after the
+/// caret in Normal mode (Insert mode types the text, see `route_event`) and Ctrl+A selects
+/// the whole buffer. Copy and cut without a selection do nothing.
+fn clipboard_shortcut(
+    ev: &egui::Event,
+    tab: &mut Tab,
+    edit: &EditSettings,
+) -> Option<Vec<VimEffect>> {
+    let mode = tab.vim.mode();
+    let visual = matches!(mode, Mode::Visual | Mode::VisualLine);
+    let feed = |tab: &mut Tab, key: VimKey| {
+        tab.vim
+            .handle_key(key, &mut tab.buffer, &mut tab.editor, edit)
+    };
+    match ev {
+        egui::Event::Copy if !visual => Some(Vec::new()),
+        egui::Event::Copy => {
+            let mut fx = feed(tab, VimKey::Char('y'));
+            fx.push(VimEffect::Copied);
+            Some(fx)
+        }
+        egui::Event::Cut if !visual => Some(Vec::new()),
+        egui::Event::Cut => Some(feed(tab, VimKey::Char('d'))),
+        egui::Event::Paste(text) if mode == Mode::Normal => {
+            Some(
+                tab.vim
+                    .paste_text(text.clone(), &mut tab.buffer, &mut tab.editor, edit),
+            )
+        }
+        egui::Event::Key {
+            key: egui::Key::A,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.command && !modifiers.shift && !modifiers.alt => {
+            Some(tab.vim.select_all(&mut tab.buffer, &mut tab.editor, edit))
+        }
+        _ => None,
+    }
+}
+
 /// Hands one editor keyboard event of `tab` to its vim state and collects the effects in
 /// `effects`. Once an effect that may close or switch tabs was produced (`frame_ended`), the
 /// rest of the frame's keys are swallowed. Always consumes the event.
@@ -102,6 +145,11 @@ pub(super) fn route_event(
     frame_ended: &mut bool,
 ) -> bool {
     if *frame_ended {
+        return true;
+    }
+    if let Some(fx) = clipboard_shortcut(ev, tab, edit) {
+        *frame_ended = fx.iter().any(ends_vim_frame);
+        effects.extend(fx);
         return true;
     }
     let keys: Vec<VimKey> = match ev {
@@ -147,6 +195,7 @@ impl FedApp {
             let last = ends_vim_frame(&effect);
             match effect {
                 VimEffect::SetClipboard(text) => ctx.copy_text(text),
+                VimEffect::Copied => self.toast.show(COPIED_TOAST),
                 VimEffect::Message(text) => self.set_vim_message(text, false),
                 VimEffect::Error(text) => self.set_vim_message(text, true),
                 VimEffect::Write(None) => {
@@ -296,8 +345,6 @@ mod tests {
         let mut tab = Tab::new(Buffer::from_text("\n"));
         let (mut fx, mut ended) = (Vec::new(), false);
         let paste = egui::Event::Paste("one\ntwo".into());
-        route_event(&paste, &mut tab, &SET, &mut fx, &mut ended);
-        assert_eq!(tab.buffer.text(), "\n", "Normal mode ignores the paste");
         route_event(
             &egui::Event::Text("i".into()),
             &mut tab,
@@ -309,6 +356,66 @@ mod tests {
         route_event(&paste, &mut tab, &SET, &mut fx, &mut ended);
         assert_eq!(tab.buffer.text(), "one\ntwo\n");
         assert_eq!(tab.buffer.revision(), before + 1);
+    }
+
+    /// Routes `ev` to `tab` and returns the effects.
+    fn route(tab: &mut Tab, ev: egui::Event) -> Vec<VimEffect> {
+        let (mut fx, mut ended) = (Vec::new(), false);
+        route_event(&ev, tab, &SET, &mut fx, &mut ended);
+        fx
+    }
+
+    fn ctrl_a() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }
+    }
+
+    #[test]
+    fn ctrl_a_selects_everything_and_ctrl_c_copies_it() {
+        let mut tab = Tab::new(Buffer::from_text("one\ntwo\n"));
+        assert!(
+            route(&mut tab, egui::Event::Copy).is_empty(),
+            "no selection"
+        );
+        route(&mut tab, ctrl_a());
+        assert_eq!(tab.vim.mode(), Mode::Visual);
+        let fx = route(&mut tab, egui::Event::Copy);
+        assert_eq!(
+            fx,
+            vec![
+                VimEffect::SetClipboard("one\ntwo\n".into()),
+                VimEffect::Copied
+            ]
+        );
+        assert_eq!(tab.vim.mode(), Mode::Normal);
+        assert_eq!(tab.buffer.text(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn ctrl_a_leaves_insert_mode() {
+        let mut tab = Tab::new(Buffer::from_text("ab\n"));
+        route(&mut tab, egui::Event::Text("i".into()));
+        assert_eq!(tab.vim.mode(), Mode::Insert);
+        route(&mut tab, ctrl_a());
+        assert_eq!(tab.vim.mode(), Mode::Visual);
+    }
+
+    #[test]
+    fn ctrl_x_cuts_the_selection_and_ctrl_v_pastes_in_normal_mode() {
+        let mut tab = Tab::new(Buffer::from_text("abc\n"));
+        route(&mut tab, ctrl_a());
+        let fx = route(&mut tab, egui::Event::Cut);
+        assert_eq!(fx, vec![VimEffect::SetClipboard("abc\n".into())]);
+        assert_eq!(tab.buffer.text(), "");
+        route(&mut tab, egui::Event::Paste("xy".into()));
+        assert_eq!(tab.buffer.text(), "xy");
+        route(&mut tab, egui::Event::Paste("ab\n".into()));
+        assert_eq!(tab.buffer.text(), "xy\nab", "linewise put on the last line");
     }
 
     #[test]

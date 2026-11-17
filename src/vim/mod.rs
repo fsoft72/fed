@@ -80,6 +80,8 @@ pub enum VimKey {
 pub enum VimEffect {
     /// Copy text to the system clipboard (the unnamed register changed).
     SetClipboard(String),
+    /// The user explicitly copied text (Ctrl+C): the UI confirms it with a toast.
+    Copied,
     /// Show an informational message.
     Message(String),
     /// Show an error message.
@@ -256,6 +258,50 @@ impl VimState {
             ),
             _ => None,
         }
+    }
+
+    /// Pastes `text` (from the system clipboard) after the caret in Normal mode, as `p` does
+    /// with the unnamed register; text ending with a line break is put as whole lines. Other
+    /// modes ignore it (Insert mode types the text instead).
+    pub fn paste_text(
+        &mut self,
+        text: String,
+        buf: &mut Buffer,
+        ed: &mut EditorState,
+        settings: &EditSettings,
+    ) -> Vec<VimEffect> {
+        if self.mode != Mode::Normal || text.is_empty() {
+            return Vec::new();
+        }
+        let linewise = text.ends_with('\n');
+        self.register = Register { text, linewise };
+        self.handle_key(VimKey::Char('p'), buf, ed, settings)
+    }
+
+    /// Selects the whole buffer in Visual mode (Ctrl+A). An Insert session is ended first;
+    /// the command line is left alone.
+    pub fn select_all(
+        &mut self,
+        buf: &mut Buffer,
+        ed: &mut EditorState,
+        settings: &EditSettings,
+    ) -> Vec<VimEffect> {
+        let mut fx = Vec::new();
+        match self.mode {
+            Mode::CommandLine => return fx,
+            Mode::Insert => fx = self.handle_key(VimKey::Esc, buf, ed, settings),
+            _ => {}
+        }
+        self.keys.clear();
+        self.pending_text.clear();
+        // Visual selections are inclusive: the head sits on the last char (a final line
+        // break included), so the whole text is selected.
+        ed.selection = Selection {
+            anchor: 0,
+            head: buf.rope().len_chars().saturating_sub(1),
+        };
+        self.mode = Mode::Visual;
+        fx
     }
 
     /// Feeds one key; returns the effects the UI must perform.

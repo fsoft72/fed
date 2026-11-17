@@ -6,6 +6,7 @@ mod menu;
 mod spell_menu;
 mod status;
 mod tab_bar;
+mod toast;
 mod vim;
 
 use std::path::{Path, PathBuf};
@@ -34,6 +35,7 @@ use spell_menu::SpellMenu;
 pub use status::status_text;
 use status::{Severity, StatusBar};
 use tab_bar::TabBarAction;
+use toast::{COPIED_TOAST, Toast};
 use vim::VimMessage;
 pub use vim::vim_status_text;
 
@@ -194,6 +196,8 @@ struct EditorFrame {
     vim_effects: Vec<VimEffect>,
     /// True when vim received at least one key.
     vim_key_seen: bool,
+    /// True when the user copied text to the clipboard this frame.
+    copied: bool,
 }
 
 /// Top-level editor application state.
@@ -214,6 +218,8 @@ pub struct FedApp {
     paths: Option<ConfigPaths>,
     /// Status bar message and link opener errors.
     status: StatusBar,
+    /// Transient toast (e.g. the copy confirmation).
+    toast: Toast,
     /// Confirmation dialog currently shown.
     pending: Option<Pending>,
     /// UI theme last applied to the context.
@@ -292,6 +298,7 @@ impl FedApp {
             keymap,
             paths,
             status: StatusBar::new(),
+            toast: Toast::default(),
             pending: None,
             applied_theme: None,
             find_bar: FindBar::new(),
@@ -952,6 +959,7 @@ impl FedApp {
                 false => None,
             };
             let out = tab.show_editor(ui, &opts, env, key_handler);
+            frame.copied = out.copied;
             if let Some((range, _)) = out.context_word {
                 frame.context_click = ui.input(|i| i.pointer.latest_pos()).map(|pos| (pos, range));
             }
@@ -1005,6 +1013,9 @@ impl eframe::App for FedApp {
         if editor.vim_key_seen {
             self.vim_message = None;
         }
+        if editor.copied {
+            self.toast.show(COPIED_TOAST);
+        }
         self.apply_vim_effects(&ctx, editor.vim_effects);
         if let Some((pos, range)) = editor.context_click {
             self.open_spell_menu(pos, range);
@@ -1013,6 +1024,7 @@ impl eframe::App for FedApp {
         self.show_settings(&ctx);
         self.show_about(&ctx);
         self.show_dialogs(&ctx);
+        self.toast.draw(&ctx);
         self.flush_settings_save(&ctx);
         self.sync_session();
         self.open_links(&ctx);

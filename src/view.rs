@@ -141,6 +141,8 @@ pub type KeyHandler<'a> = dyn FnMut(&egui::Event, &mut Tab) -> bool + 'a;
 pub struct ViewOutput {
     /// Text to put on the clipboard (from Copy or Cut).
     pub clipboard: Option<String>,
+    /// True when a Copy command (not a Cut) filled `clipboard` this frame.
+    pub copied: bool,
     /// Word under a right click: char range in the buffer and its text.
     pub context_word: Option<(Range<usize>, String)>,
     /// True when the buffer content changed this frame.

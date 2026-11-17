@@ -39,8 +39,10 @@ pub(super) fn handle_keyboard(
         let Some(cmd) = event_to_command(ev, page) else {
             continue;
         };
+        let is_copy = cmd == EditCommand::Copy;
         if let Some(text) = tab.apply(cmd, &opts.edit) {
             out.clipboard = Some(text);
+            out.copied |= is_copy;
         }
     }
 }
